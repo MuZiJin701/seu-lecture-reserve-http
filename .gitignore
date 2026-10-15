@@ -5,6 +5,7 @@ __pycache__/
 *.egg-info/
 .env
 .env.*
+!.env.example
 config.local.toml
 state/
 *.log

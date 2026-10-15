@@ -1,9 +1,0 @@
-# Non-secret filters. Copy to config.local.toml and pass --config config.local.toml.
-titles = []
-campuses = []
-online = true
-offline = true
-state_dir = "state"
-
-# Omit categories to use the five categories defined in the confirmed spec.
-# An empty campuses list permits no offline lectures.

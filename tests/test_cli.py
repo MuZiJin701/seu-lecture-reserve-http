@@ -1,11 +1,14 @@
 import subprocess
 import sys
 import json
+from pathlib import Path
+
+import pytest
 
 
-def cli(directory, *args):
+def cli(directory, *args, environment=None):
     return subprocess.run([sys.executable, '-m', 'seu_reserve.cli', *args], cwd=directory,
-                          env={}, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+                          env=environment or {}, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
 
 
 def test_status_and_help_do_not_require_credentials_or_network(tmp_path):
@@ -24,8 +27,8 @@ def test_noninteractive_missing_credentials_fail_without_unsafe_prompt(tmp_path)
 
 
 def test_invalid_configuration_is_rejected_without_echoing_its_value(tmp_path):
-    config = tmp_path / 'filters.toml'
-    config.write_text('online = "SECRET invalid switch"\n')
+    config = tmp_path / 'custom.env'
+    config.write_text('SEU_ENABLE_ONLINE="SECRET invalid switch"\n')
     result = cli(tmp_path, '--config', str(config))
     assert result.returncode == 1
     assert 'SECRET' not in result.stdout + result.stderr
@@ -37,3 +40,113 @@ def test_completed_task_restart_does_not_prompt_for_credentials(tmp_path):
     (state / 'task.json').write_text(json.dumps({'version': 1, 'account': '0' * 64,
         'status': 'done', 'activity': 'one', 'cooldowns': {}}))
     assert cli(tmp_path).returncode == 0
+
+
+def test_dotenv_is_loaded_automatically_and_controls_state_directory(tmp_path):
+    (tmp_path / '.env').write_text('SEU_STATE_DIR=jobs\n')
+    state = tmp_path / 'jobs'
+    state.mkdir()
+    (state / 'task.json').write_text(json.dumps({'version': 1, 'account': '0' * 64,
+        'status': 'done', 'activity': 'one', 'cooldowns': {}}))
+    result = cli(tmp_path, '--status')
+    assert result.returncode == 0
+    assert result.stdout.strip() == 'status=done'
+
+
+def test_environment_overrides_dotenv_and_explicit_path_does_not_search_other_files(tmp_path):
+    (tmp_path / '.env').write_text('SEU_ENABLE_ONLINE=invalid\n')
+    private = tmp_path / 'configuration'
+    private.mkdir()
+    selected = private / '.env'
+    selected.write_text('SEU_ENABLE_ONLINE=false\nSEU_STATE_DIR=jobs\n')
+    state = private / 'overridden'
+    state.mkdir()
+    (state / 'task.json').write_text('{"status":"done"}')
+    result = cli(tmp_path, '--config', str(selected), '--status', environment={'SEU_STATE_DIR': 'overridden'})
+    assert result.returncode == 0
+    assert result.stdout.strip() == 'status=done'
+
+
+@pytest.mark.parametrize('environment, expected', [
+    ({'SEU_USERNAME': 'legacy-user'}, 'legacy-user'),
+    ({'SEU_CARD_NUMBER': 'canonical-user', 'SEU_USERNAME': 'legacy-user'}, 'canonical-user'),
+])
+def test_process_account_aliases_override_file_and_resume_the_correct_account(tmp_path, environment, expected):
+    import hashlib
+    (tmp_path / '.env').write_text('SEU_CARD_NUMBER=file-user\n')
+    state = tmp_path / 'state'
+    state.mkdir()
+    (state / 'task.json').write_text(json.dumps({'version': 1,
+        'account': hashlib.sha256(expected.encode()).hexdigest(), 'status': 'done',
+        'activity': 'one', 'cooldowns': {}}))
+    assert cli(tmp_path, environment=environment).returncode == 0
+
+
+@pytest.mark.parametrize('text', [
+    'SEU_PASSWORD="SIMULATED_SECRET\n',
+    'SEU_PREFERRED_LECTURES=SIMULATED_SECRET\n',
+    'SEU_REQUIRED_CATEGORIES=\'[]\'\n',
+    'SEU_ENABLE_ONLNE=SIMULATED_SECRET\n',
+])
+def test_invalid_dotenv_never_echoes_values_or_starts_authentication(tmp_path, text):
+    (tmp_path / '.env').write_text(text)
+    result = cli(tmp_path, '--check')
+    assert result.returncode == 1
+    assert result.stdout.strip() == 'event=configuration_or_state_invalid'
+    assert 'SIMULATED_SECRET' not in result.stdout + result.stderr
+
+
+def test_example_is_valid_dotenv_with_the_confirmed_default_categories(tmp_path):
+    example = Path(__file__).resolve().parents[1] / '.env.example'
+    (tmp_path / '.env').write_text(example.read_text())
+    result = cli(tmp_path, '--status')
+    assert result.returncode == 0
+    assert result.stdout.strip() == 'status=not_started'
+
+
+def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(tmp_path, monkeypatch, capsys):
+    import base64
+    from types import SimpleNamespace
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from seu_reserve.cli import main
+    from test_app import School, lecture
+
+    password = 'test ${literal} # = password'
+    class ConfiguredSchool(School):
+        def request(self, method, url, **kwargs):
+            if method == 'POST' and url.endswith('casLogin'):
+                assert kwargs['json']['username'] == 'test-user'
+                decoded = self.key.decrypt(base64.b64decode(kwargs['json']['password']), padding.PKCS1v15()).decode()
+                assert decoded == password
+            return super().request(method, url, **kwargs)
+    school = ConfiguredSchool()
+    school.activities = [lecture('skip', HDMC='不匹配'),
+                         lecture('chosen', HDMC='指定讲座', IS_ONLINE=False, JZDD='无锡校区会议室')]
+    messages = []
+    class SMTP:
+        def __init__(self, host, port, **kwargs):
+            assert (host, port) == ('smtp.example.org', 465)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def login(self, username, secret):
+            assert (username, secret) == ('mail-user', 'test ${mail} # = password')
+        def send_message(self, message):
+            messages.append(message)
+    (tmp_path / '.env').write_text(
+        "SEU_CARD_NUMBER=test-user\nSEU_PASSWORD='test ${literal} # = password'\n"
+        "SEU_PREFERRED_LECTURES='[\"指定讲座\"]'\nSEU_PREFERRED_CAMPUS='[\"无锡校区\"]'\n"
+        "SEU_ENABLE_ONLINE=false\nSEU_ENABLE_OFFLINE=true\nSEU_STATE_DIR=jobs\n"
+        "SMTP_HOST=smtp.example.org\nSMTP_USERNAME=mail-user\nSMTP_PASSWORD='test ${mail} # = password'\n"
+        "MAIL_FROM=sender@example.org\nMAIL_TO=receiver@example.org\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('os.environ', {})
+    monkeypatch.setattr('requests.Session', lambda: school)
+    monkeypatch.setattr('smtplib.SMTP_SSL', SMTP)
+    monkeypatch.setattr('ddddocr.DdddOcr', lambda **kwargs: SimpleNamespace(classification=lambda _: '1234'))
+    school.close = lambda: None
+    assert main([]) == 0
+    assert school.submitted == ['chosen']
+    assert len(messages) == 1
+    assert password not in capsys.readouterr().out

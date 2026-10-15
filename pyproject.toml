@@ -3,7 +3,7 @@ name = "seu-lecture-reserve-http"
 version = "0.1.0"
 description = "Single-account SEU lecture reservation over HTTPS"
 requires-python = ">=3.12,<3.13"
-dependencies = ["requests>=2.32,<3", "cryptography>=43", "ddddocr>=1.5,<2", "pillow>=10,<13"]
+dependencies = ["requests>=2.32,<3", "cryptography>=43", "ddddocr>=1.5,<2", "pillow>=10,<13", "python-dotenv>=1,<2"]
 
 [project.scripts]
 seu-reserve = "seu_reserve.cli:main"

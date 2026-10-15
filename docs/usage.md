@@ -17,20 +17,34 @@ uv run --locked seu-reserve --help
 ## 配置与凭据
 
 ```bash
-cp config.example.toml config.local.toml
-uv run --locked seu-reserve --config config.local.toml --status
+cp -n .env.example .env
+chmod 600 .env
+# 编辑 .env，填写登录信息、筛选和邮件配置
+uv run --locked seu-reserve --status
 ```
 
-配置仅包含 `titles`、`categories`、`campuses`、`online`、`offline` 和 `state_dir`。
-状态目录相对于配置文件所在目录；不用配置文件时默认为当前目录的 `state`。
-标题完整匹配，空列表不限制标题；标题不会绕过其他条件。类别省略时使用已确认的五类及其顺序。
-线下开关打开也必须配置允许的校区；默认空校区列表意味着只约线上。线上识别必须来自明确的业务字段，不能从标题猜测。
+登录、筛选、状态目录和邮件统一放入 [.env.example](../.env.example) 对应的 `.env` 文件，程序默认自动读取**当前工作目录**的 `.env`，不向上搜索其他目录。
+在其他目录运行时，用 `--config /项目目录/.env` 明确指定文件。显式指定的文件不存在会报错，不回退读取其他文件。
+状态目录相对于所选 `.env` 所在目录；默认名称为 `state`。进程环境变量优先于文件，不会把文件内容写回全局进程环境。
 
-学校凭据使用环境变量 `SEU_USERNAME`、`SEU_PASSWORD`，未提供时在交互终端隐藏输入。
-不要把真实值放进命令行、配置示例、仓库或聊天。程序不自动加载 `.env` 文件。
-非交互运行缺少凭据时直接报错，不回退到可能回显秘密的输入。
+| 配置项 | 含义 |
+| --- | --- |
+| `SEU_CARD_NUMBER` / `SEU_PASSWORD` | 一卡通号 / 密码，与旧项目命名一致 |
+| `SEU_PREFERRED_LECTURES` | 完整标题列表，`'[]'` 表示不限标题 |
+| `SEU_REQUIRED_CATEGORIES` | 类别 JSON 数组，省略时使用已确认的五类及顺序，不能是空数组 |
+| `SEU_PREFERRED_CAMPUS` | 允许的线下校区 JSON 数组，`'[]'` 表示不约线下 |
+| `SEU_ENABLE_ONLINE` / `SEU_ENABLE_OFFLINE` | 是否允许线上 / 线下，值为 `true` 或 `false` |
+| `SEU_STATE_DIR` | 任务状态和日志目录，默认 `state` |
 
-预约运行还需以下邮件环境变量：
+列表是 JSON 数组，外层用单引号，例如 `SEU_PREFERRED_CAMPUS='["无锡校区"]'`。
+标题完整匹配仍受其他筛选及冲突规则约束；线上识别来自明确业务字段，不从标题猜测。
+密码等字符串含空格、`#`、`=` 或 `$` 时可以按示例用引号包裹。`${...}` 原样保留，不做变量展开；`.env` 由 Python 读取，不需要也不要作为 shell 脚本执行。
+真实 `.env` 和 `.env.*` 已被 Git 忽略，仅提交不含凭据的 `.env.example`。
+
+为保留此前的使用方式，也接受 `SEU_USERNAME`；同一来源同时有它和 `SEU_CARD_NUMBER` 时后者优先，任何进程环境中的账号设置都优先于文件中的账号设置。
+未填写登录信息时仍可在交互终端隐藏输入；非交互运行缺少凭据时直接报错。
+
+正式预约还需在同一 `.env` 中填写邮件配置：
 
 | 变量 | 含义 |
 | --- | --- |
@@ -41,10 +55,13 @@ uv run --locked seu-reserve --config config.local.toml --status
 
 首版使用 SMTP 隐式 TLS，不提供明文连接或 STARTTLS 模式。邮件只包含固定事件、时间和处理提示，不包含学校账号、标题、验证码或个人活动记录。
 
+从此前 TOML 方式迁移时，按新 `.env.example` 填入对应字段即可；TOML 配置入口已移除，已有个人 `config.local.toml` 不会被删除。
+旧 Playwright 项目的浏览器专用超时参数不适用于本项目，不要原样复制整个旧 `.env`；正常轮询仍为已确认的 10 秒。
+
 ## 先做只读检查
 
 ```bash
-uv run --locked seu-reserve --config config.local.toml --check
+uv run --locked seu-reserve --check
 ```
 
 该命令认证后查询列表、我的活动并获取校验验证码图片，不提交或取消预约，不创建预约任务，也不发送邮件。
@@ -54,7 +71,7 @@ uv run --locked seu-reserve --config config.local.toml --check
 ## 运行和恢复
 
 ```bash
-uv run --locked seu-reserve --config config.local.toml
+uv run --locked seu-reserve
 ```
 
 此命令会对符合条件的候选提交真实预约。默认每 10 秒查询，异常时退避（20、40、80 秒，最多 300 秒），学校明确的 Retry-After 优先。
@@ -69,7 +86,7 @@ uv run --locked seu-reserve --config config.local.toml
 需要再预约另一场时，显式启动新任务：
 
 ```bash
-uv run --locked seu-reserve --config config.local.toml --new-task
+uv run --locked seu-reserve --new-task
 ```
 
 仅允许替换已完成任务；待确认或仍在扫描的任务不能用此参数重置。状态损坏或账号不匹配时停止，避免覆盖旧任务。

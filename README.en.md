@@ -20,6 +20,8 @@ uv sync --locked
 
 If you already have the project, enter its existing directory instead.
 
+Dependencies include `tzdata` to provide `Asia/Shanghai` on systems without an IANA time zone database, including Windows. After updating the dependencies and lockfile, run `uv sync --locked` again to install it.
+
 **2. Fill in `.env`**
 
 Copy the example for first-time setup. Keep your existing `.env` if you have already filled it in.

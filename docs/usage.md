@@ -12,6 +12,7 @@ uv run --locked seu-reserve --help
 ```
 
 依赖安装到项目隔离环境；OCR 使用 ddddocr，模型随依赖包提供。首次安装包含 ONNX、图像依赖和模型，下载量较大。
+`tzdata` 提供 `Asia/Shanghai` 时区数据，兼容 Windows 等没有系统 IANA 时区库的环境；更新依赖及锁文件后需重新运行 `uv sync --locked`，避免启动时出现 `ZoneInfoNotFoundError`。
 测试只使用构造的学校响应、临时时间/文件、人工输入和邮件替身，不加载真实账号配置，不访问学校，不发送真实邮件。
 
 ## 配置与凭据

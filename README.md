@@ -20,6 +20,8 @@ uv sync --locked
 
 已有项目目录时，直接进入该目录即可。
 
+依赖包含 `tzdata`，用于在 Windows 等缺少系统 IANA 时区库的环境中提供 `Asia/Shanghai`。更新依赖及锁文件后，重新运行 `uv sync --locked` 即可安装。
+
 **2. 填写 `.env`**
 
 首次使用时复制样例；如果已经填好 `.env`，请保留原文件。

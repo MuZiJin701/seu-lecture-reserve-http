@@ -58,9 +58,11 @@ class Client:
                 or parsed.port not in (None, 443) or parsed.username or parsed.password
                 or any(ord(char) < 32 for char in url)):
             raise RemoteError('unexpected_origin')
+        # CAS rejects the default python-requests user agent with HTTP 403.
+        headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64)', **kwargs.pop('headers', {})}
         try:
             response = self.session.request(method, url, timeout=25, allow_redirects=False,
-                                            verify=True, **kwargs)
+                                            verify=True, headers=headers, **kwargs)
         except requests.RequestException:
             raise RemoteError('network_failure') from None
         if response.status_code in (429, 503):

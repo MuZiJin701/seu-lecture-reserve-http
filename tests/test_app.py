@@ -150,6 +150,47 @@ def test_unknown_submission_is_queried_and_survives_restart_without_resubmission
     assert 'SECRET' not in capsys.readouterr().out
 
 
+def test_school_reservation_fields_preserve_conflicts_including_touching_times(tmp_path):
+    school = School()
+    school.mine = [{'WID': 'reservation-row', 'HD_WID': 'old', 'YY_WID': 'reservation-id',
+                    'FBZT': '1', 'SFDK': '1', 'SFWY': '0',
+                    'JZSJ': '2030-01-01 09:00:00', 'HDJSSJ': '2030-01-01 10:00:00'}]
+    school.activities = [lecture('touching'),
+                         lecture('later', KSSJ='2030-01-01 11:00:00', JSSJ='2030-01-01 12:00:00')]
+    assert execute(school, tmp_path, sleep=interrupted) == 0
+    assert school.submitted == ['later']
+
+
+def test_school_cancelled_activity_does_not_block_booking(tmp_path):
+    school = School()
+    school.mine = [{'WID': 'reservation-row', 'HD_WID': 'one', 'FBZT': '-1'}]
+    school.activities = [lecture()]
+    assert execute(school, tmp_path, sleep=interrupted) == 0
+    assert school.submitted == ['one']
+
+
+@pytest.mark.parametrize('changes', [{'FBZT': 'unknown'}, {'HD_WID': None}, {'YYZT': 'unknown'},
+                                  {'JZSJ': 'invalid'}, {'HDJSSJ': None}])
+def test_unknown_school_reservation_fields_still_block_submission(tmp_path, changes):
+    school = School()
+    school.mine = [{'WID': 'reservation-row', 'HD_WID': 'old', 'FBZT': '1',
+                    'JZSJ': '2030-01-01 09:00:00', 'HDJSSJ': '2030-01-01 10:00:00', **changes}]
+    school.activities = [lecture()]
+    assert execute(school, tmp_path, sleep=interrupted) == 130
+    assert not school.submitted
+
+
+def test_pending_submission_is_confirmed_by_school_activity_id_after_restart(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    school.mine = [{'WID': 'reservation-row', 'HD_WID': 'one', 'YY_WID': 'reservation-id', 'FBZT': '1',
+                    'JZSJ': '2030-01-01 10:00:00', 'HDJSSJ': '2030-01-01 11:00:00'}]
+    assert execute(school, tmp_path, sleep=interrupted) == 0
+    assert school.submitted == ['one']
+
+
 def test_query_failure_notification_is_deduplicated_and_resets_after_recovery(tmp_path):
     school = School()
     school.query_statuses = [500, 500, 500, 500, 200, 500, 500, 500]
@@ -184,6 +225,24 @@ def test_unsupported_activity_schema_alerts_instead_of_looking_like_empty_list(t
     assert execute(school, tmp_path, notify=events.append, sleep=stop_after_three) == 130
     assert events == ['query_failure']
     assert school.submitted == []
+
+
+@pytest.mark.parametrize('mail', [
+    {},
+    {'SMTP_HOST': 'smtp.example.org', 'MAIL_FROM': 'sender@example.org',
+     'MAIL_TO': 'receiver@example.org', 'SMTP_PORT': 'SECRET-invalid-port'},
+    {'SMTP_HOST': 'smtp.example.org', 'MAIL_FROM': 'sender@example.org',
+     'MAIL_TO': 'receiver@example.org', 'SMTP_USERNAME': 'SECRET-user'},
+])
+def test_invalid_mail_configuration_explains_startup_failure_without_network(tmp_path, capsys, mail):
+    school = School()
+    env = {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'SECRET-password', **mail}
+    assert run(Settings(state_dir=tmp_path), session=school, environ=env) == 1
+    output = capsys.readouterr().out
+    assert 'event=mail_configuration_invalid' in output
+    assert all(key in output for key in ('.env', 'SMTP_HOST', 'MAIL_FROM', 'MAIL_TO'))
+    assert 'SECRET' not in output
+    assert not school.requests
 
 
 def test_default_email_contains_only_event_and_mail_failure_does_not_repeat_booking(tmp_path, monkeypatch, capsys):
@@ -225,6 +284,27 @@ def test_read_only_check_fetches_captcha_without_creating_task_or_submitting(tmp
     assert school.submitted == []
     assert any(urlsplit(url).path.endswith('vcode.do') for _, url, _ in school.requests)
     assert not directory.exists()
+
+
+def test_read_only_check_passes_cas_browser_user_agent_requirement(tmp_path, capsys):
+    class BrowserOnlySchool(School):
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if urlsplit(url).path == '/dist/':
+                if not kwargs.get('headers', {}).get('User-Agent', '').startswith('Mozilla/5.0'):
+                    response.status_code = 403
+            return response
+
+    school = BrowserOnlySchool()
+    assert execute(school, tmp_path / 'unused-state', check_only=True) == 0
+    assert 'event=read_only_complete' in capsys.readouterr().out
+    assert not school.submitted
+    gateway_headers = [options['headers'] for _, url, options in school.requests
+                       if 'x-csrf-token' in options.get('headers', {})]
+    assert gateway_headers
+    assert all(headers['x-csrf-token'] == 'test-csrf'
+               and headers['Referer'].startswith('https://auth.seu.edu.cn/')
+               for headers in gateway_headers)
 
 
 def test_sms_is_only_sent_on_user_command_and_challenge_email_is_not_repeated(tmp_path):

@@ -4,7 +4,7 @@
 
 Keep looking for suitable SEU lectures on a server, recognize image CAPTCHAs, and attempt a reservation. The client uses HTTPS directly, needs no browser, and exits after confirming one reservation.
 
-Offline tests pass; live reservations and long-running use still need verification. Start with the read-only check.
+Offline tests, live login and read-only queries have passed. Live reservations and long-running use still need verification. Start with the read-only check.
 
 ## Quick start
 
@@ -51,11 +51,15 @@ This only logs in, queries data and fetches a CAPTCHA. It does not submit a rese
 
 First fill in `SMTP_HOST`, `MAIL_FROM`, `MAIL_TO`, and any required SMTP credentials in `.env`. Mail uses implicit TLS on port `465` by default. Use the password or app password required by your mail provider.
 
+Email alerts cover reservation success, required manual authentication, persistent errors and unconfirmed results. Mail configuration is required for normal operation. See the [Gmail setup guide](docs/usage.md#gmail-示例) (Chinese).
+
 ```bash
 uv run --locked seu-reserve
 ```
 
 This command submits real reservations. The client checks every 10 seconds by default until it confirms one reservation or you stop it.
+
+**A quiet terminal does not necessarily mean the client is stuck.** Successful queries with no suitable lectures lead to a quiet wait and do not count as failures. Errors produce events and longer retry delays; restarting preserves any remaining delay. See [status and logs](docs/usage.md#状态与日志) (Chinese).
 
 ## Common settings
 
@@ -89,9 +93,11 @@ Check local task status:
 uv run --locked seu-reserve --status
 ```
 
+This reads the local task record, not process health. `status=scanning` does not prove the process is running or its latest query succeeded. You do not need to start another reservation process to check status.
+
 ## Current status
 
-The CLI and offline regression tests are implemented. Live activity data mapping, actual reservations, SMS recovery and operation across days still need acceptance testing. Passing the read-only check does not verify reservations; confirm the final result in the [SEU portal](https://ehall.seu.edu.cn/).
+Live login, activity queries and CAPTCHA retrieval have been verified, and the status, activity ID and time fields in “My activities” have been adapted. The available-activity list was empty during verification. Nonempty candidate data, actual reservations, email delivery, SMS recovery and operation across days still need acceptance testing. Passing the read-only check does not verify reservations; confirm the final result in the [SEU portal](https://ehall.seu.edu.cn/).
 
 The real `.env` is excluded from Git. Do not upload credentials or personal activity records. Development checks are `uv run --locked pytest` and `uv run --locked mypy seu_reserve`.
 

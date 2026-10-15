@@ -85,7 +85,13 @@ def run(settings: Settings, *, session: Any = None,
         if task.data['status'] == 'done':
             return 0
         if notify is None:
-            notify = Mailer(environ)
+            try:
+                notify = Mailer(environ)
+            except ValueError:
+                print('event=mail_configuration_invalid', flush=True)
+                print('邮件配置不完整或格式错误。请检查 .env 中的 SMTP_HOST、SMTP_PORT、MAIL_FROM、MAIL_TO；'
+                      'SMTP_USERNAME 与 SMTP_PASSWORD 需同时填写。', flush=True)
+                return 1
         checkpoint = task
         def defer(seconds: float) -> None:
             checkpoint.data['retry_at'] = clock() + seconds

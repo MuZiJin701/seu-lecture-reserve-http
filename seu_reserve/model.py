@@ -28,7 +28,7 @@ def moment(value: Any) -> datetime:
 
 
 def interval(row: dict[str, Any]) -> tuple[datetime, datetime]:
-    start = moment(row.get('KSSJ', row.get('HDKSSJ')))
+    start = moment(row.get('KSSJ', row.get('HDKSSJ', row.get('JZSJ'))))
     end = moment(row.get('JSSJ', row.get('HDJSSJ')))
     if end <= start:
         raise ValueError('interval_invalid')
@@ -36,6 +36,12 @@ def interval(row: dict[str, Any]) -> tuple[datetime, datetime]:
 
 
 def reserved(row: dict[str, Any]) -> bool:
+    # The school UI identifies my reservations by HD_WID and publication status.
+    if 'YYZT' not in row and isinstance(row.get('HD_WID'), str) and row['HD_WID']:
+        if row.get('FBZT') == '1':
+            return True
+        if row.get('FBZT') == '-1':
+            return False
     status = row.get('YYZT')
     if status in ('已预约', '预约成功', '取消预约'):
         return True

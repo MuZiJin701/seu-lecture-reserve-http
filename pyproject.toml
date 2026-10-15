@@ -1,0 +1,31 @@
+[project]
+name = "seu-lecture-reserve-http"
+version = "0.1.0"
+description = "Single-account SEU lecture reservation over HTTPS"
+requires-python = ">=3.12,<3.13"
+dependencies = ["requests>=2.32,<3", "cryptography>=43", "ddddocr>=1.5,<2", "pillow>=10,<13"]
+
+[project.scripts]
+seu-reserve = "seu_reserve.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "mypy>=1.13,<2", "types-requests>=2.32"]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["seu_reserve*"]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+files = ["seu_reserve"]
+
+[[tool.mypy.overrides]]
+module = "ddddocr"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

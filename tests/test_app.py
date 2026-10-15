@@ -1,0 +1,451 @@
+import base64
+import json
+from urllib.parse import parse_qs, urlencode, urlsplit
+
+import requests
+import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+from seu_reserve.app import Settings, run
+
+
+class School:
+    """Controlled external HTTP service; never opens a socket."""
+
+    def __init__(self, *, sms=False):
+        self.sms = sms
+        self.authenticated = False
+        self.requests = []
+        self.activities = []
+        self.mine = []
+        self.submitted = []
+        self.submit_timeout = False
+        self.query_statuses = []
+        self.submit_replies = []
+        self.sms_sends = 0
+        self.login_reply = None
+        self.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    def request(self, method, url, **kwargs):
+        self.requests.append((method, url, kwargs))
+        path = urlsplit(url).path
+        response = requests.Response()
+        response.url = url
+        response.status_code = 200
+        payload = {"code": 0, "data": {}}
+        if path.endswith('index.do') and self.authenticated:
+            response._content = b'<script src="indexjsp.js"></script>'
+            return response
+        if path.endswith('index.do') or path.endswith('/casLogin') and method == 'GET':
+            response.status_code = 302
+            response.headers['Location'] = 'https://auth.seu.edu.cn/dist/#/login?service=https%3A%2F%2Fvpn.seu.edu.cn%2Fcallback'
+        elif path == '/dist/':
+            response._content = b'<html>CAS</html>'
+            return response
+        elif path.endswith('authConfig'):
+            payload = {"code": 0, "data": {"security": {"csrfToken": "test-csrf"}, "isLogin": int(self.authenticated)}}
+        elif path.endswith('getChiperKey'):
+            public = self.key.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+            payload = {"success": True, "publicKey": base64.urlsafe_b64encode(public).decode()}
+        elif path.endswith('casLogin'):
+            encrypted = kwargs['json'].get('mobileVerifyCode')
+            if self.sms and encrypted:
+                self.sms = self.key.decrypt(base64.b64decode(encrypted), padding.PKCS1v15()).decode() != '654321'
+            payload = {"code": 502 if self.sms else 200, "success": not self.sms,
+                       "redirectUrl": 'https%3A%2F%2Fvpn.seu.edu.cn%2Fcallback'}
+            if self.login_reply is not None:
+                payload = self.login_reply
+        elif path.endswith('sendStage2Code'):
+            assert kwargs['json'] == {'userId': 'test-user'}
+            self.sms_sends += 1
+            payload = {'code': 200}
+        elif path.endswith('loginRedirect'):
+            assert parse_qs(urlsplit(url).query)['redirectUrl'] == ['https://vpn.seu.edu.cn/callback']
+            self.authenticated = True
+        elif path.endswith('queryActivityList.do'):
+            if self.query_statuses:
+                response.status_code = self.query_statuses.pop(0)
+            payload = {'code': 0, 'datas': {'hdlbList': self.activities}}
+        elif path.endswith('queryMyActivityList.do'):
+            payload = {'code': 0, 'datas': {'wdhdList': self.mine}}
+        elif path.endswith('appiontCheck.do'):
+            payload = {'code': 0}
+        elif path.endswith('vcode.do'):
+            import io
+            from PIL import Image
+            image = io.BytesIO()
+            Image.new('RGB', (50, 20), 'white').save(image, format='PNG')
+            payload = {'code': 0, 'datas': {'vcode': 'data:image/png;base64,' + base64.b64encode(image.getvalue()).decode()}}
+        elif path.endswith('addReservation.do'):
+            wid = kwargs['data']['wid']
+            self.submitted.append(wid)
+            if self.submit_timeout:
+                raise requests.Timeout('SECRET must never enter logs')
+            if self.submit_replies:
+                payload = self.submit_replies.pop(0)
+                response._content = json.dumps(payload).encode()
+                return response
+            self.mine.append({**next(row for row in self.activities if row['WID'] == wid), 'YYZT': '已预约', 'HD_WID': wid})
+            payload = {'code': 0}
+        elif path.endswith('needCaptcha'):
+            payload = {"code": 200}
+        response._content = json.dumps(payload).encode()
+        return response
+
+
+def interrupted(_):
+    raise KeyboardInterrupt
+
+
+def test_sms_authentication_never_queries_or_submits_business(tmp_path):
+    school = School(sms=True)
+    notifications = []
+    result = run(Settings(state_dir=tmp_path), session=school,
+                 environ={'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
+                 prompt=interrupted, notify=notifications.append)
+    assert result == 130
+    assert 'authentication_required' in notifications
+    assert not any('/modules/hdyy/' in url for _, url, _ in school.requests)
+
+
+def lecture(wid='one', **changes):
+    return {'WID': wid, 'HDMC': '测试讲座', 'HDLX_DISPLAY': '人文与科学素养系列讲座_心理健康',
+            'KSSJ': '2030-01-01 10:00:00', 'JSSJ': '2030-01-01 11:00:00',
+            'IS_ONLINE': True, 'JZDD': '线上', 'YYZT': '预约', **changes}
+
+
+def execute(school, directory, **options):
+    options.setdefault('sleep', lambda _: None)
+    options.setdefault('notify', lambda _: None)
+    options.setdefault('prompt', interrupted)
+    options.setdefault('recognize', lambda image: '1234')
+    settings = options.pop('settings', Settings(state_dir=directory))
+    return run(settings, session=school,
+               environ={'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
+               **options)
+
+
+def test_one_confirmed_reservation_ends_task_and_restart_does_not_book_again(tmp_path):
+    school = School()
+    school.activities = [lecture(), lecture('two')]
+    events = []
+    assert execute(school, tmp_path, notify=events.append) == 0
+    assert school.submitted == ['one']
+    assert events == ['reservation_succeeded']
+    assert execute(school, tmp_path, notify=events.append) == 0
+    assert school.submitted == ['one']
+
+
+def test_unknown_submission_is_queried_and_survives_restart_without_resubmission(tmp_path, capsys):
+    school = School()
+    school.activities = [lecture(), lecture('two')]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == ['one']
+    school.mine = [{**lecture(), 'HD_WID': 'one', 'YYZT': '已预约'}]
+    assert execute(school, tmp_path) == 0
+    assert school.submitted == ['one']
+    assert 'SECRET' not in capsys.readouterr().out
+
+
+def test_query_failure_notification_is_deduplicated_and_resets_after_recovery(tmp_path):
+    school = School()
+    school.query_statuses = [500, 500, 500, 500, 200, 500, 500, 500]
+    events, delays = [], []
+    def wait(seconds):
+        delays.append(seconds)
+        if len(delays) == 8:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, notify=events.append, sleep=wait) == 130
+    assert events == ['query_failure', 'query_failure']
+    assert delays[:3] == [20, 40, 80]
+    assert delays[4] == 10
+
+
+def test_four_explicit_captcha_rejections_cool_down_first_candidate_and_try_next(tmp_path):
+    school = School()
+    school.activities = [lecture(), lecture('two')]
+    school.submit_replies = [{'code': 1, 'msg': '验证码错误'}] * 4
+    assert execute(school, tmp_path) == 0
+    assert school.submitted == ['one', 'one', 'one', 'one', 'two']
+
+
+def test_unsupported_activity_schema_alerts_instead_of_looking_like_empty_list(tmp_path):
+    school = School()
+    school.activities = [lecture(IS_ONLINE=None)]
+    events = []
+    waits = []
+    def stop_after_three(seconds):
+        waits.append(seconds)
+        if len(waits) == 3:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, notify=events.append, sleep=stop_after_three) == 130
+    assert events == ['query_failure']
+    assert school.submitted == []
+
+
+def test_default_email_contains_only_event_and_mail_failure_does_not_repeat_booking(tmp_path, monkeypatch, capsys):
+    messages = []
+    class SMTP:
+        def __init__(self, host, port, **kwargs):
+            assert (host, port) == ('smtp.example.org', 465)
+            assert kwargs['context'].check_hostname
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def login(self, username, password):
+            assert username == 'mail-user'
+        def send_message(self, message):
+            messages.append(message)
+            raise OSError('SECRET mail password')
+    monkeypatch.setattr('smtplib.SMTP_SSL', SMTP)
+    school = School()
+    school.activities = [lecture(HDMC='PRIVATE TITLE')]
+    env = {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password',
+           'SMTP_HOST': 'smtp.example.org', 'SMTP_USERNAME': 'mail-user', 'SMTP_PASSWORD': 'private-mail-password',
+           'MAIL_FROM': 'sender@example.org', 'MAIL_TO': 'receiver@example.org'}
+    assert run(Settings(state_dir=tmp_path), session=school, environ=env,
+               recognize=lambda _: '1234', sleep=lambda _: None) == 0
+    assert len(messages) == 1
+    assert 'reservation_succeeded' in messages[0].get_content()
+    assert 'PRIVATE TITLE' not in messages[0].get_content()
+    assert 'SECRET' not in capsys.readouterr().out
+    assert execute(school, tmp_path) == 0
+    assert school.submitted == ['one']
+
+
+def test_read_only_check_fetches_captcha_without_creating_task_or_submitting(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    directory = tmp_path / 'unused-state'
+    assert execute(school, directory, check_only=True) == 0
+    assert school.submitted == []
+    assert any(urlsplit(url).path.endswith('vcode.do') for _, url, _ in school.requests)
+    assert not directory.exists()
+
+
+def test_sms_is_only_sent_on_user_command_and_challenge_email_is_not_repeated(tmp_path):
+    school = School(sms=True)
+    school.activities = [lecture()]
+    answers = iter(['send', '111111', '654321'])
+    events = []
+    assert execute(school, tmp_path, prompt=lambda _: next(answers), notify=events.append) == 0
+    assert school.sms_sends == 1
+    assert events == ['authentication_required', 'reservation_succeeded']
+
+
+def test_unknown_authentication_challenge_waits_without_business_requests(tmp_path):
+    school = School()
+    school.login_reply = {'code': 499, 'info': 'unmodeled challenge'}
+    events = []
+    assert execute(school, tmp_path, notify=events.append) == 130
+    assert events == ['authentication_required']
+    assert not school.submitted
+
+
+@pytest.mark.parametrize('payload', [
+    {'code': False, 'datas': {'hdlbList': [lecture()]}},
+    {'code': 0, 'datas': {'hdlbList': None}},
+    {'code': 0, 'datas': {'hdlbList': [lecture()], 'total': 2}},
+])
+def test_invalid_business_response_never_allows_submission(tmp_path, payload):
+    class InvalidSchool(School):
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if url.endswith('queryActivityList.do'):
+                response._content = json.dumps(payload).encode()
+            return response
+    school = InvalidSchool()
+    school.activities = [lecture()]
+    assert execute(school, tmp_path, sleep=interrupted) == 130
+    assert school.submitted == []
+
+
+@pytest.mark.parametrize('changes, filters, mine', [
+    ({'HDLX_DISPLAY': '未允许类别'}, {'titles': ('测试讲座',)}, []),
+    ({'IS_ONLINE': False, 'JZDD': '无锡校区教室'}, {'titles': ('测试讲座',)}, []),
+    ({}, {'titles': ('其他标题',)}, []),
+    ({}, {'online': False}, []),
+    ({'IS_ONLINE': False, 'JZDD': '无锡校区教室'}, {'offline': False, 'campuses': ('无锡校区',)}, []),
+    ({'KSSJ': 'invalid'}, {}, []),
+    ({}, {}, [{**lecture('old'), 'YYZT': '已预约', 'JSSJ': '2030-01-01 10:00:00', 'KSSJ': '2030-01-01 09:00:00'}]),
+    ({}, {}, [{**lecture('old'), 'YYZT': '已预约', 'KSSJ': 'unknown'}]),
+    ({}, {}, [{**lecture('old'), 'YYZT': 'unknown'}]),
+])
+def test_all_filters_and_conflict_uncertainty_block_booking(tmp_path, changes, filters, mine):
+    school = School()
+    school.activities = [lecture(**changes)]
+    school.mine = mine
+    assert execute(school, tmp_path, settings=Settings(state_dir=tmp_path, **filters), sleep=interrupted) == 130
+    assert school.submitted == []
+
+
+def test_category_order_precedes_time_and_title_order(tmp_path):
+    school = School()
+    school.activities = [lecture('early', HDMC='first title', HDLX_DISPLAY='人文与科学素养系列讲座_法律'),
+                         lecture('late', HDMC='second title', KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00')]
+    settings = Settings(state_dir=tmp_path, titles=('first title', 'second title'))
+    assert execute(school, tmp_path, settings=settings) == 0
+    assert school.submitted == ['late']
+
+
+def test_new_task_only_replaces_completed_task_and_preserves_pending_submission(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    assert execute(school, tmp_path, new_task=True) == 1
+    assert school.submitted == ['one']
+    school.mine = [{**lecture(), 'YYZT': '已预约'}]
+    assert execute(school, tmp_path) == 0
+    school.submit_timeout = False
+    school.activities = [lecture('two', KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00')]
+    assert execute(school, tmp_path, new_task=True) == 0
+    assert school.submitted == ['one', 'two']
+
+
+def test_corrupt_checkpoint_stops_before_any_network_request(tmp_path):
+    school = School()
+    (tmp_path / 'task.json').write_text('{invalid')
+    assert execute(school, tmp_path) == 1
+    assert not school.requests
+
+
+@pytest.mark.parametrize('target', [
+    'http://auth.seu.edu.cn/unsafe', 'https://attacker.example/collect?ticket=SECRET',
+    'https://auth.seu.edu.cn@attacker.example/collect', 'https://auth.seu.edu.cn:8443/collect',
+])
+def test_redirects_cannot_send_credentials_or_tickets_to_untrusted_origins(tmp_path, target, capsys):
+    class RedirectSchool(School):
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if url.endswith('index.do'):
+                response.headers['Location'] = target
+            return response
+    school = RedirectSchool()
+    assert execute(school, tmp_path, sleep=interrupted) == 130
+    assert len(school.requests) == 1
+    assert 'SECRET' not in capsys.readouterr().out
+
+
+def test_server_retry_after_is_respected(tmp_path):
+    class LimitedSchool(School):
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if url.endswith('queryActivityList.do'):
+                response.status_code = 429
+                response.headers['Retry-After'] = '600'
+            return response
+    delays = []
+    def stop(seconds):
+        delays.append(seconds)
+        raise KeyboardInterrupt
+    assert execute(LimitedSchool(), tmp_path, sleep=stop) == 130
+    assert delays == [600]
+
+
+def test_explicit_bad_credentials_stop_without_repeated_login(tmp_path):
+    school = School()
+    school.login_reply = {'code': 500, 'info': '用户名或密码错误'}
+    events = []
+    assert execute(school, tmp_path, notify=events.append) == 1
+    assert events == ['authentication_rejected']
+    assert len([url for method, url, _ in school.requests if method == 'POST' and url.endswith('casLogin')]) == 1
+
+
+def test_empty_ocr_output_has_bounded_attempts_and_does_not_block_other_candidates(tmp_path):
+    school = School()
+    school.activities = [lecture(), lecture('two')]
+    answers = iter(['', '', '', '', '1234'])
+    assert execute(school, tmp_path, recognize=lambda _: next(answers)) == 0
+    assert school.submitted == ['two']
+
+
+def test_gateway_steps_and_application_cas_reuse_preserve_service_but_use_https(tmp_path, capsys):
+    class GatewaySchool(School):
+        application_ready = False
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            path = urlsplit(url).path
+            if path.endswith('loginRedirect'):
+                response.status_code = 302
+                query = urlencode({'nextService': 'auth/authCheck', 'taskId': 'test-task',
+                                   'data': json.dumps({'env': {'need': True}, 'ticket': 'SIMULATED_TICKET'})})
+                response.headers['Location'] = 'https://vpn.seu.edu.cn/callback?' + query
+            elif path.endswith('index.do') and self.authenticated and not self.application_ready:
+                response.status_code = 302
+                response.headers['Location'] = 'https://auth.seu.edu.cn/dist/#/login?' + urlencode({'service': 'http://ehall.seu.edu.cn/app'})
+            elif path.endswith('verifyTgt'):
+                assert kwargs['json']['service'] == 'http://ehall.seu.edu.cn/app'
+                self.application_ready = True
+                response._content = json.dumps({'code': 201, 'redirectUrl': 'http://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do?ticket=SIMULATED_TICKET'}).encode()
+            elif path.endswith('reportEnv'):
+                assert kwargs['json']['ticket'] == 'SIMULATED_TICKET'
+                assert kwargs['json']['env']['endpoint']['device']['type'] == 'browser'
+            return response
+    school = GatewaySchool()
+    school.activities = [lecture()]
+    assert execute(school, tmp_path) == 0
+    assert school.submitted == ['one']
+    assert any(url.endswith('reportEnv') for _, url, _ in school.requests)
+    assert any(url.endswith('auth/authCheck') for _, url, _ in school.requests)
+    assert all(url.startswith('https://') and kwargs['verify'] for _, url, kwargs in school.requests)
+    assert 'SIMULATED_TICKET' not in capsys.readouterr().out
+
+
+def test_rate_limited_submission_waits_before_any_confirmation_query(tmp_path):
+    class LimitedSubmission(School):
+        limited = False
+        queries_after_limit = 0
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if url.endswith('addReservation.do'):
+                self.limited = True
+                response.status_code = 429
+                response.headers['Retry-After'] = '600'
+            elif self.limited and url.endswith('queryMyActivityList.do'):
+                self.queries_after_limit += 1
+            return response
+    school = LimitedSubmission()
+    school.activities = [lecture()]
+    delays = []
+    def stop(seconds):
+        delays.append(seconds)
+        raise KeyboardInterrupt
+    execute(school, tmp_path, sleep=stop)
+    assert delays == [600]
+    assert school.queries_after_limit == 0
+
+
+def test_large_recoverable_state_does_not_block_restart(tmp_path):
+    school = School()
+    assert execute(school, tmp_path, sleep=interrupted) == 130
+    path = tmp_path / 'task.json'
+    saved = json.loads(path.read_text())
+    saved['cooldowns'] = {str(n).zfill(32): 1 for n in range(2000)}
+    path.write_text(json.dumps(saved))
+    school.activities = [lecture()]
+    assert execute(school, tmp_path) == 0
+    assert school.submitted == ['one']
+
+
+def test_persistent_preflight_failure_backs_off_and_notifies(tmp_path):
+    class FailedPreflight(School):
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if url.endswith('appiontCheck.do'):
+                response.status_code = 500
+            return response
+    school = FailedPreflight()
+    school.activities = [lecture()]
+    delays, events = [], []
+    def stop(seconds):
+        delays.append(seconds)
+        if len(delays) == 3:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, sleep=stop, notify=events.append) == 130
+    assert delays == [20, 40, 80]
+    assert events == ['query_failure']

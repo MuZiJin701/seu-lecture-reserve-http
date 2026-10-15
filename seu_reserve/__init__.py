@@ -1,0 +1,1 @@
+"""SEU lecture reservation client."""

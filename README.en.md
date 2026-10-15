@@ -49,9 +49,18 @@ This only logs in, queries data and fetches a CAPTCHA. It does not submit a rese
 
 **4. Start reservations**
 
-First fill in `SMTP_HOST`, `MAIL_FROM`, `MAIL_TO`, and any required SMTP credentials in `.env`. Mail uses implicit TLS on port `465` by default. Use the password or app password required by your mail provider.
+Email notifications are optional. Without mail configuration, reservations still work and events such as success, required manual authentication and persistent errors remain in the terminal and local log.
 
-Email alerts cover reservation success, required manual authentication, persistent errors and unconfirmed results. Mail configuration is required for normal operation. See the [Gmail setup guide](docs/usage.md#gmail-示例) (Chinese).
+For Gmail notifications, enter just your full email address and app password in `.env`. Messages go to the same address by default:
+
+```dotenv
+SMTP_USERNAME=your-address@gmail.com
+SMTP_PASSWORD='your-app-password'
+```
+
+The client automatically uses `smtp.gmail.com:465` with implicit TLS. See the [Gmail setup guide](docs/usage.md#gmail-示例) (Chinese) for app passwords and advanced settings for other providers. Existing complete SMTP configurations still work. Incomplete or malformed mail settings stop startup.
+
+When upgrading, nonempty `SMTP_HOST`, `MAIL_FROM` and `MAIL_TO` values keep overriding automatic defaults. To disable email, clear all mail fields; `SMTP_PORT` may be empty, absent or left at the default `465`. Also check matching process environment variables.
 
 ```bash
 uv run --locked seu-reserve
@@ -71,7 +80,7 @@ Edit `.env`, then restart. Lists use JSON arrays, as in the campus example above
 | `SEU_REQUIRED_CATEGORIES` | Allowed lecture categories; you can keep the example values |
 | `SEU_ENABLE_ONLINE` / `SEU_ENABLE_OFFLINE` | Allow online / offline lectures; use `true` or `false` |
 | `SEU_PREFERRED_LECTURES` | Match exact full titles; `'[]'` leaves titles unrestricted |
-| `SMTP_*` / `MAIL_*` | Email notifications for success, required manual authentication or persistent failures |
+| `SMTP_*` / `MAIL_*` | Optional email notifications; Gmail needs only `SMTP_USERNAME` and `SMTP_PASSWORD` |
 
 Exact titles still obey all other filters and time-conflict checks. Process environment variables take precedence over matching `.env` settings.
 See [.env.example](.env.example) for all settings and the [usage guide](docs/usage.md) (Chinese) for formats and troubleshooting.

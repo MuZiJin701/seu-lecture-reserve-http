@@ -19,7 +19,7 @@ uv run --locked seu-reserve --help
 ```bash
 cp -n .env.example .env
 chmod 600 .env
-# 编辑 .env，填写登录信息、筛选和邮件配置
+# 编辑 .env，填写登录信息、筛选及可选的邮件配置
 uv run --locked seu-reserve --status
 ```
 
@@ -44,38 +44,40 @@ uv run --locked seu-reserve --status
 为保留此前的使用方式，也接受 `SEU_USERNAME`；同一来源同时有它和 `SEU_CARD_NUMBER` 时后者优先，任何进程环境中的账号设置都优先于文件中的账号设置。
 未填写登录信息时仍可在交互终端隐藏输入；非交互运行缺少凭据时直接报错。
 
-正式预约还需在同一 `.env` 中填写邮件配置：
+邮件通知可选。不填写邮件配置也能正常预约，成功、需要人工认证、持续异常或结果待确认时仍记录终端和本地事件，但不会主动发信；需要自己查看终端和日志。
+
+Gmail 只需填写 `SMTP_USERNAME`（完整的 `@gmail.com` 邮箱地址）和 `SMTP_PASSWORD`（应用专用密码），其余配置自动补全，默认自己给自己发邮件。设置方法见下方 [Gmail 示例](#gmail-示例)。
+
+以下字段保留为高级配置，非空的显式值优先于自动补全；已有完整配置仍可使用，包括无需认证的 TLS 中继：
 
 | 变量 | 含义 |
 | --- | --- |
-| `SMTP_HOST` | SMTP TLS 主机 |
+| `SMTP_HOST` | SMTP TLS 主机；Gmail 默认 `smtp.gmail.com`，其他邮箱及自定义域名需手动填写 |
 | `SMTP_PORT` | 隐式 TLS 端口，默认 465 |
-| `MAIL_FROM` / `MAIL_TO` | 发件人 / 收件人 |
+| `MAIL_FROM` / `MAIL_TO` | 发件人默认取 `SMTP_USERNAME`；收件人默认取发件人 |
 | `SMTP_USERNAME` / `SMTP_PASSWORD` | SMTP 认证，需成对提供；允许无需认证的 TLS 中继 |
 
 首版使用 SMTP 隐式 TLS，不提供明文连接或 STARTTLS 模式。邮件只包含固定事件、时间和处理提示，不包含学校账号、标题、验证码或个人活动记录。
 
-邮件用于提醒预约成功、需要人工认证、持续异常及预约结果待确认，不读取收件箱，也不代替手机短信验证。收到认证提醒后，仍需回到 SSH 终端处理。正常等待不发送邮件；只填收件邮箱不能完成发信配置。
+邮件启用后用于提醒预约成功、需要人工认证、持续异常及预约结果待确认，不读取收件箱，也不代替手机短信验证。收到认证提醒后，仍需回到 SSH 终端处理。正常等待不发送邮件；只填收件邮箱不能完成发信配置。
 
-正式运行显示 `event=mail_configuration_invalid` 时，请检查 `.env`：`SMTP_HOST`、`MAIL_FROM`、`MAIL_TO` 不能为空，`SMTP_PORT` 必须为有效端口；需要认证时同时填写 `SMTP_USERNAME` 和 `SMTP_PASSWORD`。只读 `--check` 不检查邮件配置，因此只读通过后仍需完成这一步。程序不会在邮件配置无效时开始预约。
+所有邮件字段缺省或为空时关闭邮件；单独保留旧样例中的 `SMTP_PORT=465` 也视为未启用。要关闭已有邮件通知，清空 `SMTP_USERNAME`、`SMTP_PASSWORD`、`SMTP_HOST`、`MAIL_FROM` 和 `MAIL_TO`，并将 `SMTP_PORT` 留空、删除或保留为 `465`；进程环境中的同名配置也需清除。
+
+尝试配置但缺项、邮箱格式错误、无法确定 SMTP 主机或端口无效时，显示 `event=mail_configuration_invalid` 并停止启动。Gmail 的账号与应用专用密码需同时填写；其他邮箱需提供 `SMTP_HOST`，发件人与收件人必须可确定。只读 `--check` 不检查邮件配置，也不发送测试邮件。实际发信失败仅记录 `notification_failed`，不会改变预约结果或触发重复预约。
 
 从此前 TOML 方式迁移时，按新 `.env.example` 填入对应字段即可；TOML 配置入口已移除，已有个人 `config.local.toml` 不会被删除。
 旧 Playwright 项目的浏览器专用超时参数不适用于本项目，不要原样复制整个旧 `.env`；正常轮询仍为已确认的 10 秒。
 
 ### Gmail 示例
 
-先为 Google 账号开启[两步验证](https://myaccount.google.com/signinoptions/two-step-verification)，再创建[应用专用密码](https://myaccount.google.com/apppasswords)。将以下内容填入本机 `.env`，三个邮箱位置可以使用同一个 Gmail 地址：
+先为 Google 账号开启[两步验证](https://myaccount.google.com/signinoptions/two-step-verification)，再创建[应用专用密码](https://myaccount.google.com/apppasswords)。将以下两项填入本机 `.env`：
 
 ```dotenv
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=465
 SMTP_USERNAME=your-address@gmail.com
 SMTP_PASSWORD='your-app-password'
-MAIL_FROM=your-address@gmail.com
-MAIL_TO=your-address@gmail.com
 ```
 
-将邮箱和应用专用密码占位值替换为自己的值。服务器与端口见 [Google SMTP 文档](https://developers.google.com/workspace/gmail/imap/imap-smtp)；本客户端使用应用专用密码，不填写 Google 账号的日常登录密码。
+将邮箱和应用专用密码占位值替换为自己的值。程序自动使用 `smtp.gmail.com:465`，发件人与收件人均为上述邮箱；若旧文件仍有 `SMTP_HOST`、`SMTP_PORT`、`MAIL_FROM`、`MAIL_TO`，请清空或删除这些项以使用自动补全。服务器与端口见 [Google SMTP 文档](https://developers.google.com/workspace/gmail/imap/imap-smtp)；本客户端使用应用专用密码，不填写 Google 账号的日常登录密码。
 若页面显示“您的账号不支持您正在尝试的设置”，先确认两步验证已开启；组织账号、仅使用安全密钥的两步验证或高级保护计划也可能限制此功能，见 [Google 官方说明](https://support.google.com/accounts/answer/185833?hl=zh-Hans)。不要为了配置邮件关闭账号安全保护。
 配置格式通过检查不代表邮件已送达；服务器还需要能连接 Gmail 的 SMTP 服务。`--check` 不发送测试邮件。
 
@@ -123,8 +125,8 @@ uv run --locked seu-reserve --new-task
 | 正常等待 | 没有合适候选，继续查询，不发送邮件 |
 | `event=invalid_activity_data` | 无法确认已有活动的状态、ID 或时间，暂停本轮提交并退避；不是“没抢到讲座” |
 | `event=activity_schema_unknown` | 候选关键字段无法识别，暂停本轮提交并退避 |
-| `event=query_failure` | 连续三轮查询或处理出错，尝试发送一次邮件提醒；正常空列表不会触发 |
-| `event=mail_configuration_invalid` | 邮件配置缺失或无效，启动停止；按上文检查 `.env` |
+| `event=query_failure` | 连续三轮查询或处理出错；启用邮件时尝试发送一次提醒，正常空列表不会触发 |
+| `event=mail_configuration_invalid` | 已尝试配置邮件但内容不完整或无效，启动停止；完全不配置邮件允许运行 |
 | `event=reservation_unconfirmed` | 已尝试提交但结果不明，核对原活动并等待人工处理，不继续提交其他场次 |
 | `event=reservation_succeeded` | 已按活动 ID 查询确认预约成功，本任务结束 |
 
@@ -177,6 +179,7 @@ Ctrl+C 退出码为 130，不会自动取消已有预约。
 ## 验收记录
 
 - 已完成：离线入口场景、类型检查、命令行检查；OCR 模型可加载并处理本地合成图片。
+- 2026-10-15：邮件改为可选，Gmail 支持邮箱地址和应用专用密码两项配置；已通过空配置、配置错误、Gmail 自动补全、旧配置及发信失败不重复预约的离线检查，未发送真实邮件。
 - 2026-10-15：修复 CAS 对默认请求头返回 HTTP 403 的问题后，真实 `uv run --locked seu-reserve --check` 通过，显示 `event=read_only_complete`。
 - 2026-10-15：适配“我的活动”实际字段，修复 `invalid_activity_data`；在隔离临时任务中验证一轮真实查询及 10 秒等待，禁用邮件并阻止预约写入，原任务未修改。
 - 双轴代码审查已完成，Standards 与 Spec 的行动项已修正并通过增量复审，包括提交限流、持续前置检查故障和大状态重启。

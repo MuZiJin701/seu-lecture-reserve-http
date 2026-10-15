@@ -49,9 +49,18 @@ uv run --locked seu-reserve --check
 
 **4. 启动预约**
 
-先在 `.env` 中填写 `SMTP_HOST`、`MAIL_FROM`、`MAIL_TO` 及所需的 SMTP 账号和密码。邮件使用隐式 TLS，默认端口为 `465`；密码或授权码按邮箱服务商的要求填写。
+邮件通知可选；不配置邮件也能正常预约，成功、需要人工认证或持续异常时仍在终端和本地日志记录。
 
-邮件用于提醒预约成功、需要人工认证、持续异常或结果待确认，正式运行需要配置。Gmail 的填写方法见[使用指南](docs/usage.md#gmail-示例)。
+需要 Gmail 通知时，只需在 `.env` 中填写完整邮箱地址和应用专用密码，默认自己给自己发信：
+
+```dotenv
+SMTP_USERNAME=your-address@gmail.com
+SMTP_PASSWORD='your-app-password'
+```
+
+程序自动使用 `smtp.gmail.com:465`，通过隐式 TLS 发信。应用专用密码设置及其他邮箱的高级配置见[使用指南](docs/usage.md#gmail-示例)。已有完整 SMTP 配置仍可用；配置不完整或格式错误时会停止启动。
+
+从旧版本升级时，非空的 `SMTP_HOST`、`MAIL_FROM`、`MAIL_TO` 会继续覆盖自动补全。需要关闭邮件时，清空所有邮件字段；`SMTP_PORT` 可以留空、删除或保留默认 `465`。同时检查进程环境变量中的同名配置。
 
 ```bash
 uv run --locked seu-reserve
@@ -71,7 +80,7 @@ uv run --locked seu-reserve
 | `SEU_REQUIRED_CATEGORIES` | 允许的讲座类别，可保留样例值 |
 | `SEU_ENABLE_ONLINE` / `SEU_ENABLE_OFFLINE` | 是否允许线上 / 线下，填 `true` 或 `false` |
 | `SEU_PREFERRED_LECTURES` | 只匹配指定的完整标题；`'[]'` 表示不限标题 |
-| `SMTP_*` / `MAIL_*` | 成功、需要人工认证或持续失败时的邮件通知 |
+| `SMTP_*` / `MAIL_*` | 可选的邮件通知；Gmail 只需 `SMTP_USERNAME` 和 `SMTP_PASSWORD` |
 
 指定标题仍须满足其他筛选和时间冲突条件。进程环境变量优先于 `.env` 中的同名配置。
 全部配置见 [.env.example](.env.example)，格式和排查方法见[使用指南](docs/usage.md)。

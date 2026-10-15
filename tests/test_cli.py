@@ -104,7 +104,9 @@ def test_example_is_valid_dotenv_with_the_confirmed_default_categories(tmp_path)
     assert result.stdout.strip() == 'status=not_started'
 
 
-def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize('simple_gmail', [False, True])
+def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
+        tmp_path, monkeypatch, capsys, simple_gmail):
     import base64
     from types import SimpleNamespace
     from cryptography.hazmat.primitives.asymmetric import padding
@@ -125,21 +127,25 @@ def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
     messages = []
     class SMTP:
         def __init__(self, host, port, **kwargs):
-            assert (host, port) == ('smtp.example.org', 465)
+            assert (host, port) == ('smtp.gmail.com' if simple_gmail else 'smtp.example.org', 465)
+            assert kwargs['context'].check_hostname
         def __enter__(self):
             return self
         def __exit__(self, *args):
             return False
         def login(self, username, secret):
-            assert (username, secret) == ('mail-user', 'test ${mail} # = password')
+            assert username == ('sender@gmail.com' if simple_gmail else 'mail-user')
+            assert secret == 'test ${mail} # = password'
         def send_message(self, message):
             messages.append(message)
     (tmp_path / '.env').write_text(
         "SEU_CARD_NUMBER=test-user\nSEU_PASSWORD='test ${literal} # = password'\n"
         "SEU_PREFERRED_LECTURES='[\"指定讲座\"]'\nSEU_PREFERRED_CAMPUS='[\"无锡校区\"]'\n"
-        "SEU_ENABLE_ONLINE=false\nSEU_ENABLE_OFFLINE=true\nSEU_STATE_DIR=jobs\n"
-        "SMTP_HOST=smtp.example.org\nSMTP_USERNAME=mail-user\nSMTP_PASSWORD='test ${mail} # = password'\n"
-        "MAIL_FROM=sender@example.org\nMAIL_TO=receiver@example.org\n")
+        "SEU_ENABLE_ONLINE=false\nSEU_ENABLE_OFFLINE=true\nSEU_STATE_DIR=jobs\n" +
+        ("SMTP_USERNAME=sender@gmail.com\nSMTP_PASSWORD='test ${mail} # = password'\n"
+         "SMTP_HOST=\nSMTP_PORT=\nMAIL_FROM=\nMAIL_TO=\n" if simple_gmail else
+         "SMTP_HOST=smtp.example.org\nSMTP_USERNAME=mail-user\nSMTP_PASSWORD='test ${mail} # = password'\n"
+         "MAIL_FROM=sender@example.org\nMAIL_TO=receiver@example.org\n"))
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr('os.environ', {})
     monkeypatch.setattr('requests.Session', lambda: school)
@@ -149,4 +155,6 @@ def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
     assert main([]) == 0
     assert school.submitted == ['chosen']
     assert len(messages) == 1
+    assert messages[0]['From'] == ('sender@gmail.com' if simple_gmail else 'sender@example.org')
+    assert messages[0]['To'] == ('sender@gmail.com' if simple_gmail else 'receiver@example.org')
     assert password not in capsys.readouterr().out

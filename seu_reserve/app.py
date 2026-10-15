@@ -84,13 +84,16 @@ def run(settings: Settings, *, session: Any = None,
             task.save()
         if task.data['status'] == 'done':
             return 0
-        if notify is None:
+        if notify is None and (any(environ.get(key) for key in
+                                  ('SMTP_HOST', 'SMTP_USERNAME', 'SMTP_PASSWORD', 'MAIL_FROM', 'MAIL_TO'))
+                               or environ.get('SMTP_PORT', '') not in ('', '465')):
             try:
                 notify = Mailer(environ)
             except ValueError:
                 print('event=mail_configuration_invalid', flush=True)
-                print('邮件配置不完整或格式错误。请检查 .env 中的 SMTP_HOST、SMTP_PORT、MAIL_FROM、MAIL_TO；'
-                      'SMTP_USERNAME 与 SMTP_PASSWORD 需同时填写。', flush=True)
+                print('邮件配置不完整或格式错误。Gmail 只需在 .env 中填写 SMTP_USERNAME（完整邮箱地址）'
+                      '和 SMTP_PASSWORD（应用专用密码）；其他邮箱需指定 SMTP_HOST。'
+                      '高级配置请检查 SMTP_PORT、MAIL_FROM、MAIL_TO。清空邮件配置可关闭通知。', flush=True)
                 return 1
         checkpoint = task
         def defer(seconds: float) -> None:

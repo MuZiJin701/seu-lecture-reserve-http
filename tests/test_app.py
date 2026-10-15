@@ -228,7 +228,14 @@ def test_unsupported_activity_schema_alerts_instead_of_looking_like_empty_list(t
 
 
 @pytest.mark.parametrize('mail', [
-    {},
+    {'SMTP_USERNAME': 'sender@gmail.com'},
+    {'SMTP_PASSWORD': 'SECRET-app-password'},
+    {'SMTP_USERNAME': '@gmail.com', 'SMTP_PASSWORD': 'SECRET-app-password'},
+    {'SMTP_USERNAME': 'sender@@gmail.com', 'SMTP_PASSWORD': 'SECRET-app-password'},
+    {'SMTP_USERNAME': 'sender@example.org', 'SMTP_PASSWORD': 'SECRET-app-password'},
+    {'SMTP_USERNAME': 'sender@gmail.com', 'SMTP_PASSWORD': 'SECRET-app-password', 'MAIL_TO': 'invalid'},
+    {'SMTP_PORT': 'SECRET-invalid-port'},
+    {'SMTP_PORT': '587'},
     {'SMTP_HOST': 'smtp.example.org', 'MAIL_FROM': 'sender@example.org',
      'MAIL_TO': 'receiver@example.org', 'SMTP_PORT': 'SECRET-invalid-port'},
     {'SMTP_HOST': 'smtp.example.org', 'MAIL_FROM': 'sender@example.org',
@@ -245,18 +252,40 @@ def test_invalid_mail_configuration_explains_startup_failure_without_network(tmp
     assert not school.requests
 
 
-def test_default_email_contains_only_event_and_mail_failure_does_not_repeat_booking(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize('mail', [{}, {
+    'SMTP_HOST': '', 'SMTP_PORT': '465', 'SMTP_USERNAME': '',
+    'SMTP_PASSWORD': '', 'MAIL_FROM': '', 'MAIL_TO': '',
+}])
+def test_no_mail_configuration_still_books_and_records_success(tmp_path, monkeypatch, capsys, mail):
+    def unexpected_smtp(*args, **kwargs):
+        pytest.fail('disabled mail must not open an SMTP connection')
+    monkeypatch.setattr('smtplib.SMTP_SSL', unexpected_smtp)
+    school = School()
+    school.activities = [lecture()]
+    env = {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password', **mail}
+    assert run(Settings(state_dir=tmp_path), session=school, environ=env,
+               recognize=lambda _: '1234', sleep=lambda _: None) == 0
+    assert school.submitted == ['one']
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'done'
+    assert 'event=reservation_succeeded' in capsys.readouterr().out
+    assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
+
+
+@pytest.mark.parametrize('authenticated', [False, True])
+def test_default_email_contains_only_event_and_mail_failure_does_not_repeat_booking(
+        tmp_path, monkeypatch, capsys, authenticated):
     messages = []
+    logins = []
     class SMTP:
         def __init__(self, host, port, **kwargs):
-            assert (host, port) == ('smtp.example.org', 465)
+            assert (host, port) == ('smtp.example.org', 2465)
             assert kwargs['context'].check_hostname
         def __enter__(self):
             return self
         def __exit__(self, *args):
             return False
         def login(self, username, password):
-            assert username == 'mail-user'
+            logins.append((username, password))
         def send_message(self, message):
             messages.append(message)
             raise OSError('SECRET mail password')
@@ -264,14 +293,20 @@ def test_default_email_contains_only_event_and_mail_failure_does_not_repeat_book
     school = School()
     school.activities = [lecture(HDMC='PRIVATE TITLE')]
     env = {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password',
-           'SMTP_HOST': 'smtp.example.org', 'SMTP_USERNAME': 'mail-user', 'SMTP_PASSWORD': 'private-mail-password',
+           'SMTP_HOST': 'smtp.example.org', 'SMTP_PORT': '2465',
            'MAIL_FROM': 'sender@example.org', 'MAIL_TO': 'receiver@example.org'}
+    if authenticated:
+        env.update(SMTP_USERNAME='sender@gmail.com', SMTP_PASSWORD='private-mail-password')
     assert run(Settings(state_dir=tmp_path), session=school, environ=env,
                recognize=lambda _: '1234', sleep=lambda _: None) == 0
     assert len(messages) == 1
+    assert logins == ([('sender@gmail.com', 'private-mail-password')] if authenticated else [])
+    assert messages[0]['From'] == 'sender@example.org'
+    assert messages[0]['To'] == 'receiver@example.org'
     assert 'reservation_succeeded' in messages[0].get_content()
     assert 'PRIVATE TITLE' not in messages[0].get_content()
     assert 'SECRET' not in capsys.readouterr().out
+    assert 'event=notification_failed' in (tmp_path / 'events.log').read_text()
     assert execute(school, tmp_path) == 0
     assert school.submitted == ['one']
 

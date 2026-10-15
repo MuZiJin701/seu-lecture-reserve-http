@@ -1,5 +1,6 @@
 """SMTP over TLS; event messages contain no school account or lecture data."""
 
+import re
 import smtplib
 import ssl
 from collections.abc import Mapping
@@ -9,14 +10,16 @@ from email.message import EmailMessage
 
 class Mailer:
     def __init__(self, environ: Mapping[str, str]):
-        self.host = environ.get('SMTP_HOST', '')
-        self.port = int(environ.get('SMTP_PORT', '465'))
-        self.sender = environ.get('MAIL_FROM', '')
-        self.recipient = environ.get('MAIL_TO', '')
         self.username = environ.get('SMTP_USERNAME', '')
         self.password = environ.get('SMTP_PASSWORD', '')
+        self.host = environ.get('SMTP_HOST') or (
+            'smtp.gmail.com' if self.username.rpartition('@')[2].lower() == 'gmail.com' else '')
+        self.port = int(environ.get('SMTP_PORT') or '465')
+        self.sender = environ.get('MAIL_FROM') or self.username
+        self.recipient = environ.get('MAIL_TO') or self.sender
         if (not self.host or not 1 <= self.port <= 65535
-                or '@' not in self.sender or '@' not in self.recipient
+                or any(not re.fullmatch(r'[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+', address)
+                       for address in (self.sender, self.recipient))
                 or any(c in self.host + self.sender + self.recipient for c in '\r\n')
                 or bool(self.username) != bool(self.password)):
             raise ValueError('mail_configuration_invalid')

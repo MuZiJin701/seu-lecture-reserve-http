@@ -57,6 +57,8 @@ uv run --locked seu-reserve --check
 
 失败时，`event=task_failed` 会附带 `stage`（失败阶段）、`reason`（安全错误码），HTTP 请求失败还会显示 `http_status`。TLS 失败会显示学校域名 `host`、细分类别 `tls_reason`，以及可确定时的 `proxy_used`；排查时请提供这一整行。
 
+若确认 `vpn.seu.edu.cn` 的本机 DNS 解析有误，可在项目 `.env` 中设置可选的 `SEU_VPN_IP`，保留域名证书校验，且不修改系统 DNS 或 TUN。配置及限制见[使用文档](docs/usage.md#仅在项目内绕过网关-dns-故障)。正常网络无需设置。
+
 **4. 启动预约**
 
 邮件通知可选；不配置邮件也能正常预约，成功、需要人工认证或持续异常时仍在终端和本地日志记录。

@@ -57,6 +57,8 @@ This only logs in, queries data and fetches a CAPTCHA. It does not submit a rese
 
 On failure, `event=task_failed` includes `stage` and a safe `reason` code, plus `http_status` for HTTP errors. TLS failures include the school domain in `host`, a `tls_reason` category, and `proxy_used` when available. Include this entire line when reporting a failure.
 
+If local DNS is confirmed to resolve `vpn.seu.edu.cn` incorrectly, set the optional `SEU_VPN_IP` in the project's `.env`. Domain certificate verification remains enabled, and system DNS and TUN settings stay unchanged. See the [usage guide](docs/usage.md#仅在项目内绕过网关-dns-故障) for configuration and limitations. Leave it unset on working networks.
+
 **4. Start reservations**
 
 Email notifications are optional. Without mail configuration, reservations still work and events such as success, required manual authentication and persistent errors remain in the terminal and local log.

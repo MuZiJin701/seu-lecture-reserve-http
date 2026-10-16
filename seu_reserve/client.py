@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from ipaddress import ip_address
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
@@ -19,6 +20,24 @@ CAS = 'https://auth.seu.edu.cn/auth/casback/'
 GATEWAY = 'https://vpn.seu.edu.cn'
 API_PARAMS = {'clientType': 'SDPBrowserClient', 'platform': 'Linux', 'lang': 'zh-CN'}
 HOSTS = {'auth.seu.edu.cn', 'vpn.seu.edu.cn', 'ehall.seu.edu.cn'}
+
+
+class GatewayIPAdapter(requests.adapters.HTTPAdapter):
+    def __init__(self, address: str):
+        # shortcut: a configured gateway IP can change; update it when the university moves the gateway.
+        self.address = str(ip_address(address))
+        super().__init__()
+
+    def build_connection_pool_key_attributes(self, request: requests.PreparedRequest,
+            verify: Any, cert: Any = None) -> Any:
+        attributes: Any = super().build_connection_pool_key_attributes(request, verify, cert)
+        host, tls = attributes
+        tls['server_hostname'] = host['host']
+        host['host'] = self.address
+        return host, tls
+
+    def add_headers(self, request: requests.PreparedRequest, **kwargs: Any) -> None:
+        request.headers['Host'] = 'vpn.seu.edu.cn'
 
 
 def has_code(payload: dict[str, Any], expected: int) -> bool:
@@ -52,6 +71,10 @@ class Client:
         self.environ = environ
         self.prompt = prompt
         self.notify = notify
+        if address := environ.get('SEU_VPN_IP', '').strip():
+            adapter = GatewayIPAdapter(address)
+            session.mount(GATEWAY + '/', adapter)
+            session.mount(GATEWAY + ':443/', adapter)
 
     def request(self, method: str, url: str, **kwargs: Any) -> Any:
         parsed = urlsplit(url)

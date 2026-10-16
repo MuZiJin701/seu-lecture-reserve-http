@@ -28,7 +28,7 @@ def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[S
     allowed = {'SEU_CARD_NUMBER', 'SEU_USERNAME', 'SEU_PASSWORD', 'SEU_PREFERRED_LECTURES',
                'SEU_REQUIRED_CATEGORIES', 'SEU_PREFERRED_CAMPUS', 'SEU_ENABLE_ONLINE',
                'SEU_ENABLE_OFFLINE', 'SEU_STATE_DIR', 'SMTP_HOST', 'SMTP_PORT',
-               'SMTP_USERNAME', 'SMTP_PASSWORD', 'MAIL_FROM', 'MAIL_TO'}
+               'SMTP_USERNAME', 'SMTP_PASSWORD', 'MAIL_FROM', 'MAIL_TO', 'SEU_VPN_IP'}
     if set(values) - allowed:
         raise ValueError('unknown_configuration_key')
     environ = {**values, **process}

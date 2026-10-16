@@ -40,6 +40,7 @@ uv run --locked seu-reserve --status
 | `SEU_PREFERRED_CAMPUS` | 允许的线下校区 JSON 数组，`'[]'` 表示不约线下 |
 | `SEU_ENABLE_ONLINE` / `SEU_ENABLE_OFFLINE` | 是否允许线上 / 线下，值为 `true` 或 `false` |
 | `SEU_STATE_DIR` | 任务状态和日志目录，默认 `state` |
+| `SEU_VPN_IP` | 可选的 VPN 网关 IP；缺省或空值使用原有 DNS，仅在确认网关域名解析故障时填写 |
 
 列表是 JSON 数组，外层用单引号，例如 `SEU_PREFERRED_CAMPUS='["无锡校区"]'`。
 标题完整匹配仍受其他筛选及冲突规则约束；线上识别来自明确业务字段，不从标题猜测。
@@ -108,6 +109,20 @@ uv run --locked seu-reserve --check
 TLS 失败会额外显示 `host`（通过白名单校验的学校域名）、`tls_reason` 和可确定时的 `proxy_used=true/false`（Requests 是否选择了代理，不输出代理地址或凭据）。`tls_reason` 只输出预设类别，无法识别时为 `unknown`：`certificate_verify_failed` 表示证书校验失败，`unexpected_eof_while_reading` 表示 TLS 连接意外中断，`unsafe_legacy_renegotiation_disabled` 表示旧式 TLS 重协商不兼容；其他握手类别按原错误码的小写形式输出。不要把所有 `tls_failure` 都归因于代理。
 
 此检查验证接口读取及图片解码，不代表活动字段映射、冲突数据完整性、OCR 准确率或真实预约已验收。
+
+### 仅在项目内绕过网关 DNS 故障
+
+本机网络的 DNS 或 TUN 内部解析可能对 `vpn.seu.edu.cn` 返回 NXDOMAIN，即使公共 DNS 能返回有效地址。TUN 接管连接后无法解析真实 IP 并关闭连接，客户端可能显示 `tls_reason=unexpected_eof_while_reading`。只有确认这个原因后，才使用此配置；其他 TLS 错误仍需分别排查。
+
+在项目 `.env` 中填写已确认的网关 IP，例如 2026-10-16 排查时公共 DNS 返回的地址：
+
+```dotenv
+SEU_VPN_IP=121.249.14.2
+```
+
+程序只替换本次会话对 `vpn.seu.edu.cn:443` 的连接地址；请求 URL、HTTP Host、TLS SNI、证书域名校验和 Cookie 仍使用原域名。其他学校域名、系统 DNS、代理及 TUN 设置不变。IP 必须是有效的 IPv4 或 IPv6 字面地址，不接受域名、URL 或端口；进程环境变量优先于 `.env`。
+
+重新运行 `uv run --locked seu-reserve --check`。此配置不自动查询公共 DNS，也不在失败后重放请求。网关 IP 可能变化，示例地址不是永久保证；失效时重新向可信公共 DNS 核对该域名的 A/AAAA 记录后更新。删除该配置或设为空值可恢复原有 DNS，云服务器等正常网络无需填写。不建议将该覆盖扩展到其他学校域名，它们可能需要校内 DNS。
 
 ## 运行和恢复
 

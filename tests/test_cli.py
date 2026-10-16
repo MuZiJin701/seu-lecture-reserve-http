@@ -8,7 +8,7 @@ import pytest
 
 def cli(directory, *args, environment=None):
     return subprocess.run([sys.executable, '-m', 'seu_reserve.cli', *args], cwd=directory,
-                          env=environment or {}, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+                          env=environment or {}, input='', capture_output=True, text=True, timeout=10)
 
 
 def test_status_and_help_do_not_require_credentials_or_network(tmp_path):
@@ -102,6 +102,7 @@ def test_process_account_aliases_override_file_and_resume_the_correct_account(tm
     'SEU_PREFERRED_LECTURES=SIMULATED_SECRET\n',
     'SEU_REQUIRED_CATEGORIES=\'[]\'\n',
     'SEU_ENABLE_ONLNE=SIMULATED_SECRET\n',
+    'SEU_CARD_NUMBER=test-user\nSEU_PASSWORD=test-password\nSEU_VPN_IP=SIMULATED_SECRET\n',
 ])
 def test_invalid_dotenv_never_echoes_values_or_starts_authentication(tmp_path, text):
     (tmp_path / '.env').write_text(text)
@@ -117,6 +118,15 @@ def test_example_is_valid_dotenv_with_the_confirmed_default_categories(tmp_path)
     result = cli(tmp_path, '--status')
     assert result.returncode == 0
     assert result.stdout.strip() == 'status=not_started'
+
+
+def test_gateway_ip_is_loaded_from_dotenv_and_process_takes_precedence(tmp_path):
+    from seu_reserve.cli import configuration_from
+
+    config = tmp_path / '.env'
+    config.write_text('SEU_VPN_IP=192.0.2.1\n')
+    assert configuration_from(config, {})[1]['SEU_VPN_IP'] == '192.0.2.1'
+    assert configuration_from(config, {'SEU_VPN_IP': '192.0.2.2'})[1]['SEU_VPN_IP'] == '192.0.2.2'
 
 
 @pytest.mark.parametrize('simple_gmail', [False, True])

@@ -91,7 +91,21 @@ uv run main.py --status
 | `pending` | A reservation submission result is unconfirmed |
 | `done` | The attendance goal is complete |
 
-**`scanning` does not prove the process is running.** For the background startup method above, also check the process recorded in the PID file:
+The first line remains `status=...`, followed by runtime information:
+
+| Field | Meaning |
+| --- | --- |
+| `process_running` | Whether a process holds this task's lock; `false` means no reservation instance is running |
+| `phase` | `authentication`: logging in; `waiting`: waiting after a scan; `waiting_for_attendance`: waiting for attendance; `backoff`: retry delay; `manual_required`: user action needed |
+| `last_query_at` / `last_query_age_seconds` | Most recent successful query and its age; `never` / `unknown` means none has been recorded |
+| `updated_at` / `snapshot_age_seconds` | Last runtime update and its age; investigate old snapshots together with the phase and `next_check_at` |
+| `failure_count` / `last_error` / `last_error_at` | Consecutive failures, latest error and its time; recovery resets the count but retains the error for diagnosis |
+| `activity_count` / `candidate_count` | Last activity-list size and matching candidate count; `unknown` means the list was not queried in that cycle |
+| `mail_status` | `disabled`, `ready`, `sending`, `accepted` by SMTP, or `failed`; this does not prove inbox delivery |
+
+Check `process_running=true`, a recent successful query and the current phase together. Zero candidates with an advancing success timestamp means normal waiting. Normal polling stays quiet. `phase=unknown` means an old task has no new runtime information, or its information is invalid; it is not evidence of health.
+
+**`scanning` alone does not prove the process is running.** For the background startup method above, you can also check the process recorded in the PID file:
 
 ```bash
 ps -p "$(cat state/runner.pid)" -o pid,ppid,args
@@ -149,9 +163,17 @@ SMTP_PASSWORD='your-app-password'
 
 Messages go to the same address by default. Use an app password. See the [usage guide](docs/usage.md#gmail-示例) (Chinese) for setup, other providers and disabling notifications.
 
+Send one test email without logging into the university or starting a reservation task:
+
+```bash
+uv run main.py --test-mail
+```
+
+`event=test_mail_accepted` means SMTP accepted the message; check your inbox separately. Normal operation attempts mail for confirmed bookings, goal completion, required manual action and caught fatal errors. Three consecutive query or processing failures trigger one alert; recovery resets the count. Single failures and normal waiting do not send mail. Failed mail records `notification_failed` without automatic resending. Forced termination, power loss or an unavailable mail service can prevent notifications.
+
 ## Before relying on it
 
-- Live login and read-only queries have been verified. Actual reservations, email delivery, SMS recovery and long-running operation still need acceptance testing. Confirm bookings and attendance in the [SEU portal](https://ehall.seu.edu.cn/); these counts do not replace final departmental assessment.
+- Live login, read-only queries and delivery of the test email have been verified. Actual reservations, SMS recovery and long-running operation still need acceptance testing. Confirm bookings and attendance in the [SEU portal](https://ehall.seu.edu.cn/); these counts do not replace final departmental assessment.
 - `.env` contains credentials; do not upload it. When a submission result is unclear, the client checks that activity before proceeding instead of blindly resubmitting.
 - Development checks, detailed settings and acceptance records are in the [usage guide](docs/usage.md) (Chinese).
 

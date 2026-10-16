@@ -16,7 +16,7 @@ def test_status_and_help_do_not_require_credentials_or_network(tmp_path):
     assert cli(tmp_path, '--help').returncode == 0
     status = cli(tmp_path, '--status')
     assert status.returncode == 0
-    assert status.stdout.strip() == 'status=not_started'
+    assert status.stdout.splitlines() == ['status=not_started', 'process_running=false', 'phase=unknown']
     assert not (tmp_path / 'state').exists()
 
 
@@ -64,7 +64,7 @@ def test_legacy_single_success_requires_credentials_to_recheck_goal(tmp_path):
     saved = json.dumps({'version': 1, 'account': '0' * 64,
         'status': 'done', 'activity': 'one', 'cooldowns': {}})
     (state / 'task.json').write_text(saved)
-    assert cli(tmp_path, '--status').stdout.strip() == 'status=legacy_completed'
+    assert cli(tmp_path, '--status').stdout.splitlines()[0] == 'status=legacy_completed'
     assert cli(tmp_path).returncode == 1
     assert (state / 'task.json').read_text() == saved
 
@@ -77,7 +77,7 @@ def test_dotenv_is_loaded_automatically_and_controls_state_directory(tmp_path):
         'status': 'done', 'activity': 'one', 'cooldowns': {}}))
     result = cli(tmp_path, '--status')
     assert result.returncode == 0
-    assert result.stdout.strip() == 'status=done'
+    assert result.stdout.splitlines()[0] == 'status=done'
 
 
 def test_environment_overrides_dotenv_and_explicit_path_does_not_search_other_files(tmp_path):
@@ -91,7 +91,7 @@ def test_environment_overrides_dotenv_and_explicit_path_does_not_search_other_fi
     (state / 'task.json').write_text('{"status":"done"}')
     result = cli(tmp_path, '--config', str(selected), '--status', environment={'SEU_STATE_DIR': 'overridden'})
     assert result.returncode == 0
-    assert result.stdout.strip() == 'status=done'
+    assert result.stdout.splitlines()[0] == 'status=done'
 
 
 @pytest.mark.parametrize('environment, expected', [
@@ -138,7 +138,7 @@ def test_example_is_valid_dotenv_with_the_confirmed_default_categories(tmp_path)
     (tmp_path / '.env').write_text(example.read_text())
     result = cli(tmp_path, '--status')
     assert result.returncode == 0
-    assert result.stdout.strip() == 'status=not_started'
+    assert result.stdout.splitlines()[0] == 'status=not_started'
 
 
 def test_gateway_ip_is_loaded_from_dotenv_and_process_takes_precedence(tmp_path):
@@ -148,6 +148,45 @@ def test_gateway_ip_is_loaded_from_dotenv_and_process_takes_precedence(tmp_path)
     config.write_text('SEU_VPN_IP=192.0.2.1\n')
     assert configuration_from(config, {})[1]['SEU_VPN_IP'] == '192.0.2.1'
     assert configuration_from(config, {'SEU_VPN_IP': '192.0.2.2'})[1]['SEU_VPN_IP'] == '192.0.2.2'
+
+
+@pytest.mark.parametrize('configuration, outcome', [
+    ('', 'mail_disabled'),
+    ('SMTP_USERNAME=sender@gmail.com\n', 'mail_configuration_invalid'),
+    ('SMTP_USERNAME=sender@gmail.com\nSMTP_PASSWORD=SECRET\n', 'test_mail_accepted'),
+])
+def test_test_mail_needs_no_school_credentials_or_task(tmp_path, monkeypatch, capsys, configuration, outcome):
+    from seu_reserve.cli import main
+    calls = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('os.environ', {})
+    (tmp_path / '.env').write_text(configuration)
+    def send(self, event):
+        calls.append(event)
+    monkeypatch.setattr('seu_reserve.mail.Mailer.__call__', send)
+    def school_forbidden():
+        pytest.fail('test mail must not access the school')
+    monkeypatch.setattr('requests.Session', school_forbidden)
+    assert main(['--test-mail']) == (0 if outcome == 'test_mail_accepted' else 1)
+    assert calls == (['test_notification'] if outcome == 'test_mail_accepted' else [])
+    output = capsys.readouterr().out
+    assert 'event=' + outcome in output
+    assert 'SECRET' not in output
+    assert not (tmp_path / 'state').exists()
+
+
+def test_test_mail_failure_is_safe_and_does_not_create_task(tmp_path, monkeypatch, capsys):
+    from seu_reserve.cli import main
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('os.environ', {})
+    (tmp_path / '.env').write_text('SMTP_USERNAME=sender@gmail.com\nSMTP_PASSWORD=SECRET\n')
+    def fail(self, event):
+        raise OSError('SECRET server reply')
+    monkeypatch.setattr('seu_reserve.mail.Mailer.__call__', fail)
+    assert main(['--test-mail']) == 1
+    output = capsys.readouterr().out
+    assert 'event=notification_failed' in output and 'SECRET' not in output
+    assert not (tmp_path / 'state').exists()
 
 
 @pytest.mark.parametrize('simple_gmail', [False, True])

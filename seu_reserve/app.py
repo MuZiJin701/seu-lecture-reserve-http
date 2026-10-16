@@ -44,8 +44,23 @@ def run(settings: Settings, *, session: Any = None,
         check_only: bool = False, new_task: bool = False) -> int:
     environ = os.environ if environ is None else environ
     announced: set[str] = set()
+    task = None
+    client = None
+    final_phase = 'stopped'
+    stage = 'configuration'
+    snapshot: dict[str, Any] = dict(phase='starting', last_query_at=0, last_error='none',
+        last_error_at=0, failure_count=0, next_check_at=0, mail_status='disabled',
+        last_mail_at=0, activity_count=None, candidate_count=None)
+    def health(**changes: Any) -> None:
+        snapshot.update(changes, updated_at=clock())
+        if task is not None:
+            task.data['health'] = dict(snapshot)
+            try:
+                task.save()
+            except (OSError, ValueError):
+                print('event=health_write_failed', flush=True)
     def record(event: str) -> None:
-        print('event=' + event, flush=True)
+        print(('' if check_only else f'{clock():.0f} ') + 'event=' + event, flush=True)
         if check_only:
             return
         try:
@@ -61,13 +76,29 @@ def run(settings: Settings, *, session: Any = None,
             announced.add(event)
         record(event)
         if notify:
+            health(mail_status='sending')
             try:
                 notify(event)
+                health(mail_status='accepted', last_mail_at=clock())
             except Exception:
                 record('notification_failed')
-    client = Client(session or requests.Session(), environ, prompt, emit)
-    task = None
+                health(mail_status='failed', last_mail_at=clock())
+    def ask(label: str) -> str:
+        health(phase='manual_required', next_check_at=0)
+        return prompt(label)
     try:
+        if not check_only:
+            if notify is None and Mailer.configured(environ):
+                try:
+                    notify = Mailer(environ)
+                except ValueError:
+                    print('event=mail_configuration_invalid', flush=True)
+                    print('邮件配置不完整或格式错误。Gmail 只需在 .env 中填写 SMTP_USERNAME（完整邮箱地址）'
+                          '和 SMTP_PASSWORD（应用专用密码）；其他邮箱需指定 SMTP_HOST。'
+                          '高级配置请检查 SMTP_PORT、MAIL_FROM、MAIL_TO。清空邮件配置可关闭通知。', flush=True)
+                    return 1
+            snapshot['mail_status'] = 'ready' if notify else 'disabled'
+        client = Client(session or requests.Session(), environ, ask, emit)
         if check_only:
             stage = 'authentication'
             client.authenticate()
@@ -80,28 +111,21 @@ def run(settings: Settings, *, session: Any = None,
             print('event=read_only_complete', flush=True)
             return 0
         task = Task(settings.state_dir, environ.get('SEU_USERNAME', ''))
+        health(phase='starting')
         if new_task:
             if task.data['status'] != 'done':
                 raise ValueError('active_task_cannot_be_reset')
             task.data.update(status='scanning', activity='', cooldowns={})
             task.save()
         if task.data['status'] == 'done':
+            final_phase = 'done'
             return 0
-        if notify is None and (any(environ.get(key) for key in
-                                  ('SMTP_HOST', 'SMTP_USERNAME', 'SMTP_PASSWORD', 'MAIL_FROM', 'MAIL_TO'))
-                               or environ.get('SMTP_PORT', '') not in ('', '465')):
-            try:
-                notify = Mailer(environ)
-            except ValueError:
-                print('event=mail_configuration_invalid', flush=True)
-                print('邮件配置不完整或格式错误。Gmail 只需在 .env 中填写 SMTP_USERNAME（完整邮箱地址）'
-                      '和 SMTP_PASSWORD（应用专用密码）；其他邮箱需指定 SMTP_HOST。'
-                      '高级配置请检查 SMTP_PORT、MAIL_FROM、MAIL_TO。清空邮件配置可关闭通知。', flush=True)
-                return 1
+        record('task_started')
         checkpoint = task
         def defer(seconds: float) -> None:
             checkpoint.data['retry_at'] = clock() + seconds
             checkpoint.save()
+            health(phase='backoff', next_check_at=checkpoint.data['retry_at'])
             sleep(seconds)
             checkpoint.data['retry_at'] = 0
             checkpoint.save()
@@ -117,32 +141,43 @@ def run(settings: Settings, *, session: Any = None,
                     task.data['cooldowns'] = fresh
                     task.save()
                 if not authenticated:
+                    health(phase='authentication', next_check_at=0)
                     client.authenticate()
                     authenticated = True
                     announced.discard('authentication_required')
+                    record('authentication_succeeded')
+                health(phase='my_activities', next_check_at=0, activity_count=None, candidate_count=None)
                 mine = client.mine()
                 booked = {activity_id(row) for row in mine if reserved(row)}
                 if task.data['status'] == 'pending':
                     if task.data['activity'] in booked:
                         task.data.update(status='scanning', activity='')
                         task.save()
+                        announced.discard('reservation_unconfirmed')
                         emit('reservation_succeeded')
                     else:
+                        failures = 0
+                        health(last_query_at=clock(), failure_count=0)
                         emit('reservation_unconfirmed')
-                        prompt('预约结果待确认；核实后按回车重新查询（Ctrl+C 停止）：')
+                        ask('预约结果待确认；核实后按回车重新查询（Ctrl+C 停止）：')
                         continue
                 current = progress(mine, clock())
                 if current.done:
                     task.data.update(status='done', activity='')
                     task.save()
+                    final_phase = 'done'
+                    health(phase='done', last_query_at=clock(), failure_count=0)
                     emit('goal_completed')
                     return 0
                 if not any(current.needs(category) for category in settings.categories):
                     failures = 0
+                    health(phase='waiting_for_attendance', last_query_at=clock(), failure_count=0,
+                           next_check_at=clock() + 10)
                     sleep(10)
                     continue
                 conflicts = [interval(row) for row in mine if reserved(row)]
                 candidates = []
+                health(phase='activities')
                 rows = client.activities()
                 for row in rows:
                     try:
@@ -162,10 +197,14 @@ def run(settings: Settings, *, session: Any = None,
                     candidates.append(lecture)
                 candidates.sort(key=lambda row: (row.category not in current.missing,
                                 settings.categories.index(row.category), not row.online, row.start, row.wid))
+                health(last_query_at=clock(), failure_count=failures, activity_count=len(rows),
+                       candidate_count=len(candidates), phase='preflight' if candidates else 'waiting')
                 for lecture in candidates:
+                    health(phase='preflight')
                     if not client.preflight(lecture.wid):
                         continue
                     for attempt in range(4):
+                        health(phase='captcha')
                         binary = client.captcha()
                         if recognize is None:
                             import ddddocr
@@ -179,9 +218,11 @@ def run(settings: Settings, *, session: Any = None,
                         # Persist before sending: a crash must recover by querying, never resubmitting.
                         task.data.update(status='pending', activity=lecture.wid)
                         task.save()
+                        health(phase='submitting')
                         try:
                             reply = client.submit(lecture.wid, code)
                         except RemoteError as exc:
+                            health(last_error=str(exc), last_error_at=clock())
                             if isinstance(exc, AuthenticationExpired):
                                 authenticated = False
                             defer(max(20, exc.retry_after))
@@ -202,21 +243,27 @@ def run(settings: Settings, *, session: Any = None,
                         break
                 failures = 0
                 if task.data['status'] != 'pending':
+                    health(phase='waiting', next_check_at=clock() + 10, failure_count=0)
                     sleep(10)
+                else:
+                    health(phase='confirming', failure_count=0)
             except AuthenticationRejected:
                 raise
             except AuthenticationExpired:
                 authenticated = False
                 failures += 1
+                health(last_error='authentication_expired', last_error_at=clock(), failure_count=failures)
                 if failures == 3:
                     emit('query_failure')
                 defer(min(300, 10 * 2 ** min(failures, 5)))
             except (RemoteError, ValueError) as exc:
                 failures += 1
                 reason = str(exc)
-                record(reason if isinstance(exc, RemoteError) or reason in (
+                safe_reason = reason if isinstance(exc, RemoteError) or reason in (
                     'attendance_result_pending', 'attendance_category_unknown',
-                    'attendance_status_unknown', 'attendance_record_conflict') else 'invalid_activity_data')
+                    'attendance_status_unknown', 'attendance_record_conflict') else 'invalid_activity_data'
+                record(safe_reason)
+                health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
                 if failures == 3:
                     emit('query_failure')
                 retry = exc.retry_after if isinstance(exc, RemoteError) else 0
@@ -224,6 +271,9 @@ def run(settings: Settings, *, session: Any = None,
     except (KeyboardInterrupt, EOFError):
         return 130
     except (AuthenticationRejected, RemoteError, ValueError, OSError) as exc:
+        final_phase = 'failed'
+        health(last_error=str(exc) if isinstance(exc, RemoteError) else 'configuration_or_state_invalid',
+               last_error_at=clock())
         details = ''
         if check_only:
             reason = str(exc) if isinstance(exc, RemoteError) else type(exc).__name__
@@ -236,13 +286,25 @@ def run(settings: Settings, *, session: Any = None,
                 details += f' tls_reason={exc.tls_reason}'
             if isinstance(exc, RemoteError) and exc.proxy_used is not None:
                 details += f' proxy_used={str(exc.proxy_used).lower()}'
-        print('event=task_failed' + details, flush=True)
+        if check_only:
+            print('event=task_failed' + details, flush=True)
+        elif isinstance(exc, AuthenticationRejected):
+            record('task_failed')
+        else:
+            emit('task_failed')
         return 1
     except Exception:
-        print('event=unexpected_failure', flush=True)
+        final_phase = 'failed'
+        health(last_error='unexpected_failure', last_error_at=clock())
+        if check_only:
+            print('event=unexpected_failure', flush=True)
+        else:
+            emit('unexpected_failure')
         return 1
     finally:
         if task:
+            health(phase='manual_required' if snapshot['phase'] == 'manual_required' and final_phase == 'stopped'
+                   else final_phase, next_check_at=0)
             task.close()
-        if session is None:
+        if session is None and client is not None:
             client.session.close()

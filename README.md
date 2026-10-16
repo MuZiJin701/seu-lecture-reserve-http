@@ -91,7 +91,21 @@ uv run main.py --status
 | `pending` | 预约提交结果待确认 |
 | `done` | 已打卡目标完成 |
 
-**`scanning` 不代表程序还在运行。** 使用上述后台启动方式时，还需查看 PID 文件对应的进程：
+输出首行仍为 `status=...`，后面增加运行信息：
+
+| 字段 | 怎么看 |
+| --- | --- |
+| `process_running` | 是否有进程持有本任务的锁；`false` 表示没有正在运行的预约实例 |
+| `phase` | `authentication` 为登录中，`waiting` 为扫描后等待，`waiting_for_attendance` 为等待打卡，`backoff` 为异常退避，`manual_required` 为需人工处理 |
+| `last_query_at` / `last_query_age_seconds` | 最近成功查询时间及距今秒数；`never` / `unknown` 表示尚无成功记录 |
+| `updated_at` / `snapshot_age_seconds` | 运行状态最后更新时间及距今秒数；长时间不更新时结合阶段和 `next_check_at` 排查 |
+| `failure_count` / `last_error` / `last_error_at` | 连续失败次数、最近错误及发生时间；恢复后次数清零，旧错误保留供排查 |
+| `activity_count` / `candidate_count` | 最近一次讲座列表条数及通过筛选的候选数；`unknown` 表示该轮未查询列表 |
+| `mail_status` | `disabled` 未配置、`ready` 已配置、`sending` 发送中、`accepted` 服务器接受、`failed` 发送失败；不代表收件箱送达 |
+
+判断是否在正常工作，结合 `process_running=true`、最近的成功查询时间及当前阶段。候选数为 0 且成功查询时间持续更新，表示正常等待；正常轮询不刷屏。`phase=unknown` 表示旧任务尚无新运行信息或信息无效，不能当作健康证明。
+
+**`scanning` 本身不代表程序还在运行。** 使用上述后台启动方式时，也可检查 PID 文件对应的进程：
 
 ```bash
 ps -p "$(cat state/runner.pid)" -o pid,ppid,args
@@ -149,9 +163,17 @@ SMTP_PASSWORD='your-app-password'
 
 默认自己给自己发邮件，使用应用专用密码。配置方法、其他邮箱及关闭通知的步骤见[使用指南](docs/usage.md#gmail-示例)。
 
+验证邮件配置，可以单独发送一封测试邮件，不登录学校、不启动预约任务：
+
+```bash
+uv run main.py --test-mail
+```
+
+显示 `event=test_mail_accepted` 表示 SMTP 服务器已接受，再去收件箱核对。正常运行时，预约成功、目标完成、需要人工处理和可捕获的异常退出会尝试发信；连续三轮查询或处理失败提醒一次，恢复后重新计数。单次错误和正常等待不发邮件，发信失败记录 `notification_failed`，不自动重发。强制杀进程、断电或邮件服务不可达时，不能保证收到通知。
+
 ## 使用提醒
 
-- 真实登录和只读查询已验证；真实预约、邮件送达、短信恢复及长期运行仍待验收。请在 [SEU 门户](https://ehall.seu.edu.cn/)核对预约与打卡结果，统计不代替学院最终认定。
+- 真实登录、只读查询及本次测试邮件送达已验证；真实预约、短信恢复及长期运行仍待验收。请在 [SEU 门户](https://ehall.seu.edu.cn/)核对预约与打卡结果，统计不代替学院最终认定。
 - `.env` 包含凭据，请勿上传；预约结果不明时程序先查询原活动，不盲目重复提交。
 - 开发检查、详细配置及验收记录见[使用文档](docs/usage.md)。
 

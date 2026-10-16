@@ -2,11 +2,17 @@
 
 import argparse
 import json
+import math
 import os
+import re
+import signal
 import sys
+import time
 from collections.abc import Mapping
+from datetime import datetime
 from getpass import getpass
 from io import StringIO
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +20,53 @@ from dotenv import dotenv_values
 from dotenv.parser import parse_stream
 
 from .app import Settings, run
+from .mail import Mailer
+from .model import SHANGHAI
+from .state import read_json, task_running
+
+
+def show_status(directory: Path) -> None:
+    try:
+        saved = read_json(directory / 'task.json')
+    except FileNotFoundError:
+        saved = {}
+    if not isinstance(saved, dict):
+        raise ValueError('invalid_state')
+    status = saved.get('status', 'not_started')
+    if status not in ('not_started', 'scanning', 'pending', 'done'):
+        raise ValueError('invalid_state')
+    if saved.get('version') == 1 and status == 'done':
+        status = 'legacy_completed'
+    print('status=' + status)
+    running = task_running(directory)
+    print('process_running=' + str(running).lower())
+    snapshot = saved.get('health')
+    phases = {'starting', 'authentication', 'my_activities', 'activities', 'preflight', 'captcha',
+              'submitting', 'confirming', 'waiting', 'waiting_for_attendance', 'manual_required',
+              'backoff', 'done', 'stopped', 'failed'}
+    timestamps = ('updated_at', 'last_query_at', 'last_error_at', 'next_check_at', 'last_mail_at')
+    if (not isinstance(snapshot, dict) or not isinstance(snapshot.get('phase'), str)
+            or snapshot['phase'] not in phases
+            or snapshot.get('mail_status') not in ('disabled', 'ready', 'sending', 'accepted', 'failed')
+            or not isinstance(snapshot.get('last_error'), str)
+            or not re.fullmatch('[a-z_]{1,80}', snapshot['last_error'])
+            or any(type(snapshot.get(key)) not in (int, float) or not math.isfinite(snapshot[key])
+                   or not 0 <= snapshot[key] <= 253402214400 for key in timestamps)
+            or type(snapshot.get('failure_count')) is not int or snapshot['failure_count'] < 0
+            or any(snapshot.get(key) is not None and (type(snapshot[key]) is not int or snapshot[key] < 0)
+                   for key in ('activity_count', 'candidate_count'))):
+        print('phase=unknown')
+        return
+    print('phase=' + (snapshot['phase'] if running else 'stopped'))
+    if not running:
+        print('last_phase=' + snapshot['phase'])
+    for key in timestamps:
+        value = snapshot[key]
+        print(key + '=' + (datetime.fromtimestamp(value, SHANGHAI).isoformat(timespec='seconds') if value else 'never'))
+    for key, label in (('updated_at', 'snapshot_age_seconds'), ('last_query_at', 'last_query_age_seconds')):
+        print(label + '=' + (str(max(0, round(time.time() - snapshot[key]))) if snapshot[key] else 'unknown'))
+    for key in ('last_error', 'failure_count', 'mail_status', 'activity_count', 'candidate_count'):
+        print(key + '=' + (str(snapshot[key]) if snapshot.get(key) is not None else 'unknown'))
 
 
 def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[Settings, dict[str, str]]:
@@ -32,6 +85,8 @@ def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[S
     if set(values) - allowed:
         raise ValueError('unknown_configuration_key')
     environ = {**values, **process}
+    if address := environ.get('SEU_VPN_IP', '').strip():
+        ip_address(address)
     for layer in (values, process):
         if 'SEU_CARD_NUMBER' in layer:
             environ['SEU_USERNAME'] = layer['SEU_CARD_NUMBER']
@@ -66,23 +121,34 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument('--check', action='store_true', help='authenticate and fetch data/captcha without submitting')
     mode.add_argument('--new-task', action='store_true', help='recheck a completed goal against school records')
     mode.add_argument('--status', action='store_true', help='show local task status without network access')
+    mode.add_argument('--test-mail', action='store_true', help='send one test email without school login or reservations')
     args = parser.parse_args(argv)
     if not args.status:
         print('SEU Lecture Reserve HTTPS | by MuZiJin701\n'
               'https://github.com/MuZiJin701/seu-lecture-reserve-http', flush=True)
+    def stop(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+    previous = signal.signal(signal.SIGTERM, stop)
     try:
         settings, environ = configuration_from(args.config, os.environ)
         if args.status:
-            path = settings.state_dir / 'task.json'
-            if path.is_symlink():
-                raise ValueError('unsafe_state')
-            saved = json.loads(path.read_text()) if path.exists() else {}
-            status = saved.get('status', 'not_started')
-            if status not in ('not_started', 'scanning', 'pending', 'done'):
-                raise ValueError('invalid_state')
-            if saved.get('version') == 1 and status == 'done':
-                status = 'legacy_completed'
-            print('status=' + status)
+            show_status(settings.state_dir)
+            return 0
+        if args.test_mail:
+            if not Mailer.configured(environ):
+                print('event=mail_disabled', flush=True)
+                return 1
+            try:
+                mailer = Mailer(environ)
+            except ValueError:
+                print('event=mail_configuration_invalid', flush=True)
+                return 1
+            try:
+                mailer('test_notification')
+            except Exception:
+                print('event=notification_failed', flush=True)
+                return 1
+            print('event=test_mail_accepted', flush=True)
             return 0
         checkpoint = settings.state_dir / 'task.json'
         if not args.check and not args.new_task and checkpoint.exists():
@@ -103,6 +169,8 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, OSError, TypeError, AttributeError):
         print('event=configuration_or_state_invalid', flush=True)
         return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == '__main__':

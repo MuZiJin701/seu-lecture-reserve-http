@@ -9,6 +9,12 @@ from email.message import EmailMessage
 
 
 class Mailer:
+    @staticmethod
+    def configured(environ: Mapping[str, str]) -> bool:
+        return (any(environ.get(key) for key in
+                    ('SMTP_HOST', 'SMTP_USERNAME', 'SMTP_PASSWORD', 'MAIL_FROM', 'MAIL_TO'))
+                or environ.get('SMTP_PORT', '') not in ('', '465'))
+
     def __init__(self, environ: Mapping[str, str]):
         self.username = environ.get('SMTP_USERNAME', '')
         self.password = environ.get('SMTP_PASSWORD', '')

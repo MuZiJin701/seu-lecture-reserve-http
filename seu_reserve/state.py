@@ -1,6 +1,7 @@
 """Private, atomic task checkpoint with a process lock."""
 
 import hashlib
+import errno
 import json
 import math
 import os
@@ -9,6 +10,38 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+
+def lock_file(fd: int) -> None:
+    if sys.platform == 'win32':
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def task_running(directory: Path) -> bool:
+    try:
+        fd = open_nofollow(directory / 'task.lock', os.O_RDWR)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            lock_file(fd)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return True
+            raise
+        return False
+    finally:
+        os.close(fd)
+
+
+def read_json(path: Path) -> Any:
+    fd = open_nofollow(path, os.O_RDONLY)
+    with os.fdopen(fd) as source:
+        return json.load(source)
 
 
 def open_nofollow(path: Path, flags: int) -> int:
@@ -36,17 +69,10 @@ class Task:
         self.path = directory / 'task.json'
         self.lock = open_nofollow(directory / 'task.lock', os.O_CREAT | os.O_RDWR)
         try:
-            if sys.platform == 'win32':
-                import msvcrt
-                msvcrt.locking(self.lock, msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_file(self.lock)
             account = hashlib.sha256(username.encode()).hexdigest()
             if self.path.exists() or self.path.is_symlink():
-                fd = open_nofollow(self.path, os.O_RDONLY)
-                with os.fdopen(fd) as source:
-                    data = json.load(source)
+                data = read_json(self.path)
                 if (not isinstance(data, dict) or type(data.get('version')) is not int or data['version'] not in (1, 2)
                         or data.get('status') not in ('scanning', 'pending', 'done')
                         or not isinstance(data.get('account'), str)

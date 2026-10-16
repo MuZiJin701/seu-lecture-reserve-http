@@ -8,6 +8,14 @@ The default goal is 8 school-recorded attendances, including at least one each i
 
 When existing records overlap, the client automatically selects mutually nonconflicting lectures for local counts. It does not cancel school reservations; the university determines which attendances are valid. See the [selection rules](docs/usage.md#运行和恢复) (Chinese).
 
+## Screenshot
+
+Background startup and local task status on a Linux server:
+
+![Linux terminal starting the client in the background with nohup and querying the local task status, status=scanning](docs/images/使用截图.png)
+
+`status=scanning` is a local task state; it does not confirm process health or a successful reservation. See the [usage guide](docs/usage.md#服务器后台运行) (Chinese) for process and log checks. Actual reservations and long-running operation still need acceptance testing.
+
 ## Quick start
 
 Prepare Python 3.12 and [uv](https://docs.astral.sh/uv/getting-started/installation/).

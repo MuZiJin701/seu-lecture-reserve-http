@@ -8,6 +8,14 @@
 
 已有记录时间重叠时，自动选择互不冲突的场次计数，只调整本地统计，不取消学校预约；最终有效场次以学校认定为准。选择顺序见[使用指南](docs/usage.md#运行和恢复)。
 
+## 使用截图
+
+Linux 服务器后台启动与本地任务状态查询：
+
+![Linux 终端中使用 nohup 后台启动客户端，并查询到本地任务状态 status=scanning](docs/images/使用截图.png)
+
+`status=scanning` 表示本地任务处于扫描状态，不代表进程健康或预约成功。后台进程和日志的核对方法见[使用指南](docs/usage.md#服务器后台运行)；真实预约及长期运行仍待验收。
+
 ## 快速开始
 
 先准备 Python 3.12 和 [uv](https://docs.astral.sh/uv/getting-started/installation/)。

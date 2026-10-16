@@ -16,6 +16,8 @@ Background startup and local task status on a Linux server:
 
 `status=scanning` is a local task state; it does not confirm process health or a successful reservation. See the [usage guide](docs/usage.md#服务器后台运行) (Chinese) for process and log checks. Actual reservations and long-running operation still need acceptance testing.
 
+Joint project poster: [high-resolution PNG](docs/promo/seu-lecture-poster.png) · [Python generation guide](docs/promo/usage.md) (Chinese), featuring the Windows browser edition and Linux HTTPS edition.
+
 ## Quick start
 
 Prepare Python 3.12 and [uv](https://docs.astral.sh/uv/getting-started/installation/).

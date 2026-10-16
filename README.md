@@ -16,6 +16,8 @@ Linux 服务器后台启动与本地任务状态查询：
 
 `status=scanning` 表示本地任务处于扫描状态，不代表进程健康或预约成功。后台进程和日志的核对方法见[使用指南](docs/usage.md#服务器后台运行)；真实预约及长期运行仍待验收。
 
+联合宣传海报：[高清 PNG](docs/promo/seu-lecture-poster.png) · [Python 生成说明](docs/promo/usage.md)，同时介绍 Windows 浏览器版与 Linux HTTPS 版。
+
 ## 快速开始
 
 先准备 Python 3.12 和 [uv](https://docs.astral.sh/uv/getting-started/installation/)。

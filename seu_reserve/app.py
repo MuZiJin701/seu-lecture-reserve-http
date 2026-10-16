@@ -14,7 +14,7 @@ import requests
 from .client import AuthenticationExpired, AuthenticationRejected, Client, RemoteError, has_code
 from .model import Lecture, activity_id, interval, reserved
 from .mail import Mailer
-from .state import Task
+from .state import Task, open_nofollow
 
 DEFAULT_CATEGORIES = ('人文与科学素养系列讲座_心理健康', '人文与科学素养系列讲座_法律',
                       '人文与科学素养系列讲座-艺术类', '人文与科学素养系列讲座_其他', '“SEU咖啡间"系列沙龙活动')
@@ -50,7 +50,7 @@ def run(settings: Settings, *, session: Any = None,
         if check_only:
             return
         try:
-            fd = os.open(settings.state_dir / 'events.log', os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            fd = open_nofollow(settings.state_dir / 'events.log', os.O_WRONLY | os.O_APPEND | os.O_CREAT)
             with os.fdopen(fd, 'a') as target:
                 target.write(f'{clock():.0f} event={event}\n')
         except OSError:

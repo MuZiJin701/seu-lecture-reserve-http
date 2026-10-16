@@ -1,0 +1,74 @@
+import os
+import subprocess
+import sys
+
+import pytest
+
+from seu_reserve.state import Task, open_nofollow
+
+
+def test_task_lock_excludes_another_process_and_releases_on_close(tmp_path):
+    script = """
+import sys
+from pathlib import Path
+from seu_reserve.state import Task
+try:
+    task = Task(Path(sys.argv[1]), 'test-user')
+except OSError:
+    sys.exit(3)
+task.close()
+"""
+    task = Task(tmp_path, 'test-user')
+    try:
+        blocked = subprocess.run([sys.executable, '-c', script, str(tmp_path)],
+                                 capture_output=True, text=True, timeout=10)
+        assert blocked.returncode == 3, blocked.stderr
+    finally:
+        task.close()
+    resumed = subprocess.run([sys.executable, '-c', script, str(tmp_path)],
+                             capture_output=True, text=True, timeout=10)
+    assert resumed.returncode == 0, resumed.stderr
+
+
+@pytest.mark.parametrize('native_nofollow', [True, False])
+@pytest.mark.parametrize('existing_target', [True, False])
+def test_state_file_symlinks_are_rejected_without_changing_target(
+        tmp_path, monkeypatch, native_nofollow, existing_target):
+    if not native_nofollow:
+        monkeypatch.delattr(os, 'O_NOFOLLOW', raising=False)
+    target = tmp_path / 'private'
+    if existing_target:
+        target.write_text('do not change')
+    link = tmp_path / 'events.log'
+    try:
+        link.symlink_to(target)
+    except OSError:
+        if sys.platform == 'win32':
+            pytest.skip('Creating symlinks requires Windows Developer Mode or administrator rights')
+        raise
+    with pytest.raises(OSError):
+        open_nofollow(link, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+    assert target.exists() == existing_target
+    if existing_target:
+        assert target.read_text() == 'do not change'
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='Windows open handles prevent this replacement')
+def test_state_file_replaced_during_open_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.delattr(os, 'O_NOFOLLOW', raising=False)
+    path = tmp_path / 'events.log'
+    original_open = os.open
+    opened = []
+    def replace_after_open(*args, **kwargs):
+        fd = original_open(*args, **kwargs)
+        opened.append(fd)
+        replacement = tmp_path / 'replacement'
+        replacement.write_text('do not change')
+        os.replace(replacement, path)
+        return fd
+    monkeypatch.setattr(os, 'open', replace_after_open)
+    with pytest.raises(OSError, match='unsafe_state_file'):
+        open_nofollow(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+    assert path.read_text() == 'do not change'
+    with pytest.raises(OSError):
+        os.fstat(opened[0])

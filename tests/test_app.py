@@ -138,6 +138,30 @@ def test_one_confirmed_reservation_ends_task_and_restart_does_not_book_again(tmp
     assert school.submitted == ['one']
 
 
+def test_windows_state_and_event_log_without_unix_file_apis(tmp_path, monkeypatch):
+    import os
+    import sys
+    from types import SimpleNamespace
+    from seu_reserve import state
+
+    locks = []
+    def locking(fd, mode, size):
+        assert os.lseek(fd, 0, os.SEEK_CUR) == 0
+        locks.append((mode, size))
+    monkeypatch.setattr(state, 'sys', SimpleNamespace(platform='win32'))
+    monkeypatch.setitem(sys.modules, 'msvcrt', SimpleNamespace(LK_NBLCK=2, locking=locking))
+    monkeypatch.delattr(os, 'O_NOFOLLOW', raising=False)
+    monkeypatch.delattr(os, 'O_DIRECTORY', raising=False)
+    school = School()
+    school.activities = [lecture()]
+    assert execute(school, tmp_path) == 0
+    assert execute(school, tmp_path) == 0
+    assert school.submitted == ['one']
+    assert locks == [(2, 1), (2, 1)]
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'done'
+    assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
+
+
 def test_unknown_submission_is_queried_and_survives_restart_without_resubmission(tmp_path, capsys):
     school = School()
     school.activities = [lecture(), lecture('two')]

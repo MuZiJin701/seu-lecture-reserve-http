@@ -25,6 +25,15 @@ def test_cli_starts_without_system_timezone_data(tmp_path):
     assert '--check' in result.stdout
 
 
+def test_cli_help_does_not_import_unix_only_locking(tmp_path):
+    result = subprocess.run([sys.executable, '-c',
+        "import runpy, sys; sys.modules['fcntl'] = None; "
+        "sys.argv = ['seu-reserve', '--help']; runpy.run_module('seu_reserve.cli', run_name='__main__')"],
+        cwd=tmp_path, env={}, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert '--check' in result.stdout
+
+
 def test_noninteractive_missing_credentials_fail_without_unsafe_prompt(tmp_path):
     result = cli(tmp_path)
     assert result.returncode == 1

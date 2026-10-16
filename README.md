@@ -8,7 +8,7 @@
 
 ## 快速开始
 
-适用于 Linux，使用 Python 3.12 和 [uv](https://docs.astral.sh/uv/getting-started/installation/)。
+使用 Python 3.12 和 [uv](https://docs.astral.sh/uv/getting-started/installation/)，以下命令以 Linux shell 为例。Windows 兼容路径已做离线模拟验证，仍待真实 Windows 验收。
 
 **1. 下载并安装依赖**
 
@@ -29,6 +29,12 @@ uv sync --locked
 ```bash
 cp -n .env.example .env
 chmod 600 .env
+```
+
+Windows PowerShell 使用以下命令保留已有配置或复制样例；`.env` 和状态目录的访问权限由 Windows ACL 控制，请放在仅自己可访问的目录中。
+
+```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
 用文本编辑器打开 `.env`，填写账号、密码和筛选条件，例如：

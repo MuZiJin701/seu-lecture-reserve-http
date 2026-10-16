@@ -15,6 +15,8 @@ uv run --locked seu-reserve --help
 `tzdata` 提供 `Asia/Shanghai` 时区数据，兼容 Windows 等没有系统 IANA 时区库的环境；更新依赖及锁文件后需重新运行 `uv sync --locked`，避免启动时出现 `ZoneInfoNotFoundError`。
 测试只使用构造的学校响应、临时时间/文件、人工输入和邮件替身，不加载真实账号配置，不访问学校，不发送真实邮件。
 
+Windows 使用标准库 `msvcrt` 文件锁，Linux 使用 `fcntl`；二者都阻止同一状态目录并发运行。Windows 保留状态文件的 `fsync` 与原子替换，不执行 Linux 的目录 `fsync`。Windows 分支已做离线模拟验证，真实 Windows 运行及断电恢复仍待验收。
+
 ## 配置与凭据
 
 ```bash
@@ -23,6 +25,8 @@ chmod 600 .env
 # 编辑 .env，填写登录信息、筛选及可选的邮件配置
 uv run --locked seu-reserve --status
 ```
+
+上面的复制和权限命令适用于 Linux。在 Windows PowerShell 中用 `if (-not (Test-Path .env)) { Copy-Item .env.example .env }` 保留已有配置或复制样例；`.env` 和状态目录的访问权限由 Windows ACL 控制，请放在仅自己可访问的目录中。
 
 登录、筛选、状态目录和邮件统一放入 [.env.example](../.env.example) 对应的 `.env` 文件，程序默认自动读取**当前工作目录**的 `.env`，不向上搜索其他目录。
 在其他目录运行时，用 `--config /项目目录/.env` 明确指定文件。显式指定的文件不存在会报错，不回退读取其他文件。

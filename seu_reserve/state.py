@@ -1,13 +1,32 @@
 """Private, atomic task checkpoint with a process lock."""
 
-import fcntl
 import hashlib
 import json
 import math
 import os
+import stat
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+
+def open_nofollow(path: Path, flags: int) -> int:
+    if not hasattr(os, 'O_NOFOLLOW') and (path.is_symlink() or path.is_junction()):
+        raise OSError('unsafe_state_file')
+    fd = os.open(path, flags | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    try:
+        # Windows has no O_NOFOLLOW; check the opened file before reading or writing.
+        if not hasattr(os, 'O_NOFOLLOW'):
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode)
+                    or getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                    or not os.path.samestat(info, os.fstat(fd))):
+                raise OSError('unsafe_state_file')
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 class Task:
@@ -15,12 +34,17 @@ class Task:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.directory = directory
         self.path = directory / 'task.json'
-        self.lock = os.open(directory / 'task.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        self.lock = open_nofollow(directory / 'task.lock', os.O_CREAT | os.O_RDWR)
         try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if sys.platform == 'win32':
+                import msvcrt
+                msvcrt.locking(self.lock, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             account = hashlib.sha256(username.encode()).hexdigest()
             if self.path.exists() or self.path.is_symlink():
-                fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+                fd = open_nofollow(self.path, os.O_RDONLY)
                 with os.fdopen(fd) as source:
                     data = json.load(source)
                 if (not isinstance(data, dict) or type(data.get('version')) is not int or data['version'] != 1
@@ -59,11 +83,12 @@ class Task:
                 target.flush()
                 os.fsync(target.fileno())
             os.replace(name, self.path)
-            directory_fd = os.open(self.directory, os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            if sys.platform != 'win32':
+                directory_fd = os.open(self.directory, os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             if os.path.exists(name):
                 os.unlink(name)

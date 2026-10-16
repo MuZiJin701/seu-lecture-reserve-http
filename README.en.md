@@ -8,7 +8,7 @@ Offline tests, live login and read-only queries have passed. Live reservations a
 
 ## Quick start
 
-For Linux, using Python 3.12 and [uv](https://docs.astral.sh/uv/getting-started/installation/).
+Use Python 3.12 and [uv](https://docs.astral.sh/uv/getting-started/installation/). Commands below use a Linux shell. Windows compatibility paths have passed offline simulations; acceptance on Windows is still pending.
 
 **1. Download and install dependencies**
 
@@ -29,6 +29,12 @@ Copy the example for first-time setup. Keep your existing `.env` if you have alr
 ```bash
 cp -n .env.example .env
 chmod 600 .env
+```
+
+In Windows PowerShell, use the following to keep an existing configuration or copy the example. Windows ACLs control access to `.env` and the state directory; keep them in a directory only you can access.
+
+```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
 Open `.env` in a text editor and enter your credentials and filters, for example:

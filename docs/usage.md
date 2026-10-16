@@ -94,6 +94,17 @@ uv run --locked seu-reserve --check
 
 该命令认证后查询列表、我的活动并获取校验验证码图片，不提交或取消预约，不创建预约任务，也不发送邮件。
 成功退出码为 0，终端显示 `event=read_only_complete`；失败退出码为 1。认证需要短信时仍须人工处理。
+检查失败时会输出阶段与安全错误码，例如 `event=task_failed stage=authentication reason=http_failure http_status=403`。阶段依次为 `authentication`（登录认证）、`my_activities`（我的活动）、`activities`（讲座列表）、`captcha`（预约验证码）。排查时提供这一整行；诊断不输出凭据、票据、完整 URL 或响应正文。
+
+| 错误码 | 含义 |
+| --- | --- |
+| `tls_failure` | TLS 握手或证书校验失败 |
+| `proxy_failure` | 代理连接失败 |
+| `network_timeout` | 连接或读取超时 |
+| `connection_failure` / `network_failure` | 连接失败或其他请求异常 |
+| `http_failure` / `server_backoff` | HTTP 请求失败或服务要求退避，同时显示 `http_status` |
+| `authentication_rejected` | 认证明确拒绝账号或密码 |
+
 此检查验证接口读取及图片解码，不代表活动字段映射、冲突数据完整性、OCR 准确率或真实预约已验收。
 
 ## 运行和恢复

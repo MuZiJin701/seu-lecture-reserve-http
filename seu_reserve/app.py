@@ -70,9 +70,13 @@ def run(settings: Settings, *, session: Any = None,
     task = None
     try:
         if check_only:
+            stage = 'authentication'
             client.authenticate()
+            stage = 'my_activities'
             client.mine()
+            stage = 'activities'
             client.activities()
+            stage = 'captcha'
             client.captcha()
             print('event=read_only_complete', flush=True)
             return 0
@@ -205,8 +209,14 @@ def run(settings: Settings, *, session: Any = None,
                 defer(max(retry, min(300, 10 * 2 ** min(failures, 5))))
     except (KeyboardInterrupt, EOFError):
         return 130
-    except (AuthenticationRejected, RemoteError, ValueError, OSError):
-        print('event=task_failed', flush=True)
+    except (AuthenticationRejected, RemoteError, ValueError, OSError) as exc:
+        details = ''
+        if check_only:
+            reason = str(exc) if isinstance(exc, RemoteError) else type(exc).__name__
+            details = f' stage={stage} reason={reason}'
+            if isinstance(exc, RemoteError) and exc.http_status is not None:
+                details += f' http_status={exc.http_status}'
+        print('event=task_failed' + details, flush=True)
         return 1
     except Exception:
         print('event=unexpected_failure', flush=True)

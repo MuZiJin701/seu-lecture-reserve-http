@@ -28,9 +28,10 @@ def has_code(payload: dict[str, Any], expected: int) -> bool:
 class RemoteError(Exception):
     """Only fixed, non-sensitive reason codes cross this boundary."""
 
-    def __init__(self, reason: str, retry_after: float = 0):
+    def __init__(self, reason: str, retry_after: float = 0, *, http_status: int | None = None):
         super().__init__(reason)
         self.retry_after = retry_after
+        self.http_status = http_status
 
 
 class AuthenticationExpired(RemoteError):
@@ -63,6 +64,14 @@ class Client:
         try:
             response = self.session.request(method, url, timeout=25, allow_redirects=False,
                                             verify=True, headers=headers, **kwargs)
+        except requests.exceptions.SSLError:
+            raise RemoteError('tls_failure') from None
+        except requests.exceptions.ProxyError:
+            raise RemoteError('proxy_failure') from None
+        except requests.Timeout:
+            raise RemoteError('network_timeout') from None
+        except requests.ConnectionError:
+            raise RemoteError('connection_failure') from None
         except requests.RequestException:
             raise RemoteError('network_failure') from None
         if response.status_code in (429, 503):
@@ -72,7 +81,7 @@ class Client:
                 seconds = float(retry) if retry.isdigit() else parsedate_to_datetime(retry).timestamp() - time.time()
             except (ValueError, TypeError, OverflowError):
                 seconds = 0
-            raise RemoteError('server_backoff', max(0, seconds))
+            raise RemoteError('server_backoff', max(0, seconds), http_status=response.status_code)
         return response
 
     def get(self, url: str) -> Any:
@@ -80,7 +89,7 @@ class Client:
             response = self.request('GET', url)
             if response.status_code not in (301, 302, 303, 307, 308):
                 if response.status_code != 200:
-                    raise RemoteError('http_failure')
+                    raise RemoteError('http_failure', http_status=response.status_code)
                 return response
             location = response.headers.get('Location')
             if not location:
@@ -90,7 +99,7 @@ class Client:
 
     def payload(self, response: Any) -> dict[str, Any]:
         if response.status_code != 200:
-            raise RemoteError('http_failure')
+            raise RemoteError('http_failure', http_status=response.status_code)
         try:
             result = response.json()
         except ValueError:
@@ -219,7 +228,7 @@ class Client:
     def business(self, endpoint: str, *, method: str = 'POST', **kwargs: Any) -> dict[str, Any]:
         response = self.request(method, BASE + '/modules/hdyy/' + endpoint, **kwargs)
         if response.status_code in (301, 302, 303, 307, 308, 401, 403):
-            raise AuthenticationExpired('business_authentication_expired')
+            raise AuthenticationExpired('business_authentication_expired', http_status=response.status_code)
         return self.payload(response)
 
     def rows(self, endpoint: str, field: str, data: dict[str, str]) -> list[dict[str, Any]]:

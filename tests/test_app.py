@@ -345,6 +345,58 @@ def test_read_only_check_fetches_captcha_without_creating_task_or_submitting(tmp
     assert not directory.exists()
 
 
+@pytest.mark.parametrize('endpoint, stage', [
+    ('index.do', 'authentication'),
+    ('queryMyActivityList.do', 'my_activities'),
+    ('queryActivityList.do', 'activities'),
+    ('vcode.do', 'captcha'),
+])
+def test_read_only_http_failure_reports_stage_and_status_without_response_data(
+        tmp_path, capsys, endpoint, stage):
+    class FailedSchool(School):
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if urlsplit(url).path.endswith(endpoint):
+                response.status_code = 502
+                response._content = b'SECRET response'
+            return response
+    school = FailedSchool()
+    directory = tmp_path / 'unused-state'
+    assert execute(school, directory, check_only=True) == 1
+    assert capsys.readouterr().out == (
+        f'event=task_failed stage={stage} reason=http_failure http_status=502\n')
+    assert not directory.exists()
+    assert not school.submitted
+
+
+@pytest.mark.parametrize('error, reason', [
+    (requests.exceptions.SSLError, 'tls_failure'),
+    (requests.exceptions.ProxyError, 'proxy_failure'),
+    (requests.Timeout, 'network_timeout'),
+    (requests.ConnectionError, 'connection_failure'),
+    (requests.RequestException, 'network_failure'),
+])
+def test_read_only_network_failure_reports_safe_reason(tmp_path, capsys, error, reason):
+    class FailedSchool(School):
+        def request(self, method, url, **kwargs):
+            assert kwargs['verify'] is True
+            raise error('SECRET URL, account, password and ticket')
+    directory = tmp_path / 'unused-state'
+    assert execute(FailedSchool(), directory, check_only=True) == 1
+    assert capsys.readouterr().out == f'event=task_failed stage=authentication reason={reason}\n'
+    assert not directory.exists()
+
+
+@pytest.mark.parametrize('error', [ValueError, OSError])
+def test_read_only_local_error_does_not_echo_exception(tmp_path, capsys, monkeypatch, error):
+    def fail(_):
+        raise error('SECRET input')
+    monkeypatch.setattr('seu_reserve.client.Client.mine', fail)
+    assert execute(School(), tmp_path / 'unused-state', check_only=True) == 1
+    assert capsys.readouterr().out == (
+        f'event=task_failed stage=my_activities reason={error.__name__}\n')
+
+
 def test_read_only_check_passes_cas_browser_user_agent_requirement(tmp_path, capsys):
     class BrowserOnlySchool(School):
         def request(self, method, url, **kwargs):

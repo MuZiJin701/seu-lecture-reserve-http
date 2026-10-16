@@ -55,6 +55,8 @@ uv run --locked seu-reserve --check
 
 这一步只登录、查询和获取验证码，不会提交预约，也不需要邮件配置。成功时显示 `event=read_only_complete`。
 
+失败时，`event=task_failed` 会附带 `stage`（失败阶段）、`reason`（安全错误码），HTTP 请求失败还会显示 `http_status`；排查时请提供这一整行。
+
 **4. 启动预约**
 
 邮件通知可选；不配置邮件也能正常预约，成功、需要人工认证或持续异常时仍在终端和本地日志记录。

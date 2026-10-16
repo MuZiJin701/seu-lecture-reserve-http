@@ -105,6 +105,8 @@ uv run --locked seu-reserve --check
 | `http_failure` / `server_backoff` | HTTP 请求失败或服务要求退避，同时显示 `http_status` |
 | `authentication_rejected` | 认证明确拒绝账号或密码 |
 
+TLS 失败会额外显示 `host`（通过白名单校验的学校域名）、`tls_reason` 和可确定时的 `proxy_used=true/false`（Requests 是否选择了代理，不输出代理地址或凭据）。`tls_reason` 只输出预设类别，无法识别时为 `unknown`：`certificate_verify_failed` 表示证书校验失败，`unexpected_eof_while_reading` 表示 TLS 连接意外中断，`unsafe_legacy_renegotiation_disabled` 表示旧式 TLS 重协商不兼容；其他握手类别按原错误码的小写形式输出。不要把所有 `tls_failure` 都归因于代理。
+
 此检查验证接口读取及图片解码，不代表活动字段映射、冲突数据完整性、OCR 准确率或真实预约已验收。
 
 ## 运行和恢复

@@ -55,7 +55,7 @@ uv run --locked seu-reserve --check
 
 这一步只登录、查询和获取验证码，不会提交预约，也不需要邮件配置。成功时显示 `event=read_only_complete`。
 
-失败时，`event=task_failed` 会附带 `stage`（失败阶段）、`reason`（安全错误码），HTTP 请求失败还会显示 `http_status`；排查时请提供这一整行。
+失败时，`event=task_failed` 会附带 `stage`（失败阶段）、`reason`（安全错误码），HTTP 请求失败还会显示 `http_status`。TLS 失败会显示学校域名 `host`、细分类别 `tls_reason`，以及可确定时的 `proxy_used`；排查时请提供这一整行。
 
 **4. 启动预约**
 

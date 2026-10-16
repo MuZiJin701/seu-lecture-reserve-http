@@ -383,7 +383,36 @@ def test_read_only_network_failure_reports_safe_reason(tmp_path, capsys, error, 
             raise error('SECRET URL, account, password and ticket')
     directory = tmp_path / 'unused-state'
     assert execute(FailedSchool(), directory, check_only=True) == 1
-    assert capsys.readouterr().out == f'event=task_failed stage=authentication reason={reason}\n'
+    extra = ' host=ehall.seu.edu.cn tls_reason=unknown' if error is requests.exceptions.SSLError else ''
+    assert capsys.readouterr().out == f'event=task_failed stage=authentication reason={reason}{extra}\n'
+    assert not directory.exists()
+
+
+@pytest.mark.parametrize('tls_reason, proxy_used', [
+    ('CERTIFICATE_VERIFY_FAILED', False),
+    ('UNSAFE_LEGACY_RENEGOTIATION_DISABLED', False),
+    ('UNEXPECTED_EOF_WHILE_READING', True),
+    ('DH_KEY_TOO_SMALL', False),
+    ('SSLV3_ALERT_HANDSHAKE_FAILURE', True),
+    ('TLSV1_ALERT_PROTOCOL_VERSION', False),
+    ('WRONG_VERSION_NUMBER', True),
+])
+def test_read_only_tls_diagnostic_does_not_expose_proxy_or_exception(
+        tmp_path, capsys, monkeypatch, tls_reason, proxy_used):
+    with requests.Session() as session:
+        session.trust_env = False
+        if proxy_used:
+            session.proxies = {'https': 'http://SECRET:SECRET@proxy.example:1234'}
+        def fail(request, **kwargs):
+            assert kwargs['verify'] is True
+            assert bool(requests.utils.select_proxy(request.url, kwargs['proxies'])) == proxy_used
+            raise requests.exceptions.SSLError(f'[SSL: {tls_reason}] SECRET URL and ticket')
+        monkeypatch.setattr(session, 'send', fail)
+        directory = tmp_path / 'unused-state'
+        assert run(Settings(state_dir=directory), session=session, environ={}, check_only=True) == 1
+    assert capsys.readouterr().out == (
+        'event=task_failed stage=authentication reason=tls_failure host=ehall.seu.edu.cn '
+        f'tls_reason={tls_reason.lower()} proxy_used={str(proxy_used).lower()}\n')
     assert not directory.exists()
 
 

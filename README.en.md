@@ -55,7 +55,7 @@ uv run --locked seu-reserve --check
 
 This only logs in, queries data and fetches a CAPTCHA. It does not submit a reservation or require mail settings. Success prints `event=read_only_complete`.
 
-On failure, `event=task_failed` includes `stage` and a safe `reason` code, plus `http_status` for HTTP errors. Include this entire line when reporting a failure.
+On failure, `event=task_failed` includes `stage` and a safe `reason` code, plus `http_status` for HTTP errors. TLS failures include the school domain in `host`, a `tls_reason` category, and `proxy_used` when available. Include this entire line when reporting a failure.
 
 **4. Start reservations**
 

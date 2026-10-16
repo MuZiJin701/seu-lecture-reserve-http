@@ -32,6 +32,9 @@ class RemoteError(Exception):
         super().__init__(reason)
         self.retry_after = retry_after
         self.http_status = http_status
+        self.host: str | None = None
+        self.tls_reason: str | None = None
+        self.proxy_used: bool | None = None
 
 
 class AuthenticationExpired(RemoteError):
@@ -64,8 +67,20 @@ class Client:
         try:
             response = self.session.request(method, url, timeout=25, allow_redirects=False,
                                             verify=True, headers=headers, **kwargs)
-        except requests.exceptions.SSLError:
-            raise RemoteError('tls_failure') from None
+        except requests.exceptions.SSLError as exc:
+            failure = RemoteError('tls_failure')
+            failure.host = parsed.hostname
+            message = str(exc)
+            failure.tls_reason = next((reason.lower() for reason in (
+                'CERTIFICATE_VERIFY_FAILED', 'UNSAFE_LEGACY_RENEGOTIATION_DISABLED',
+                'UNEXPECTED_EOF_WHILE_READING', 'DH_KEY_TOO_SMALL',
+                'SSLV3_ALERT_HANDSHAKE_FAILURE', 'TLSV1_ALERT_PROTOCOL_VERSION', 'WRONG_VERSION_NUMBER'
+            ) if reason in message), 'unknown')
+            if hasattr(self.session, 'merge_environment_settings'):
+                settings = self.session.merge_environment_settings(
+                    url, dict(kwargs.get('proxies') or {}), None, True, None)
+                failure.proxy_used = bool(requests.utils.select_proxy(url, settings['proxies']))
+            raise failure from None
         except requests.exceptions.ProxyError:
             raise RemoteError('proxy_failure') from None
         except requests.Timeout:

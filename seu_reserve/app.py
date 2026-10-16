@@ -216,6 +216,12 @@ def run(settings: Settings, *, session: Any = None,
             details = f' stage={stage} reason={reason}'
             if isinstance(exc, RemoteError) and exc.http_status is not None:
                 details += f' http_status={exc.http_status}'
+            if isinstance(exc, RemoteError) and exc.host is not None:
+                details += f' host={exc.host}'
+            if isinstance(exc, RemoteError) and exc.tls_reason is not None:
+                details += f' tls_reason={exc.tls_reason}'
+            if isinstance(exc, RemoteError) and exc.proxy_used is not None:
+                details += f' proxy_used={str(exc.proxy_used).lower()}'
         print('event=task_failed' + details, flush=True)
         return 1
     except Exception:

@@ -3,9 +3,12 @@
 import base64
 import json
 import re
+import socket
+import ssl
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from http.client import RemoteDisconnected
 from ipaddress import ip_address
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
@@ -44,6 +47,23 @@ def has_code(payload: dict[str, Any], expected: int) -> bool:
     return type(payload.get('code')) is int and payload['code'] == expected
 
 
+def gateway_connection_failure(error: BaseException) -> bool:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (socket.gaierror, ConnectionResetError, ConnectionAbortedError,
+                                BrokenPipeError, RemoteDisconnected, ssl.SSLEOFError)):
+            return True
+        pending.extend(value for value in (current.__cause__, current.__context__,
+                       getattr(current, 'reason', None), *current.args)
+                       if isinstance(value, BaseException))
+    return False
+
+
 class RemoteError(Exception):
     """Only fixed, non-sensitive reason codes cross this boundary."""
 
@@ -54,6 +74,7 @@ class RemoteError(Exception):
         self.host: str | None = None
         self.tls_reason: str | None = None
         self.proxy_used: bool | None = None
+        self.gateway_fallback_allowed = False
 
 
 class AuthenticationExpired(RemoteError):
@@ -71,10 +92,9 @@ class Client:
         self.environ = environ
         self.prompt = prompt
         self.notify = notify
-        if address := environ.get('SEU_VPN_IP', '').strip():
-            adapter = GatewayIPAdapter(address)
-            session.mount(GATEWAY + '/', adapter)
-            session.mount(GATEWAY + ':443/', adapter)
+        address = environ.get('SEU_VPN_IP', '').strip()
+        self.gateway_adapter = GatewayIPAdapter(address) if address else None
+        self.initial_authentication = True
 
     def request(self, method: str, url: str, **kwargs: Any) -> Any:
         parsed = urlsplit(url)
@@ -99,6 +119,9 @@ class Client:
                 'UNEXPECTED_EOF_WHILE_READING', 'DH_KEY_TOO_SMALL',
                 'SSLV3_ALERT_HANDSHAKE_FAILURE', 'TLSV1_ALERT_PROTOCOL_VERSION', 'WRONG_VERSION_NUMBER'
             ) if reason in message), 'unknown')
+            failure.gateway_fallback_allowed = parsed.hostname == 'vpn.seu.edu.cn' and (
+                failure.tls_reason == 'unexpected_eof_while_reading'
+                or failure.tls_reason == 'unknown' and gateway_connection_failure(exc))
             if hasattr(self.session, 'merge_environment_settings'):
                 settings = self.session.merge_environment_settings(
                     url, dict(kwargs.get('proxies') or {}), None, True, None)
@@ -108,8 +131,11 @@ class Client:
             raise RemoteError('proxy_failure') from None
         except requests.Timeout:
             raise RemoteError('network_timeout') from None
-        except requests.ConnectionError:
-            raise RemoteError('connection_failure') from None
+        except requests.ConnectionError as exc:
+            failure = RemoteError('connection_failure')
+            failure.gateway_fallback_allowed = (parsed.hostname == 'vpn.seu.edu.cn'
+                                                and gateway_connection_failure(exc))
+            raise failure from None
         except requests.RequestException:
             raise RemoteError('network_failure') from None
         if response.status_code in (429, 503):
@@ -208,6 +234,20 @@ class Client:
                     break
 
     def authenticate(self) -> None:
+        try:
+            self._authenticate()
+        except RemoteError as exc:
+            if not (self.initial_authentication and self.gateway_adapter is not None
+                    and exc.gateway_fallback_allowed):
+                raise
+            adapter, self.gateway_adapter = self.gateway_adapter, None
+            self.session.mount(GATEWAY + '/', adapter)
+            self.session.mount(GATEWAY + ':443/', adapter)
+            # Restart authentication, never replay a failed request or reservation submission.
+            self._authenticate()
+        self.initial_authentication = False
+
+    def _authenticate(self) -> None:
         app = self.get(ENTRY)
         if urlsplit(app.url).hostname == 'ehall.seu.edu.cn' and 'indexjsp.js' in app.text:
             return

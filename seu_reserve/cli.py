@@ -67,6 +67,9 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument('--new-task', action='store_true', help='recheck a completed goal against school records')
     mode.add_argument('--status', action='store_true', help='show local task status without network access')
     args = parser.parse_args(argv)
+    if not args.status:
+        print('SEU Lecture Reserve HTTPS | by MuZiJin701\n'
+              'https://github.com/MuZiJin701/seu-lecture-reserve-http', flush=True)
     try:
         settings, environ = configuration_from(args.config, os.environ)
         if args.status:

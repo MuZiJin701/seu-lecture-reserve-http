@@ -38,7 +38,7 @@ def test_cli_help_does_not_import_unix_only_locking(tmp_path):
 def test_noninteractive_missing_credentials_fail_without_unsafe_prompt(tmp_path):
     result = cli(tmp_path)
     assert result.returncode == 1
-    assert result.stdout.strip() == 'event=credentials_require_terminal'
+    assert result.stdout.splitlines()[-1] == 'event=credentials_require_terminal'
     assert 'GetPassWarning' not in result.stderr
 
 
@@ -120,8 +120,17 @@ def test_invalid_dotenv_never_echoes_values_or_starts_authentication(tmp_path, t
     (tmp_path / '.env').write_text(text)
     result = cli(tmp_path, '--check')
     assert result.returncode == 1
-    assert result.stdout.strip() == 'event=configuration_or_state_invalid'
+    assert result.stdout.splitlines()[-1] == 'event=configuration_or_state_invalid'
     assert 'SIMULATED_SECRET' not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('args, expected', [
+    ((), 1), (('--check',), 1), (('--new-task',), 1), (('--status',), 0), (('--help',), 0),
+])
+def test_startup_credit_appears_once_except_status_and_help(tmp_path, args, expected):
+    result = cli(tmp_path, *args)
+    assert result.stdout.count('by MuZiJin701') == expected
+    assert result.stdout.count('https://github.com/MuZiJin701/seu-lecture-reserve-http') == expected
 
 
 def test_example_is_valid_dotenv_with_the_confirmed_default_categories(tmp_path):

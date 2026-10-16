@@ -2,6 +2,7 @@ import datetime
 import socket
 import ssl
 import threading
+from http.client import RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -11,13 +12,14 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from urllib3.util import connection
+from urllib3.exceptions import ProtocolError
 
-from seu_reserve.client import Client, GATEWAY, RemoteError
+from seu_reserve.client import Client, GATEWAY, GatewayIPAdapter, RemoteError
 
 
 @pytest.fixture
 def gateway_server(tmp_path, monkeypatch, request):
-    hostname = request.param
+    hostname, dns_works = request.param if isinstance(request.param, tuple) else (request.param, False)
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -60,7 +62,7 @@ def gateway_server(tmp_path, monkeypatch, request):
 
     def connect(address, *args, **kwargs):
         destinations.append(address)
-        if address == ('127.0.0.1', 443):
+        if address == ('127.0.0.1', 443) or dns_works and address == ('vpn.seu.edu.cn', 443):
             address = server.server_address
         return create_connection(address, *args, **kwargs)
 
@@ -83,16 +85,17 @@ def gateway_server(tmp_path, monkeypatch, request):
 
 
 @pytest.mark.parametrize('gateway_server', ['vpn.seu.edu.cn'], indirect=True)
-def test_gateway_ip_bypasses_dns_preserving_tls_origin_and_cookies(gateway_server):
+def test_gateway_ip_follows_dns_failure_preserving_tls_origin_and_cookies(gateway_server, monkeypatch):
     received, sni, destinations = gateway_server
     with requests.Session() as session:
         client = Client(session, {'SEU_VPN_IP': '127.0.0.1'}, input, lambda _: None)
-        for origin in (GATEWAY, GATEWAY + ':443'):
-            response = client.request('GET', origin + '/public')
-            assert response.status_code == 200
-            assert response.url == origin + '/public'
+        monkeypatch.setattr(client, '_authenticate', lambda: client.get(GATEWAY + '/public'))
+        client.authenticate()
+        response = client.request('GET', GATEWAY + ':443/public')
+        assert response.status_code == 200
+        assert response.url == GATEWAY + ':443/public'
         assert all(cookie.domain == 'vpn.seu.edu.cn' for cookie in session.cookies)
-    assert destinations == [('127.0.0.1', 443)] * 2
+    assert destinations == [('vpn.seu.edu.cn', 443)] + [('127.0.0.1', 443)] * 2
     assert sni == ['vpn.seu.edu.cn'] * 2
     assert received == [('vpn.seu.edu.cn', None), ('vpn.seu.edu.cn', 'gateway=test')]
 
@@ -106,21 +109,27 @@ def test_gateway_ip_rejects_wrong_domain_or_untrusted_certificates(gateway_serve
         monkeypatch.delenv('REQUESTS_CA_BUNDLE')
     with requests.Session() as session:
         client = Client(session, {'SEU_VPN_IP': '127.0.0.1'}, input, lambda _: None)
+        monkeypatch.setattr(client, '_authenticate', lambda: client.get(GATEWAY + '/public'))
         with pytest.raises(RemoteError) as error:
-            client.request('GET', GATEWAY + '/public')
+            client.authenticate()
     assert error.value.tls_reason == 'certificate_verify_failed'
     assert received == []
     assert sni == ['vpn.seu.edu.cn']
-    assert destinations == [('127.0.0.1', 443)]
+    assert destinations == [('vpn.seu.edu.cn', 443), ('127.0.0.1', 443)]
 
 
-def test_gateway_ip_only_changes_the_gateway_adapter():
+@pytest.mark.parametrize('gateway_server', [('vpn.seu.edu.cn', True)], indirect=True)
+def test_configured_ip_is_unused_when_dns_works(gateway_server, monkeypatch):
+    received, sni, destinations = gateway_server
     with requests.Session() as session:
-        other_adapter = session.get_adapter('https://auth.seu.edu.cn/')
-        Client(session, {'SEU_VPN_IP': '127.0.0.1'}, input, lambda _: None)
-        assert session.get_adapter('https://auth.seu.edu.cn/') is other_adapter
-        assert session.get_adapter('https://ehall.seu.edu.cn/') is other_adapter
-        assert session.get_adapter(GATEWAY + '/') is not other_adapter
+        adapter = session.get_adapter(GATEWAY + '/')
+        client = Client(session, {'SEU_VPN_IP': '192.0.2.1'}, input, lambda _: None)
+        monkeypatch.setattr(client, '_authenticate', lambda: client.get(GATEWAY + '/public'))
+        client.authenticate()
+        assert session.get_adapter(GATEWAY + '/') is adapter
+    assert destinations == [('vpn.seu.edu.cn', 443)]
+    assert sni == ['vpn.seu.edu.cn']
+    assert received == [('vpn.seu.edu.cn', None)]
 
 
 def test_empty_gateway_ip_keeps_the_default_adapter():
@@ -128,3 +137,95 @@ def test_empty_gateway_ip_keeps_the_default_adapter():
         adapter = session.get_adapter(GATEWAY + '/')
         Client(session, {'SEU_VPN_IP': ''}, input, lambda _: None)
         assert session.get_adapter(GATEWAY + '/') is adapter
+
+
+@pytest.mark.parametrize('failure', [
+    requests.ConnectionError(socket.gaierror(socket.EAI_NONAME, 'SECRET DNS failure')),
+    requests.ConnectionError(ProtocolError('closed', RemoteDisconnected('SECRET closed'))),
+    requests.ConnectionError(ProtocolError('reset', ConnectionResetError('SECRET reset'))),
+    requests.ConnectionError(ConnectionAbortedError('SECRET aborted')),
+    requests.ConnectionError(ProtocolError('closed', BrokenPipeError('SECRET pipe closed'))),
+    requests.exceptions.SSLError('[SSL: UNEXPECTED_EOF_WHILE_READING] SECRET'),
+    requests.exceptions.SSLError(ssl.SSLEOFError('SECRET EOF')),
+])
+def test_initial_gateway_connection_failure_switches_only_gateway_once(monkeypatch, failure):
+    with requests.Session() as session:
+        session.trust_env = False
+        original = session.get_adapter(GATEWAY + '/')
+        adapters = []
+        def send(request, **kwargs):
+            assert kwargs['verify'] is True
+            adapters.append(session.get_adapter(request.url))
+            raise failure
+        monkeypatch.setattr(session, 'send', send)
+        client = Client(session, {'SEU_VPN_IP': '127.0.0.1'}, input, lambda _: None)
+        monkeypatch.setattr(client, '_authenticate', lambda: client.get(GATEWAY + '/public'))
+        with pytest.raises(RemoteError):
+            client.authenticate()
+        assert len(adapters) == 2
+        assert adapters[0] is original
+        assert isinstance(adapters[1], GatewayIPAdapter)
+        assert session.get_adapter(GATEWAY + ':443/') is adapters[1]
+        assert session.get_adapter('https://auth.seu.edu.cn/') is original
+        assert session.get_adapter('https://ehall.seu.edu.cn/') is original
+        with pytest.raises(RemoteError):
+            client.authenticate()
+        assert adapters == [original, adapters[1], adapters[1]]
+
+
+@pytest.mark.parametrize('failure', [
+    requests.ConnectTimeout('SECRET timeout'),
+    requests.ReadTimeout('SECRET timeout'),
+    requests.exceptions.ProxyError(socket.gaierror('SECRET proxy DNS')),
+    requests.ConnectionError(ConnectionRefusedError('SECRET refused')),
+    requests.ConnectionError('SECRET unknown failure'),
+    requests.exceptions.SSLError('[SSL: CERTIFICATE_VERIFY_FAILED] SECRET'),
+    requests.exceptions.SSLError('[SSL: WRONG_VERSION_NUMBER] SECRET'),
+    requests.exceptions.SSLError('SECRET unknown TLS failure'),
+    403, 429, 500,
+])
+def test_unrelated_failure_does_not_switch_gateway(monkeypatch, failure):
+    with requests.Session() as session:
+        session.trust_env = False
+        original = session.get_adapter(GATEWAY + '/')
+        calls = []
+        def send(request, **kwargs):
+            calls.append(request.url)
+            if isinstance(failure, Exception):
+                raise failure
+            response = requests.Response()
+            response.status_code = failure
+            return response
+        monkeypatch.setattr(session, 'send', send)
+        client = Client(session, {'SEU_VPN_IP': '127.0.0.1'}, input, lambda _: None)
+        monkeypatch.setattr(client, '_authenticate', lambda: client.get(GATEWAY + '/public'))
+        with pytest.raises(RemoteError):
+            client.authenticate()
+        assert len(calls) == 1
+        assert session.get_adapter(GATEWAY + '/') is original
+
+
+@pytest.mark.parametrize('origin, address, logged_in', [
+    ('https://auth.seu.edu.cn', '127.0.0.1', False),
+    ('https://ehall.seu.edu.cn', '127.0.0.1', False),
+    (GATEWAY, '', False),
+    (GATEWAY, '127.0.0.1', True),
+])
+def test_fallback_requires_gateway_backup_and_initial_authentication(monkeypatch, origin, address, logged_in):
+    with requests.Session() as session:
+        session.trust_env = False
+        original = session.get_adapter(GATEWAY + '/')
+        client = Client(session, {'SEU_VPN_IP': address}, input, lambda _: None)
+        if logged_in:
+            monkeypatch.setattr(client, '_authenticate', lambda: None)
+            client.authenticate()
+        calls = []
+        def fail(request, **kwargs):
+            calls.append(request.url)
+            raise requests.ConnectionError(socket.gaierror('SECRET DNS failure'))
+        monkeypatch.setattr(session, 'send', fail)
+        monkeypatch.setattr(client, '_authenticate', lambda: client.get(origin + '/public'))
+        with pytest.raises(RemoteError):
+            client.authenticate()
+        assert len(calls) == 1
+        assert session.get_adapter(GATEWAY + '/') is original

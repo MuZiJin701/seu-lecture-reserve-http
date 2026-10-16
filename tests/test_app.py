@@ -1,5 +1,6 @@
 import base64
 import json
+import socket
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import requests
@@ -108,6 +109,42 @@ def test_sms_authentication_never_queries_or_submits_business(tmp_path):
     assert result == 130
     assert 'authentication_required' in notifications
     assert not any('/modules/hdyy/' in url for _, url, _ in school.requests)
+
+
+@pytest.mark.parametrize('check_only', [False, True])
+def test_initial_gateway_dns_failure_restarts_authentication_through_app(tmp_path, check_only, capsys):
+    class GatewaySchool(School):
+        def __init__(self):
+            super().__init__()
+            self.mounts = []
+            self.gateway_attempts = []
+        def mount(self, prefix, adapter):
+            self.mounts.append((prefix, adapter))
+        def request(self, method, url, **kwargs):
+            if url.startswith('https://vpn.seu.edu.cn/'):
+                self.gateway_attempts.append(bool(self.mounts))
+                if not self.mounts:
+                    raise requests.ConnectionError(socket.gaierror('SECRET DNS failure'))
+            return super().request(method, url, **kwargs)
+    school = GatewaySchool()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    options = dict(session=school, environ={'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password',
+                   'SEU_VPN_IP': '192.0.2.1'}, sleep=interrupted, prompt=interrupted,
+                   recognize=lambda _: '1234', notify=lambda _: None)
+    result = run(Settings(state_dir=tmp_path), check_only=check_only, **options)
+    assert result == (0 if check_only else 130)
+    assert school.gateway_attempts[0] is False
+    assert all(school.gateway_attempts[1:])
+    assert [prefix for prefix, _ in school.mounts] == [
+        'https://vpn.seu.edu.cn/', 'https://vpn.seu.edu.cn:443/']
+    assert school.mounts[0][1] is school.mounts[1][1]
+    assert school.submitted == ([] if check_only else ['one'])
+    assert 'SECRET' not in capsys.readouterr().out
+    if not check_only:
+        assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'pending'
+        assert run(Settings(state_dir=tmp_path), **options) == 130
+        assert school.submitted == ['one']
 
 
 def lecture(wid='one', **changes):

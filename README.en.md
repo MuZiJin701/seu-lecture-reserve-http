@@ -76,13 +76,55 @@ tail -n 20 state/runner.log
 
 The process can survive an SSH disconnect, but it will not restart automatically after exiting or a server reboot. If manual authentication is needed, it exits and preserves the task. Confirm the background process has exited, then run `uv run main.py` in the foreground to handle it. Adjust the log paths if you changed `SEU_STATE_DIR`. See [background operation](docs/usage.md#服务器后台运行) (Chinese) for process checks and recovery.
 
-Read the local task status:
+## Check task status
+
+Read the local task record from the project directory without starting another reservation process:
 
 ```bash
 uv run main.py --status
 ```
 
-`scanning`, `pending` and `done` mean scanning, an unconfirmed reservation result, and a completed attendance goal. This does not check whether the process is alive. Do not delete state files to force retries. Use `uv run main.py --new-task` to recheck a completed goal, including tasks completed before this update that need the new overlap-counting rules.
+| Status | Meaning |
+| --- | --- |
+| `not_started` | No local task yet |
+| `scanning` | The task is incomplete and still needs scanning or progress checks |
+| `pending` | A reservation submission result is unconfirmed |
+| `done` | The attendance goal is complete |
+
+**`scanning` does not prove the process is running.** For the background startup method above, also check the process recorded in the PID file:
+
+```bash
+ps -p "$(cat state/runner.pid)" -o pid,ppid,args
+```
+
+No matching process row means that PID has exited. A running process does not prove its latest query succeeded. Read recent output and events:
+
+```bash
+tail -n 20 state/runner.log
+tail -n 20 state/events.log
+```
+
+Logs may contain old errors; check their timestamps. Missing log files are possible before anything has been logged. Adjust these paths and those below if you changed `SEU_STATE_DIR`.
+
+## Stop and resume
+
+For foreground operation, press `Ctrl+C` in the original terminal. For background operation, read the PID and check its command and working directory first:
+
+```bash
+reserve_pid=$(cat state/runner.pid)
+ps -p "$reserve_pid" -o pid,ppid,args
+readlink "/proc/$reserve_pid/cwd"
+```
+
+Confirm the command is `uv run main.py` and the working directory is this project, then run:
+
+```bash
+kill -TERM "$reserve_pid"
+```
+
+`uv` forwards the termination signal to its Python child. Run the `ps` command above again to check that it exited. `No such process` means that PID has already exited. PID files can be stale, so check before sending a signal.
+
+Stopping does not cancel school reservations. Keep the `state` directory, then run `uv run main.py` or the background startup commands above to resume the same task. Use `uv run main.py --new-task` to recheck a completed goal, including tasks completed before this update that need the new overlap-counting rules.
 
 ## Common settings
 

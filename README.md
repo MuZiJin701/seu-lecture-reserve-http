@@ -76,13 +76,55 @@ tail -n 20 state/runner.log
 
 SSH 断开后仍可运行，但进程退出或服务器重启后不会自动启动。后台遇到需要人工认证的情况会退出并保留任务；确认后台已退出后，执行 `uv run main.py` 在前台处理。修改过 `SEU_STATE_DIR` 时，请同步修改上面的日志路径。进程核对及恢复方法见[服务器后台运行](docs/usage.md#服务器后台运行)。
 
-查看本地任务状态：
+## 查看任务状态
+
+在项目目录查看本地任务记录，不会启动新的预约进程：
 
 ```bash
 uv run main.py --status
 ```
 
-`scanning`、`pending`、`done` 分别表示扫描、预约结果待确认、已打卡目标完成。它不检查进程是否存活。不要删除状态文件来强行重试；已完成目标需要重新核对时使用 `uv run main.py --new-task`，升级前已完成的任务也需用此命令按重叠选择的新口径核对。
+| 状态 | 含义 |
+| --- | --- |
+| `not_started` | 尚无本地任务 |
+| `scanning` | 任务尚未完成，仍需扫描或核对进度 |
+| `pending` | 预约提交结果待确认 |
+| `done` | 已打卡目标完成 |
+
+**`scanning` 不代表程序还在运行。** 使用上述后台启动方式时，还需查看 PID 文件对应的进程：
+
+```bash
+ps -p "$(cat state/runner.pid)" -o pid,ppid,args
+```
+
+没有对应进程行，说明该 PID 已退出；即使进程存在，也不能据此确认最近一次查询成功。查看最近输出和事件：
+
+```bash
+tail -n 20 state/runner.log
+tail -n 20 state/events.log
+```
+
+日志可能保留旧错误，请结合时间判断；尚无日志时可能提示文件不存在。修改过 `SEU_STATE_DIR` 时，请调整这里和下方命令的路径。
+
+## 停止与继续
+
+前台运行时，在原终端按 `Ctrl+C`。后台运行时，先读取 PID 并核对命令和工作目录：
+
+```bash
+reserve_pid=$(cat state/runner.pid)
+ps -p "$reserve_pid" -o pid,ppid,args
+readlink "/proc/$reserve_pid/cwd"
+```
+
+确认命令是 `uv run main.py`、工作目录是本项目后，再执行：
+
+```bash
+kill -TERM "$reserve_pid"
+```
+
+`uv` 会把停止信号转发给 Python 子进程。再次执行上面的 `ps` 命令核对退出；`No such process` 表示该 PID 已结束。PID 文件可能过期，不要跳过核对。
+
+停止不会取消学校已有预约。保留 `state` 目录，再执行 `uv run main.py` 或上述后台启动命令即可继续原任务。已完成目标需要重新核对时使用 `uv run main.py --new-task`，升级前已完成的任务也需用此命令按重叠选择的新口径核对。
 
 ## 常用配置
 

@@ -225,6 +225,26 @@ tail -n 20 state/runner.log
 
 PID 文件记录的是 `uv` 启动器，需结合其 Python 子进程及工作目录核实当前实例，不能仅凭旧 PID 文件判断进程存活。正常完成、人工停止或需交互退出后不会自动重新启动，服务器重启后也不会自启。需要正常预约时保留 `.env` 的私有权限；日志仅保存脱敏事件。
 
+### 查看进程与停止后台任务
+
+在项目目录执行以下只读命令，核对 PID、启动命令和工作目录；路径示例沿用默认 `state` 目录：
+
+```bash
+reserve_pid=$(cat state/runner.pid)
+ps -p "$reserve_pid" -o pid,ppid,args
+readlink "/proc/$reserve_pid/cwd"
+```
+
+确认命令为 `uv run main.py` 且工作目录为本项目后，发送停止信号：
+
+```bash
+kill -TERM "$reserve_pid"
+```
+
+`uv` 会将 SIGTERM 转发给 Python 子进程，见 [uv 信号处理说明](https://docs.astral.sh/uv/concepts/projects/run/#signal-handling)。再次执行上面的 `ps` 命令核对退出；没有对应进程行或 `No such process` 表示该 PID 已结束。PID 文件可能过期或对应的 PID 已被其他进程复用，因此必须先核对。缺少 PID 文件时，不能仅凭这一点认定程序没有运行。
+
+停止后保留状态目录，重新执行原启动命令会恢复任务，不取消学校已有预约；预约结果待确认时仍先核对原活动。前台进程使用原终端的 `Ctrl+C` 停止。`--status` 只读本地任务，可能在进程退出后继续显示 `scanning`；核对进程和最近事件的方法见[状态与日志](#状态与日志)。
+
 后台没有交互终端，遇短信、未知认证挑战或预约结果待确认时，当前程序记录事件、按配置通知并退出，保留任务。确认后台已退出后，通过 SSH 在前台执行 `uv run main.py`，按提示处理；再次停止和后台启动会接着原任务。不能后台自动签到或绕过认证。本次未增加 systemd、容器或新的验证码通道。
 
 ## 人工认证

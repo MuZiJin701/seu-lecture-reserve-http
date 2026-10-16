@@ -113,11 +113,11 @@ def test_sms_authentication_never_queries_or_submits_business(tmp_path):
 def lecture(wid='one', **changes):
     return {'WID': wid, 'HDMC': '测试讲座', 'HDLX_DISPLAY': '人文与科学素养系列讲座_心理健康',
             'KSSJ': '2030-01-01 10:00:00', 'JSSJ': '2030-01-01 11:00:00',
-            'IS_ONLINE': True, 'JZDD': '线上', 'YYZT': '预约', **changes}
+            'IS_ONLINE': True, 'JZDD': '线上', 'YYZT': '预约', 'SFDK': '0', 'SFWY': '0', **changes}
 
 
 def execute(school, directory, **options):
-    options.setdefault('sleep', lambda _: None)
+    options.setdefault('sleep', interrupted)
     options.setdefault('notify', lambda _: None)
     options.setdefault('prompt', interrupted)
     options.setdefault('recognize', lambda image: '1234')
@@ -127,14 +127,14 @@ def execute(school, directory, **options):
                **options)
 
 
-def test_one_confirmed_reservation_ends_task_and_restart_does_not_book_again(tmp_path):
+def test_one_confirmed_reservation_continues_goal_and_restart_does_not_duplicate(tmp_path):
     school = School()
     school.activities = [lecture(), lecture('two')]
     events = []
-    assert execute(school, tmp_path, notify=events.append) == 0
+    assert execute(school, tmp_path, notify=events.append) == 130
     assert school.submitted == ['one']
     assert events == ['reservation_succeeded']
-    assert execute(school, tmp_path, notify=events.append) == 0
+    assert execute(school, tmp_path, notify=events.append) == 130
     assert school.submitted == ['one']
 
 
@@ -154,11 +154,11 @@ def test_windows_state_and_event_log_without_unix_file_apis(tmp_path, monkeypatc
     monkeypatch.delattr(os, 'O_DIRECTORY', raising=False)
     school = School()
     school.activities = [lecture()]
-    assert execute(school, tmp_path) == 0
-    assert execute(school, tmp_path) == 0
+    assert execute(school, tmp_path) == 130
+    assert execute(school, tmp_path) == 130
     assert school.submitted == ['one']
     assert locks == [(2, 1), (2, 1)]
-    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'done'
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
     assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
 
 
@@ -169,7 +169,7 @@ def test_unknown_submission_is_queried_and_survives_restart_without_resubmission
     assert execute(school, tmp_path) == 130
     assert school.submitted == ['one']
     school.mine = [{**lecture(), 'HD_WID': 'one', 'YYZT': '已预约'}]
-    assert execute(school, tmp_path) == 0
+    assert execute(school, tmp_path) == 130
     assert school.submitted == ['one']
     assert 'SECRET' not in capsys.readouterr().out
 
@@ -177,11 +177,11 @@ def test_unknown_submission_is_queried_and_survives_restart_without_resubmission
 def test_school_reservation_fields_preserve_conflicts_including_touching_times(tmp_path):
     school = School()
     school.mine = [{'WID': 'reservation-row', 'HD_WID': 'old', 'YY_WID': 'reservation-id',
-                    'FBZT': '1', 'SFDK': '1', 'SFWY': '0',
+                    'FBZT': '1', 'SFDK': '1', 'SFWY': '0', 'JZXL_DISPLAY': '人文与科学素养系列讲座_心理健康',
                     'JZSJ': '2030-01-01 09:00:00', 'HDJSSJ': '2030-01-01 10:00:00'}]
     school.activities = [lecture('touching'),
                          lecture('later', KSSJ='2030-01-01 11:00:00', JSSJ='2030-01-01 12:00:00')]
-    assert execute(school, tmp_path, sleep=interrupted) == 0
+    assert execute(school, tmp_path, sleep=interrupted) == 130
     assert school.submitted == ['later']
 
 
@@ -189,7 +189,7 @@ def test_school_cancelled_activity_does_not_block_booking(tmp_path):
     school = School()
     school.mine = [{'WID': 'reservation-row', 'HD_WID': 'one', 'FBZT': '-1'}]
     school.activities = [lecture()]
-    assert execute(school, tmp_path, sleep=interrupted) == 0
+    assert execute(school, tmp_path, sleep=interrupted) == 130
     assert school.submitted == ['one']
 
 
@@ -210,8 +210,9 @@ def test_pending_submission_is_confirmed_by_school_activity_id_after_restart(tmp
     school.submit_timeout = True
     assert execute(school, tmp_path) == 130
     school.mine = [{'WID': 'reservation-row', 'HD_WID': 'one', 'YY_WID': 'reservation-id', 'FBZT': '1',
+                    'SFDK': '0', 'SFWY': '0', 'JZXL_DISPLAY': '人文与科学素养系列讲座_心理健康',
                     'JZSJ': '2030-01-01 10:00:00', 'HDJSSJ': '2030-01-01 11:00:00'}]
-    assert execute(school, tmp_path, sleep=interrupted) == 0
+    assert execute(school, tmp_path, sleep=interrupted) == 130
     assert school.submitted == ['one']
 
 
@@ -233,7 +234,7 @@ def test_four_explicit_captcha_rejections_cool_down_first_candidate_and_try_next
     school = School()
     school.activities = [lecture(), lecture('two')]
     school.submit_replies = [{'code': 1, 'msg': '验证码错误'}] * 4
-    assert execute(school, tmp_path) == 0
+    assert execute(school, tmp_path) == 130
     assert school.submitted == ['one', 'one', 'one', 'one', 'two']
 
 
@@ -288,9 +289,9 @@ def test_no_mail_configuration_still_books_and_records_success(tmp_path, monkeyp
     school.activities = [lecture()]
     env = {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password', **mail}
     assert run(Settings(state_dir=tmp_path), session=school, environ=env,
-               recognize=lambda _: '1234', sleep=lambda _: None) == 0
+               recognize=lambda _: '1234', sleep=interrupted) == 130
     assert school.submitted == ['one']
-    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'done'
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
     assert 'event=reservation_succeeded' in capsys.readouterr().out
     assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
 
@@ -322,7 +323,7 @@ def test_default_email_contains_only_event_and_mail_failure_does_not_repeat_book
     if authenticated:
         env.update(SMTP_USERNAME='sender@gmail.com', SMTP_PASSWORD='private-mail-password')
     assert run(Settings(state_dir=tmp_path), session=school, environ=env,
-               recognize=lambda _: '1234', sleep=lambda _: None) == 0
+               recognize=lambda _: '1234', sleep=interrupted) == 130
     assert len(messages) == 1
     assert logins == ([('sender@gmail.com', 'private-mail-password')] if authenticated else [])
     assert messages[0]['From'] == 'sender@example.org'
@@ -331,7 +332,7 @@ def test_default_email_contains_only_event_and_mail_failure_does_not_repeat_book
     assert 'PRIVATE TITLE' not in messages[0].get_content()
     assert 'SECRET' not in capsys.readouterr().out
     assert 'event=notification_failed' in (tmp_path / 'events.log').read_text()
-    assert execute(school, tmp_path) == 0
+    assert execute(school, tmp_path) == 130
     assert school.submitted == ['one']
 
 
@@ -452,7 +453,7 @@ def test_sms_is_only_sent_on_user_command_and_challenge_email_is_not_repeated(tm
     school.activities = [lecture()]
     answers = iter(['send', '111111', '654321'])
     events = []
-    assert execute(school, tmp_path, prompt=lambda _: next(answers), notify=events.append) == 0
+    assert execute(school, tmp_path, prompt=lambda _: next(answers), notify=events.append) == 130
     assert school.sms_sends == 1
     assert events == ['authentication_required', 'reservation_succeeded']
 
@@ -508,8 +509,8 @@ def test_category_order_precedes_time_and_title_order(tmp_path):
     school.activities = [lecture('early', HDMC='first title', HDLX_DISPLAY='人文与科学素养系列讲座_法律'),
                          lecture('late', HDMC='second title', KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00')]
     settings = Settings(state_dir=tmp_path, titles=('first title', 'second title'))
-    assert execute(school, tmp_path, settings=settings) == 0
-    assert school.submitted == ['late']
+    assert execute(school, tmp_path, settings=settings) == 130
+    assert school.submitted == ['late', 'early']
 
 
 def test_new_task_only_replaces_completed_task_and_preserves_pending_submission(tmp_path):
@@ -520,11 +521,11 @@ def test_new_task_only_replaces_completed_task_and_preserves_pending_submission(
     assert execute(school, tmp_path, new_task=True) == 1
     assert school.submitted == ['one']
     school.mine = [{**lecture(), 'YYZT': '已预约'}]
-    assert execute(school, tmp_path) == 0
+    assert execute(school, tmp_path) == 130
     school.submit_timeout = False
     school.activities = [lecture('two', KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00')]
-    assert execute(school, tmp_path, new_task=True) == 0
-    assert school.submitted == ['one', 'two']
+    assert execute(school, tmp_path, new_task=True) == 1
+    assert school.submitted == ['one']
 
 
 def test_corrupt_checkpoint_stops_before_any_network_request(tmp_path):
@@ -580,7 +581,7 @@ def test_empty_ocr_output_has_bounded_attempts_and_does_not_block_other_candidat
     school = School()
     school.activities = [lecture(), lecture('two')]
     answers = iter(['', '', '', '', '1234'])
-    assert execute(school, tmp_path, recognize=lambda _: next(answers)) == 0
+    assert execute(school, tmp_path, recognize=lambda _: next(answers)) == 130
     assert school.submitted == ['two']
 
 
@@ -608,7 +609,7 @@ def test_gateway_steps_and_application_cas_reuse_preserve_service_but_use_https(
             return response
     school = GatewaySchool()
     school.activities = [lecture()]
-    assert execute(school, tmp_path) == 0
+    assert execute(school, tmp_path) == 130
     assert school.submitted == ['one']
     assert any(url.endswith('reportEnv') for _, url, _ in school.requests)
     assert any(url.endswith('auth/authCheck') for _, url, _ in school.requests)
@@ -648,7 +649,7 @@ def test_large_recoverable_state_does_not_block_restart(tmp_path):
     saved['cooldowns'] = {str(n).zfill(32): 1 for n in range(2000)}
     path.write_text(json.dumps(saved))
     school.activities = [lecture()]
-    assert execute(school, tmp_path) == 0
+    assert execute(school, tmp_path) == 130
     assert school.submitted == ['one']
 
 

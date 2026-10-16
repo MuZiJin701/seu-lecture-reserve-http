@@ -12,12 +12,11 @@ from typing import Any
 import requests
 
 from .client import AuthenticationExpired, AuthenticationRejected, Client, RemoteError, has_code
-from .model import Lecture, activity_id, interval, reserved
+from .model import Lecture, SERIES_CATEGORIES, activity_id, interval, progress, reserved
 from .mail import Mailer
 from .state import Task, open_nofollow
 
-DEFAULT_CATEGORIES = ('人文与科学素养系列讲座_心理健康', '人文与科学素养系列讲座_法律',
-                      '人文与科学素养系列讲座-艺术类', '人文与科学素养系列讲座_其他', '“SEU咖啡间"系列沙龙活动')
+DEFAULT_CATEGORIES = SERIES_CATEGORIES
 
 
 def terminal_prompt(label: str) -> str:
@@ -73,7 +72,7 @@ def run(settings: Settings, *, session: Any = None,
             stage = 'authentication'
             client.authenticate()
             stage = 'my_activities'
-            client.mine()
+            progress(client.mine(), clock())
             stage = 'activities'
             client.activities()
             stage = 'captcha'
@@ -125,12 +124,22 @@ def run(settings: Settings, *, session: Any = None,
                 booked = {activity_id(row) for row in mine if reserved(row)}
                 if task.data['status'] == 'pending':
                     if task.data['activity'] in booked:
-                        task.data['status'] = 'done'
+                        task.data.update(status='scanning', activity='')
                         task.save()
                         emit('reservation_succeeded')
-                        return 0
-                    emit('reservation_unconfirmed')
-                    prompt('预约结果待确认；核实后按回车重新查询（Ctrl+C 停止）：')
+                    else:
+                        emit('reservation_unconfirmed')
+                        prompt('预约结果待确认；核实后按回车重新查询（Ctrl+C 停止）：')
+                        continue
+                current = progress(mine, clock())
+                if current.done:
+                    task.data.update(status='done', activity='')
+                    task.save()
+                    emit('goal_completed')
+                    return 0
+                if not any(current.needs(category) for category in settings.categories):
+                    failures = 0
+                    sleep(10)
                     continue
                 conflicts = [interval(row) for row in mine if reserved(row)]
                 candidates = []
@@ -143,6 +152,7 @@ def run(settings: Settings, *, session: Any = None,
                             raise RemoteError('activity_schema_unknown') from None
                         continue
                     if (lecture.wid in booked or lecture.category not in settings.categories
+                            or not current.needs(lecture.category)
                             or (settings.titles and lecture.title not in settings.titles)
                             or (lecture.online and not settings.online)
                             or (not lecture.online and (not settings.offline or lecture.campus not in settings.campuses))
@@ -150,7 +160,8 @@ def run(settings: Settings, *, session: Any = None,
                             or task.data['cooldowns'].get(lecture.wid, 0) > clock()):
                         continue
                     candidates.append(lecture)
-                candidates.sort(key=lambda row: (settings.categories.index(row.category), not row.online, row.start, row.wid))
+                candidates.sort(key=lambda row: (row.category not in current.missing,
+                                settings.categories.index(row.category), not row.online, row.start, row.wid))
                 for lecture in candidates:
                     if not client.preflight(lecture.wid):
                         continue
@@ -202,7 +213,10 @@ def run(settings: Settings, *, session: Any = None,
                 defer(min(300, 10 * 2 ** min(failures, 5)))
             except (RemoteError, ValueError) as exc:
                 failures += 1
-                record(str(exc) if isinstance(exc, RemoteError) else 'invalid_activity_data')
+                reason = str(exc)
+                record(reason if isinstance(exc, RemoteError) or reason in (
+                    'attendance_result_pending', 'attendance_category_unknown',
+                    'attendance_status_unknown', 'attendance_record_conflict') else 'invalid_activity_data')
                 if failures == 3:
                     emit('query_failure')
                 retry = exc.retry_after if isinstance(exc, RemoteError) else 0

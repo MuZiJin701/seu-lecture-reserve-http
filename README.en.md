@@ -2,7 +2,7 @@
 
 [中文](README.md)
 
-Keep looking for suitable SEU lectures on a server, recognize image CAPTCHAs, and attempt a reservation. The client uses HTTPS directly, needs no browser, and exits after confirming one reservation.
+Keep looking for suitable SEU lectures on a server, recognize image CAPTCHAs, and attempt a reservation. The client uses HTTPS directly, needs no browser, and works toward 8 school-recorded attendances, including at least one each in law, art and mental health.
 
 Offline tests, live login and read-only queries have passed. Live reservations and long-running use still need verification. Start with the read-only check.
 
@@ -50,7 +50,7 @@ Campus names must match the university system; change the example to suit your n
 **3. Check login and queries**
 
 ```bash
-uv run --locked seu-reserve --check
+uv run main.py --check
 ```
 
 This only logs in, queries data and fetches a CAPTCHA. It does not submit a reservation or require mail settings. Success prints `event=read_only_complete`.
@@ -75,10 +75,14 @@ The client automatically uses `smtp.gmail.com:465` with implicit TLS. See the [G
 When upgrading, nonempty `SMTP_HOST`, `MAIL_FROM` and `MAIL_TO` values keep overriding automatic defaults. To disable email, clear all mail fields; `SMTP_PORT` may be empty, absent or left at the default `465`. Also check matching process environment variables.
 
 ```bash
-uv run --locked seu-reserve
+uv run main.py
 ```
 
-This command submits real reservations. The client checks every 10 seconds by default until it confirms one reservation or you stop it.
+`main.py` calls the existing CLI and accepts the same check, status and new-task options. Use `uv run --locked main.py` to require an up-to-date lockfile. The original `seu-reserve` command remains available.
+
+This command submits real reservations. The client checks every 10 seconds, prioritizes missing required categories, and continues after each confirmed booking. Once recorded attendance plus valid upcoming bookings covers the goal, it pauses new bookings and keeps checking. It exits only when recorded attendance meets the goal. Cancelled or breached bookings are replaced; ended bookings without a confirmed attendance or breach status pause new bookings to avoid replacements during reporting delays. SEU Coffee Salon events are neither booked nor counted. There is no assessment deadline setting.
+
+Progress comes from “My activities,” including manual and other-tool bookings, deduplicated by activity ID. You do not maintain completion counts yourself. School check-in records are the agreed counting basis and do not replace final departmental assessment. See the [API investigation](docs/completion-records.md) (Chinese) for evidence and historical-completeness limits.
 
 **A quiet terminal does not necessarily mean the client is stuck.** Successful queries with no suitable lectures lead to a quiet wait and do not count as failures. Errors produce events and longer retry delays; restarting preserves any remaining delay. See [status and logs](docs/usage.md#状态与日志) (Chinese).
 
@@ -89,7 +93,7 @@ Edit `.env`, then restart. Lists use JSON arrays, as in the campus example above
 | Setting | Purpose |
 | --- | --- |
 | `SEU_PREFERRED_CAMPUS` | Allowed offline campuses; multiple names are supported. The default empty list excludes offline lectures |
-| `SEU_REQUIRED_CATEGORIES` | Allowed lecture categories; you can keep the example values |
+| `SEU_REQUIRED_CATEGORIES` | Candidate categories and their order; keep mental health, law, art and other series. Goal counts remain independent of these filters |
 | `SEU_ENABLE_ONLINE` / `SEU_ENABLE_OFFLINE` | Allow online / offline lectures; use `true` or `false` |
 | `SEU_PREFERRED_LECTURES` | Match exact full titles; `'[]'` leaves titles unrestricted |
 | `SMTP_*` / `MAIL_*` | Optional email notifications; Gmail needs only `SMTP_USERNAME` and `SMTP_PASSWORD` |
@@ -99,19 +103,19 @@ See [.env.example](.env.example) for all settings and the [usage guide](docs/usa
 
 ## Stop and resume
 
-- Keep an interactive SSH terminal open. If SMS verification is required, enter `send` when prompted, then enter the six-digit code.
+- Keep an interactive SSH terminal open for foreground use. See [server background operation](docs/usage.md#服务器后台运行) (Chinese) to continue after disconnecting SSH. If SMS verification is required, enter `send` when prompted, then enter the six-digit code.
 - Press `Ctrl+C` to stop without cancelling any reservation. Running the original start command resumes the same task.
 - If a submission result is unclear, the client checks that reservation before doing anything else. Do not delete task state to force another attempt.
-- Restarting a completed task exits immediately. To reserve another lecture, explicitly start a new task:
+- In the new state format, `done` means the entire attendance goal is complete; restarting exits immediately. Use this command to recheck current school records; it will not book extra lectures if the goal remains complete. Old single-booking completion states are automatically migrated and rechecked, preserving pending submissions, cooldowns and backoff:
 
 ```bash
-uv run --locked seu-reserve --new-task
+uv run main.py --new-task
 ```
 
 Check local task status:
 
 ```bash
-uv run --locked seu-reserve --status
+uv run main.py --status
 ```
 
 This reads the local task record, not process health. `status=scanning` does not prove the process is running or its latest query succeeded. You do not need to start another reservation process to check status.

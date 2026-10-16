@@ -60,11 +60,11 @@ def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[S
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description='SEU HTTPS lecture reservation; one success per task')
+    parser = argparse.ArgumentParser(description='SEU lecture goal: 8 attended, including law, art and mental health')
     parser.add_argument('--config', type=Path, help='dotenv file (default: .env in the current directory)')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--check', action='store_true', help='authenticate and fetch data/captcha without submitting')
-    mode.add_argument('--new-task', action='store_true', help='explicitly replace a completed task')
+    mode.add_argument('--new-task', action='store_true', help='recheck a completed goal against school records')
     mode.add_argument('--status', action='store_true', help='show local task status without network access')
     args = parser.parse_args(argv)
     try:
@@ -73,9 +73,12 @@ def main(argv: list[str] | None = None) -> int:
             path = settings.state_dir / 'task.json'
             if path.is_symlink():
                 raise ValueError('unsafe_state')
-            status = json.loads(path.read_text()).get('status') if path.exists() else 'not_started'
+            saved = json.loads(path.read_text()) if path.exists() else {}
+            status = saved.get('status', 'not_started')
             if status not in ('not_started', 'scanning', 'pending', 'done'):
                 raise ValueError('invalid_state')
+            if saved.get('version') == 1 and status == 'done':
+                status = 'legacy_completed'
             print('status=' + status)
             return 0
         checkpoint = settings.state_dir / 'task.json'
@@ -83,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
             if checkpoint.is_symlink():
                 raise ValueError('unsafe_state')
             saved = json.loads(checkpoint.read_text())
-            if isinstance(saved, dict) and saved.get('status') == 'done':
+            if isinstance(saved, dict) and saved.get('version') == 2 and saved.get('status') == 'done':
                 return run(settings, environ=environ)
         if not sys.stdin.isatty() and any(not environ.get(key) for key in ('SEU_USERNAME', 'SEU_PASSWORD')):
             print('event=credentials_require_terminal', flush=True)

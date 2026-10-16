@@ -47,12 +47,13 @@ class Task:
                 fd = open_nofollow(self.path, os.O_RDONLY)
                 with os.fdopen(fd) as source:
                     data = json.load(source)
-                if (not isinstance(data, dict) or type(data.get('version')) is not int or data['version'] != 1
+                if (not isinstance(data, dict) or type(data.get('version')) is not int or data['version'] not in (1, 2)
                         or data.get('status') not in ('scanning', 'pending', 'done')
                         or not isinstance(data.get('account'), str)
                         or not isinstance(data.get('activity'), str)
                         or not isinstance(data.get('cooldowns'), dict)
-                        or (data['status'] in ('pending', 'done') and not data['activity'])
+                        or (data['status'] == 'pending' and not data['activity'])
+                        or (data['version'] == 1 and data['status'] == 'done' and not data['activity'])
                         or type(data.get('retry_at', 0)) not in (int, float)
                         or not math.isfinite(data.get('retry_at', 0))
                         or any(not isinstance(k, str) or type(v) not in (int, float) or not math.isfinite(v)
@@ -60,13 +61,18 @@ class Task:
                     raise ValueError('state_invalid')
                 if username and account != data['account']:
                     raise ValueError('state_account_mismatch')
-                if not username and data['status'] != 'done':
+                if not username and (data['status'] != 'done' or data['version'] == 1):
                     raise ValueError('credentials_missing')
                 self.data = data
+                if data['version'] == 1:
+                    data['version'] = 2
+                    if data['status'] == 'done':
+                        data.update(status='scanning', activity='')
+                    self.save()
             else:
                 if not username:
                     raise ValueError('credentials_missing')
-                self.data = {'version': 1, 'account': account, 'status': 'scanning',
+                self.data = {'version': 2, 'account': account, 'status': 'scanning',
                              'activity': '', 'cooldowns': {}}
                 self.save()
         except BaseException:

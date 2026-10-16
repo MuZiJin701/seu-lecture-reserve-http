@@ -1,12 +1,72 @@
 """Lecture data is accepted only when its meaning can be established."""
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 SHANGHAI = ZoneInfo('Asia/Shanghai')
+SERIES_CATEGORIES = ('人文与科学素养系列讲座_心理健康', '人文与科学素养系列讲座_法律',
+                     '人文与科学素养系列讲座-艺术类', '人文与科学素养系列讲座_其他')
+REQUIRED_CATEGORIES = SERIES_CATEGORIES[:3]
+COFFEE_CATEGORY = '“SEU咖啡间"系列沙龙活动'
+
+
+@dataclass(frozen=True)
+class Progress:
+    completed: Counter[str]
+    planned: Counter[str]
+
+    @property
+    def done(self) -> bool:
+        return sum(self.completed.values()) >= 8 and all(self.completed[c] for c in REQUIRED_CATEGORIES)
+
+    @property
+    def missing(self) -> set[str]:
+        return {c for c in REQUIRED_CATEGORIES if not self.completed[c] + self.planned[c]}
+
+    def needs(self, category: str) -> bool:
+        return (category in SERIES_CATEGORIES and (category in self.missing
+                or sum(self.completed.values()) + sum(self.planned.values()) + len(self.missing) < 8))
+
+
+def progress(rows: list[dict[str, Any]], now: float) -> Progress:
+    completed: Counter[str] = Counter()
+    planned: Counter[str] = Counter()
+    seen: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        wid = activity_id(row)
+        if wid in seen:
+            if seen[wid] != row:
+                raise ValueError('attendance_record_conflict')
+            continue
+        seen[wid] = row
+        if 'FBZT' in row and row['FBZT'] not in ('1', '-1'):
+            raise ValueError('publication_status_unknown')
+        if not reserved(row) or row.get('FBZT') == '-1':
+            continue
+        category = row.get('JZXL_DISPLAY', row.get('HDLX_DISPLAY'))
+        if not isinstance(category, str) or not category:
+            raise ValueError('attendance_category_unknown')
+        if category == COFFEE_CATEGORY:
+            continue
+        if category not in SERIES_CATEGORIES:
+            raise ValueError('attendance_category_unknown')
+        checked, breached = row.get('SFDK'), row.get('SFWY')
+        if checked not in ('0', '1') or breached not in ('0', '1'):
+            raise ValueError('attendance_status_unknown')
+        end = interval(row)[1].timestamp()
+        if breached == '1':
+            continue
+        if checked == '1':
+            completed[category] += 1
+        elif end > now:
+            planned[category] += 1
+        else:
+            raise ValueError('attendance_result_pending')
+    return Progress(completed, planned)
 
 
 def activity_id(row: dict[str, Any]) -> str:

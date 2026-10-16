@@ -7,7 +7,8 @@ import pytest
 
 
 def cli(directory, *args, environment=None):
-    return subprocess.run([sys.executable, '-m', 'seu_reserve.cli', *args], cwd=directory,
+    entrypoint = Path(__file__).resolve().parents[1] / 'main.py'
+    return subprocess.run([sys.executable, str(entrypoint), *args], cwd=directory,
                           env=environment or {}, input='', capture_output=True, text=True, timeout=10)
 
 
@@ -52,16 +53,27 @@ def test_invalid_configuration_is_rejected_without_echoing_its_value(tmp_path):
 def test_completed_task_restart_does_not_prompt_for_credentials(tmp_path):
     state = tmp_path / 'state'
     state.mkdir()
-    (state / 'task.json').write_text(json.dumps({'version': 1, 'account': '0' * 64,
+    (state / 'task.json').write_text(json.dumps({'version': 2, 'account': '0' * 64,
         'status': 'done', 'activity': 'one', 'cooldowns': {}}))
     assert cli(tmp_path).returncode == 0
+
+
+def test_legacy_single_success_requires_credentials_to_recheck_goal(tmp_path):
+    state = tmp_path / 'state'
+    state.mkdir()
+    saved = json.dumps({'version': 1, 'account': '0' * 64,
+        'status': 'done', 'activity': 'one', 'cooldowns': {}})
+    (state / 'task.json').write_text(saved)
+    assert cli(tmp_path, '--status').stdout.strip() == 'status=legacy_completed'
+    assert cli(tmp_path).returncode == 1
+    assert (state / 'task.json').read_text() == saved
 
 
 def test_dotenv_is_loaded_automatically_and_controls_state_directory(tmp_path):
     (tmp_path / '.env').write_text('SEU_STATE_DIR=jobs\n')
     state = tmp_path / 'jobs'
     state.mkdir()
-    (state / 'task.json').write_text(json.dumps({'version': 1, 'account': '0' * 64,
+    (state / 'task.json').write_text(json.dumps({'version': 2, 'account': '0' * 64,
         'status': 'done', 'activity': 'one', 'cooldowns': {}}))
     result = cli(tmp_path, '--status')
     assert result.returncode == 0
@@ -91,7 +103,7 @@ def test_process_account_aliases_override_file_and_resume_the_correct_account(tm
     (tmp_path / '.env').write_text('SEU_CARD_NUMBER=file-user\n')
     state = tmp_path / 'state'
     state.mkdir()
-    (state / 'task.json').write_text(json.dumps({'version': 1,
+    (state / 'task.json').write_text(json.dumps({'version': 2,
         'account': hashlib.sha256(expected.encode()).hexdigest(), 'status': 'done',
         'activity': 'one', 'cooldowns': {}}))
     assert cli(tmp_path, environment=environment).returncode == 0
@@ -136,7 +148,8 @@ def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
     from types import SimpleNamespace
     from cryptography.hazmat.primitives.asymmetric import padding
     from seu_reserve.cli import main
-    from test_app import School, lecture
+    from test_app import School, lecture, interrupted
+    from seu_reserve.app import run as run_application
 
     password = 'test ${literal} # = password'
     class ConfiguredSchool(School):
@@ -177,7 +190,9 @@ def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
     monkeypatch.setattr('smtplib.SMTP_SSL', SMTP)
     monkeypatch.setattr('ddddocr.DdddOcr', lambda **kwargs: SimpleNamespace(classification=lambda _: '1234'))
     school.close = lambda: None
-    assert main([]) == 0
+    monkeypatch.setattr('seu_reserve.cli.run', lambda settings, **options:
+                        run_application(settings, **options, sleep=interrupted, prompt=interrupted))
+    assert main([]) == 130
     assert school.submitted == ['chosen']
     assert len(messages) == 1
     assert messages[0]['From'] == ('sender@gmail.com' if simple_gmail else 'sender@example.org')

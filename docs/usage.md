@@ -1,6 +1,6 @@
 # 使用与验收
 
-首版为 Python 3.12 的单账号同步客户端。实现依据 [Spec #1](https://github.com/MuZiJin701/seu-lecture-reserve-http/issues/1)，不依赖浏览器。
+首版为 Python 3.12 的单账号同步客户端。实现依据[需求 Q22](requirements.md#q22中期考核讲座目标2026-10-16)及 [Spec #1](https://github.com/MuZiJin701/seu-lecture-reserve-http/issues/1)，不依赖浏览器。
 
 ## 安装与离线检查
 
@@ -8,7 +8,7 @@
 uv sync --locked
 uv run --locked mypy seu_reserve
 uv run --locked pytest
-uv run --locked seu-reserve --help
+uv run --locked main.py --help
 ```
 
 依赖安装到项目隔离环境；OCR 使用 ddddocr，模型随依赖包提供。首次安装包含 ONNX、图像依赖和模型，下载量较大。
@@ -23,7 +23,7 @@ Windows 使用标准库 `msvcrt` 文件锁，Linux 使用 `fcntl`；二者都阻
 cp -n .env.example .env
 chmod 600 .env
 # 编辑 .env，填写登录信息、筛选及可选的邮件配置
-uv run --locked seu-reserve --status
+uv run --locked main.py --status
 ```
 
 上面的复制和权限命令适用于 Linux。在 Windows PowerShell 中用 `if (-not (Test-Path .env)) { Copy-Item .env.example .env }` 保留已有配置或复制样例；`.env` 和状态目录的访问权限由 Windows ACL 控制，请放在仅自己可访问的目录中。
@@ -36,7 +36,7 @@ uv run --locked seu-reserve --status
 | --- | --- |
 | `SEU_CARD_NUMBER` / `SEU_PASSWORD` | 一卡通号 / 密码，与旧项目命名一致 |
 | `SEU_PREFERRED_LECTURES` | 完整标题列表，`'[]'` 表示不限标题 |
-| `SEU_REQUIRED_CATEGORIES` | 类别 JSON 数组，省略时使用已确认的五类及顺序，不能是空数组 |
+| `SEU_REQUIRED_CATEGORIES` | 类别 JSON 数组，省略时使用心理、法律、艺术、其他四类及顺序；不预约沙龙，不能是空数组 |
 | `SEU_PREFERRED_CAMPUS` | 允许的线下校区 JSON 数组，`'[]'` 表示不约线下 |
 | `SEU_ENABLE_ONLINE` / `SEU_ENABLE_OFFLINE` | 是否允许线上 / 线下，值为 `true` 或 `false` |
 | `SEU_STATE_DIR` | 任务状态和日志目录，默认 `state` |
@@ -65,7 +65,7 @@ Gmail 只需填写 `SMTP_USERNAME`（完整的 `@gmail.com` 邮箱地址）和 `
 
 首版使用 SMTP 隐式 TLS，不提供明文连接或 STARTTLS 模式。邮件只包含固定事件、时间和处理提示，不包含学校账号、标题、验证码或个人活动记录。
 
-邮件启用后用于提醒预约成功、需要人工认证、持续异常及预约结果待确认，不读取收件箱，也不代替手机短信验证。收到认证提醒后，仍需回到 SSH 终端处理。正常等待不发送邮件；只填收件邮箱不能完成发信配置。
+邮件启用后用于提醒预约成功、选听目标完成、需要人工认证、持续异常及预约结果待确认，不读取收件箱，也不代替手机短信验证。收到认证提醒后，仍需回到 SSH 终端处理。正常等待不发送邮件；只填收件邮箱不能完成发信配置。
 
 所有邮件字段缺省或为空时关闭邮件；单独保留旧样例中的 `SMTP_PORT=465` 也视为未启用。要关闭已有邮件通知，清空 `SMTP_USERNAME`、`SMTP_PASSWORD`、`SMTP_HOST`、`MAIL_FROM` 和 `MAIL_TO`，并将 `SMTP_PORT` 留空、删除或保留为 `465`；进程环境中的同名配置也需清除。
 
@@ -90,7 +90,7 @@ SMTP_PASSWORD='your-app-password'
 ## 先做只读检查
 
 ```bash
-uv run --locked seu-reserve --check
+uv run --locked main.py --check
 ```
 
 该命令认证后查询列表、我的活动并获取校验验证码图片，不提交或取消预约，不创建预约任务，也不发送邮件。
@@ -108,7 +108,7 @@ uv run --locked seu-reserve --check
 
 TLS 失败会额外显示 `host`（通过白名单校验的学校域名）、`tls_reason` 和可确定时的 `proxy_used=true/false`（Requests 是否选择了代理，不输出代理地址或凭据）。`tls_reason` 只输出预设类别，无法识别时为 `unknown`：`certificate_verify_failed` 表示证书校验失败，`unexpected_eof_while_reading` 表示 TLS 连接意外中断，`unsafe_legacy_renegotiation_disabled` 表示旧式 TLS 重协商不兼容；其他握手类别按原错误码的小写形式输出。不要把所有 `tls_failure` 都归因于代理。
 
-此检查验证接口读取及图片解码，不代表活动字段映射、冲突数据完整性、OCR 准确率或真实预约已验收。
+此检查验证接口读取、已有记录的选听统计字段及图片解码，不创建或迁移任务，也不提交预约；不能证明所有学期记录完整、候选活动字段、OCR 准确率或真实预约已经验收。
 
 ### 仅在项目内绕过网关 DNS 故障
 
@@ -122,30 +122,35 @@ SEU_VPN_IP=121.249.14.2
 
 程序只替换本次会话对 `vpn.seu.edu.cn:443` 的连接地址；请求 URL、HTTP Host、TLS SNI、证书域名校验和 Cookie 仍使用原域名。其他学校域名、系统 DNS、代理及 TUN 设置不变。IP 必须是有效的 IPv4 或 IPv6 字面地址，不接受域名、URL 或端口；进程环境变量优先于 `.env`。
 
-重新运行 `uv run --locked seu-reserve --check`。此配置不自动查询公共 DNS，也不在失败后重放请求。网关 IP 可能变化，示例地址不是永久保证；失效时重新向可信公共 DNS 核对该域名的 A/AAAA 记录后更新。删除该配置或设为空值可恢复原有 DNS，云服务器等正常网络无需填写。不建议将该覆盖扩展到其他学校域名，它们可能需要校内 DNS。
+重新运行 `uv run --locked main.py --check`。此配置不自动查询公共 DNS，也不在失败后重放请求。网关 IP 可能变化，示例地址不是永久保证；失效时重新向可信公共 DNS 核对该域名的 A/AAAA 记录后更新。删除该配置或设为空值可恢复原有 DNS，云服务器等正常网络无需填写。不建议将该覆盖扩展到其他学校域名，它们可能需要校内 DNS。
 
 ## 运行和恢复
 
 ```bash
-uv run --locked seu-reserve
+uv run main.py
 ```
 
+推荐入口为项目根目录的 `main.py`，复用 `seu_reserve.cli.main`，参数和退出码一致。`uv run --locked main.py` 额外要求锁文件与依赖声明一致，否则报错，不会自动更新锁文件；原 `uv run --locked seu-reserve` 仍兼容。
+
 此命令会对符合条件的候选提交真实预约。默认每 10 秒查询，异常时退避（20、40、80 秒，最多 300 秒），学校明确的 Retry-After 优先。
-类别配置顺序优先，其次线上优先、开场较早优先。冲突检查包含首尾相接；已有预约状态或时间不完整时停止本轮提交。
+先补齐法律、艺术、心理健康中缺少的类别，再按配置类别顺序、线上优先、开场较早选择。预留缺少类别的名额，不用其他类别填满 8 场后再超量补课。用户已有记录使总数必须超过 8 才能满足类别时，仅补必要类别。冲突检查包含首尾相接；已有预约状态或时间不完整时停止本轮提交。
+
+按活动 ID 去重，统计学校“我的活动”中未取消、未违约且 `SFDK='1'` 的四类系列讲座。`JZXL_DISPLAY` 是真实历史类别字段，兼容构造响应的 `HDLX_DISPLAY`；沙龙不计入，即使旧 `.env` 的类别列表保留沙龙也不会预约它。已打卡次数至少 8 且法律、艺术、心理各至少 1 才结束；当前样本的默认列表与学校“已打卡”筛选核对一致，但未证明所有学期和其他渠道记录均完整，见[接口调查](completion-records.md)。
+
+成功预约一场后通知并继续，不再直接结束。已打卡加尚未结束的有效预约覆盖目标时，每 10 秒核对“我的活动”，暂停新预约。取消或学校标记违约后重新计算缺口。已结束但既未打卡也未标记违约的记录先等待学校更新，不能自行断定缺席。未知字段、矛盾重复记录阻止新增；不猜测类别，不自动取消、签到或评价。
 
 每次提交前先原子保存待确认活动 ID。超时或响应无法解释时先查询原提交，期间不提交第二场；持续不明确时通知并等待人工处理。
 异常等待截止时间会一并持久化，重启后先等完剩余时间，避免绕过学校限流。过期冷却记录会清理。
 等待时按回车只会重新查询，不会把用户按键当作“预约失败”的证据。不要手工删除待确认任务来绕过保护。
 明确验证码错误时最多重新取图识别三次；仍失败冷却该场五分钟，再尝试其他候选。
 
-同一状态目录加进程锁，只允许一个实例运行。重启恢复原任务；成功任务再次启动立即结束。
-需要再预约另一场时，显式启动新任务：
+同一状态目录加进程锁，只允许一个实例运行。重启恢复原目标任务。状态版本 2 的 `done` 表示整个选听目标完成，重复启动直接结束。需重新核对学校最新记录时使用：
 
 ```bash
-uv run --locked seu-reserve --new-task
+uv run --locked main.py --new-task
 ```
 
-仅允许替换已完成任务；待确认或仍在扫描的任务不能用此参数重置。状态损坏或账号不匹配时停止，避免覆盖旧任务。
+此参数仅允许重新核对已完成目标；待确认或仍在扫描的任务不能重置。若学校记录仍达标则直接结束，不会额外预约。旧状态版本 1 的单场成功 `done` 首次启动自动转回扫描；待确认活动 ID、冷却和退避时间保持。迁移需要账号，旧客户端不能读取版本 2，不要混用版本或删除状态。状态损坏或账号不匹配时停止，避免覆盖旧任务。
 程序使用私有权限的任务文件、原子替换及持久化写入；任务只保存恢复必需的数据，不保存账号密码或完整业务记录。
 状态目录内的 `events.log` 保存脱敏事件；邮件失败也会记录，不会改变已确认成功的任务。
 
@@ -158,23 +163,45 @@ uv run --locked seu-reserve --new-task
 | 正常等待 | 没有合适候选，继续查询，不发送邮件 |
 | `event=invalid_activity_data` | 无法确认已有活动的状态、ID 或时间，暂停本轮提交并退避；不是“没抢到讲座” |
 | `event=activity_schema_unknown` | 候选关键字段无法识别，暂停本轮提交并退避 |
+| `event=attendance_result_pending` | 已结束但学校未确认打卡或违约，等待学校更新，暂停新增 |
+| `event=attendance_category_unknown` / `event=attendance_status_unknown` | 无法确认历史类别或打卡/违约状态，暂停新增 |
+| `event=attendance_record_conflict` | 同活动 ID 的记录矛盾，暂停新增，核对学校记录 |
 | `event=query_failure` | 连续三轮查询或处理出错；启用邮件时尝试发送一次提醒，正常空列表不会触发 |
 | `event=mail_configuration_invalid` | 已尝试配置邮件但内容不完整或无效，启动停止；完全不配置邮件允许运行 |
 | `event=reservation_unconfirmed` | 已尝试提交但结果不明，核对原活动并等待人工处理，不继续提交其他场次 |
-| `event=reservation_succeeded` | 已按活动 ID 查询确认预约成功，本任务结束 |
+| `event=reservation_succeeded` | 已按活动 ID 查询确认一场预约成功，继续核对目标 |
+| `event=goal_completed` | 已打卡至少 8 次且必需三类各至少 1 次，目标完成并结束 |
 
 异常重试一般等待 20、40、80 秒，最多 300 秒；学校要求的更长等待优先。等待截止时间保存在本地，重启后会继续等待剩余时间，期间也可能没有输出。正常查询后才会恢复普通等待节奏，不要通过删除状态文件强行跳过等待。
 
 在另一个 SSH 终端进入项目目录，可以读取状态和最近事件，不启动第二个预约进程：
 
 ```bash
-uv run --locked seu-reserve --status
+uv run --locked main.py --status
 tail -n 20 state/events.log
 ```
 
 日志路径示例使用默认 `state` 目录；修改过 `SEU_STATE_DIR` 时使用对应路径。任务尚无事件时，日志文件可能不存在。日志每行开头是 Unix 时间戳；旧错误会保留，需结合时间判断是否为新错误。
 
-`--status` 只读取本地任务记录：`not_started` 为尚无任务，`scanning` 为扫描任务，`pending` 为提交结果待确认，`done` 为已确认成功。它不检查进程是否存活、当前退避剩余时间或最近一次查询是否成功；只看到 `scanning` 不能证明进程健康。进程检查时，`uv` 启动器及其 Python 子进程属于同一个运行实例，不能据此认定重复启动。
+`--status` 只读取本地任务记录：`not_started` 为尚无任务，`scanning` 为扫描任务，`pending` 为提交结果待确认，`done` 为已打卡目标完成；`legacy_completed` 为旧版单场成功、需要启动新版重新核对。它不检查进程是否存活、当前退避剩余时间或最近一次查询是否成功；只看到 `scanning` 不能证明进程健康。进程检查时，`uv` 启动器及其 Python 子进程属于同一个运行实例，不能据此认定重复启动。
+
+## 服务器后台运行
+
+本机其他项目中，个人网站使用 `nohup`、日志重定向及 PID 文件；`wx-video-account-notes` 是脱离终端的后台进程；`we-mp-rss` 使用 Docker，但当前重启策略为 `no`。截至 2026-10-16，本机没有承载这些项目的 systemd 服务或 tmux 会话，也未发现本项目的预约常驻进程。它们的日志及 PID 管理方式可复用，不能由后台进程存在推断已具备自动恢复能力。
+
+使用已有依赖及配置，在项目根目录执行以下命令可在 SSH 断开后继续运行；这些是手动部署示例，本次未替用户启动真实预约。示例使用默认 `state` 目录，修改过路径时调整相应命令。先检查现有进程，避免重复启动；同一状态目录的锁仍会阻止第二个实例。
+
+```bash
+mkdir -p -m 700 state
+nohup uv run main.py >> state/runner.log 2>&1 < /dev/null &
+echo $! > state/runner.pid
+ps -p "$(cat state/runner.pid)" -o pid,comm
+tail -n 20 state/runner.log
+```
+
+PID 文件记录的是 `uv` 启动器，需结合其 Python 子进程及工作目录核实当前实例，不能仅凭旧 PID 文件判断进程存活。正常完成、人工停止或需交互退出后不会自动重新启动，服务器重启后也不会自启。需要正常预约时保留 `.env` 的私有权限；日志仅保存脱敏事件。
+
+后台没有交互终端，遇短信、未知认证挑战或预约结果待确认时，当前程序记录事件、按配置通知并退出，保留任务。确认后台已退出后，通过 SSH 在前台执行 `uv run main.py`，按提示处理；再次停止和后台启动会接着原任务。不能后台自动签到或绕过认证。本次未增加 systemd、容器或新的验证码通道。
 
 ## 人工认证
 
@@ -211,6 +238,7 @@ Ctrl+C 退出码为 130，不会自动取消已有预约。
 
 ## 验收记录
 
+- 2026-10-16：按用户确认的学校已打卡口径实现 8 场及三类目标、计划覆盖后等待、取消/违约补足、旧单场状态迁移及 `main.py` 入口；127 项离线测试及类型检查通过。真实新版只读检查显示 `event=read_only_complete`，覆盖现有记录的统计字段和验证码获取，没有提交预约、修改真实任务或发信；调查证据见[完成记录接口调查](completion-records.md)。
 - 已完成：离线入口场景、类型检查、命令行检查；OCR 模型可加载并处理本地合成图片。
 - 2026-10-15：邮件改为可选，Gmail 支持邮箱地址和应用专用密码两项配置；已通过空配置、配置错误、Gmail 自动补全、旧配置及发信失败不重复预约的离线检查，未发送真实邮件。
 - 2026-10-15：修复 CAS 对默认请求头返回 HTTP 403 的问题后，真实 `uv run --locked seu-reserve --check` 通过，显示 `event=read_only_complete`。

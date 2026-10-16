@@ -13,7 +13,7 @@ PSYCHOLOGY, LAW, ART, OTHER = SERIES_CATEGORIES
 def attended(count=8):
     return [lecture(f'history-{i}', YYZT='已预约', SFDK='1',
                     HDLX_DISPLAY=SERIES_CATEGORIES[i % 4],
-                    KSSJ='2020-01-01 10:00:00', JSSJ='2020-01-01 11:00:00')
+                    KSSJ=f'2020-01-{i + 1:02} 10:00:00', JSSJ=f'2020-01-{i + 1:02} 11:00:00')
             for i in range(count)]
 
 
@@ -110,7 +110,7 @@ def test_coffee_is_excluded_even_with_legacy_explicit_configuration(tmp_path):
 def test_real_school_fields_are_counted_and_duplicates_are_not():
     rows = [{'WID': f'booking-{i}', 'HD_WID': f'activity-{i}', 'FBZT': '1',
              'SFDK': '1', 'SFWY': '0', 'JZXL_DISPLAY': SERIES_CATEGORIES[i % 4],
-             'JZSJ': '2020-01-01 10:00:00', 'HDJSSJ': '2020-01-01 11:00:00'} for i in range(8)]
+             'JZSJ': f'2020-01-{i + 1:02} 10:00:00', 'HDJSSJ': f'2020-01-{i + 1:02} 11:00:00'} for i in range(8)]
     assert progress(rows + [dict(rows[0])], 0).done
     rows[-1]['SFWY'] = '1'
     assert not progress(rows, 0).done
@@ -135,6 +135,105 @@ def test_conflicting_duplicate_activity_is_rejected():
     row = attended(1)[0]
     with pytest.raises(ValueError, match='attendance_record_conflict'):
         progress([row, {**row, 'SFDK': '0'}], 0)
+
+
+@pytest.mark.parametrize('checked', ['0', '1'])
+def test_chained_overlaps_keep_nonconflicting_lectures_in_either_input_order(checked):
+    rows = [lecture('a', SFDK=checked, KSSJ='2030-01-01 10:00:00', JSSJ='2030-01-01 11:00:00'),
+            lecture('b', SFDK=checked, KSSJ='2030-01-01 10:30:00', JSSJ='2030-01-01 11:30:00'),
+            lecture('c', SFDK=checked, KSSJ='2030-01-01 11:10:00', JSSJ='2030-01-01 12:00:00')]
+    for row in rows:
+        row['YYZT'] = '已预约'
+    original = [dict(row) for row in rows]
+    for ordered in (rows, list(reversed(rows))):
+        current = progress(ordered, 0)
+        assert current.completed == ({PSYCHOLOGY: 2} if checked == '1' else {})
+        assert current.planned == ({PSYCHOLOGY: 2} if checked == '0' else {})
+    assert rows == original
+
+
+def test_completed_overlap_precedes_unattended_required_category():
+    rows = [lecture('planned-law', YYZT='已预约', HDLX_DISPLAY=LAW),
+            lecture('attended-other', YYZT='已预约', SFDK='1', HDLX_DISPLAY=OTHER,
+                    JSSJ='2030-01-01 12:00:00')]
+    current = progress(rows, 0)
+    assert current.completed == {OTHER: 1}
+    assert not current.planned
+
+
+def test_overlapping_choice_fills_missing_category_before_earlier_finish():
+    rows = attended(2) + [
+        lecture('psychology', YYZT='已预约', SFDK='1'),
+        lecture('art', YYZT='已预约', SFDK='1', HDLX_DISPLAY=ART, JSSJ='2030-01-01 12:00:00')]
+    assert progress(rows, 0).completed == {PSYCHOLOGY: 1, LAW: 1, ART: 1}
+
+
+def test_missing_categories_are_updated_after_each_choice():
+    rows = [lecture('first-psychology', YYZT='已预约'),
+            lecture('repeat-psychology', YYZT='已预约',
+                    KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00'),
+            lecture('law', YYZT='已预约', HDLX_DISPLAY=LAW,
+                    KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 12:00:00')]
+    assert progress(rows, 0).planned == {PSYCHOLOGY: 1, LAW: 1}
+
+
+@pytest.mark.parametrize('psychology_end', ['2030-01-01 12:00:00', '2030-01-01 11:00:00'])
+def test_overlap_ties_use_finish_then_activity_id_independent_of_input_order(psychology_end):
+    rows = [lecture('z', YYZT='已预约', JSSJ=psychology_end),
+            lecture('a', YYZT='已预约', HDLX_DISPLAY=LAW)]
+    for ordered in (rows, list(reversed(rows))):
+        assert progress(ordered, 0).planned == {LAW: 1}
+
+
+def test_touching_endpoints_count_only_one_lecture():
+    rows = [lecture('first', YYZT='已预约'),
+            lecture('touching', YYZT='已预约',
+                    KSSJ='2030-01-01 11:00:00', JSSJ='2030-01-01 12:00:00')]
+    assert progress(rows, 0).planned == {PSYCHOLOGY: 1}
+
+
+def test_unselected_ended_overlap_does_not_pause_confirmed_attendance():
+    rows = [lecture('pending', YYZT='已预约'), lecture('checked', YYZT='已预约', SFDK='1')]
+    current = progress(rows, float('inf'))
+    assert current.completed == {PSYCHOLOGY: 1}
+    assert not current.planned
+
+
+@pytest.mark.parametrize('changes', [{'SFDK': None}, {'HDLX_DISPLAY': '未知'}, {'KSSJ': 'invalid'}])
+def test_unknown_overlapping_record_still_requires_validation(changes):
+    rows = [lecture('checked', YYZT='已预约', SFDK='1'),
+            lecture('unknown', YYZT='已预约', **changes)]
+    with pytest.raises(ValueError):
+        progress(rows, 0)
+
+
+def test_unselected_reservation_still_blocks_new_conflicting_booking(tmp_path):
+    school = School()
+    school.mine = [lecture('selected', YYZT='已预约'),
+                   lecture('unselected', YYZT='已预约',
+                           KSSJ='2030-01-01 10:30:00', JSSJ='2030-01-01 11:30:00')]
+    original = [dict(row) for row in school.mine]
+    school.activities = [lecture('blocked', HDLX_DISPLAY=LAW,
+                                 KSSJ='2030-01-01 11:10:00', JSSJ='2030-01-01 12:00:00'),
+                         lecture('safe', HDLX_DISPLAY=ART,
+                                 KSSJ='2030-01-01 12:10:00', JSSJ='2030-01-01 13:00:00')]
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == ['safe']
+    assert school.mine[:2] == original
+    assert not any('cancel' in url.lower() for _, url, _ in school.requests)
+
+
+def test_recheck_completed_task_does_not_count_eight_overlapping_attendances(tmp_path):
+    school = School()
+    school.mine = attended()
+    assert execute(school, tmp_path) == 0
+    for row in school.mine:
+        row.update(KSSJ='2020-01-01 10:00:00', JSSJ='2020-01-01 11:00:00')
+    events = []
+    assert execute(school, tmp_path, new_task=True, notify=events.append) == 130
+    assert not events
+    assert not school.submitted
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
 
 
 def test_read_only_check_validates_attendance_schema_without_creating_state(tmp_path):

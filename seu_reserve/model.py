@@ -35,6 +35,7 @@ class Progress:
 def progress(rows: list[dict[str, Any]], now: float) -> Progress:
     completed: Counter[str] = Counter()
     planned: Counter[str] = Counter()
+    records: list[tuple[str, str, datetime, datetime, str]] = []
     seen: dict[str, dict[str, Any]] = {}
     for row in rows:
         wid = activity_id(row)
@@ -57,16 +58,24 @@ def progress(rows: list[dict[str, Any]], now: float) -> Progress:
         checked, breached = row.get('SFDK'), row.get('SFWY')
         if checked not in ('0', '1') or breached not in ('0', '1'):
             raise ValueError('attendance_status_unknown')
-        end = interval(row)[1].timestamp()
+        start, end = interval(row)
         if breached == '1':
             continue
+        records.append((checked, category, start, end, wid))
+    result = Progress(completed, planned)
+    # shortcut: greedy priorities do not maximize all schedule combinations; revisit if optimal planning is needed.
+    while records:
+        missing = result.missing
+        checked, category, start, end, _ = min(records, key=lambda record: (
+            record[0] != '1', record[1] not in missing, record[3], record[4]))
         if checked == '1':
             completed[category] += 1
-        elif end > now:
+        elif end.timestamp() > now:
             planned[category] += 1
         else:
             raise ValueError('attendance_result_pending')
-    return Progress(completed, planned)
+        records = [record for record in records if record[2] > end or record[3] < start]
+    return result
 
 
 def activity_id(row: dict[str, Any]) -> str:

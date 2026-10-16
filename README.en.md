@@ -6,6 +6,8 @@ A lecture reservation tool for Linux servers, with Windows compatibility. No bro
 
 The default goal is 8 school-recorded attendances, including at least one each in law, art and mental health. Booking one lecture does not stop the client. It pauses new bookings when existing reservations cover the remaining goal, and finishes when recorded attendance meets it. Salons are neither booked nor counted.
 
+When existing records overlap, the client automatically selects mutually nonconflicting lectures for local counts. It does not cancel school reservations; the university determines which attendances are valid. See the [selection rules](docs/usage.md#运行和恢复) (Chinese).
+
 ## Quick start
 
 Prepare Python 3.12 and [uv](https://docs.astral.sh/uv/getting-started/installation/).
@@ -72,7 +74,7 @@ Read the local task status:
 uv run main.py --status
 ```
 
-`scanning`, `pending` and `done` mean scanning, an unconfirmed reservation result, and a completed attendance goal. This does not check whether the process is alive. Do not delete state files to force retries. Use `uv run main.py --new-task` to recheck a completed goal.
+`scanning`, `pending` and `done` mean scanning, an unconfirmed reservation result, and a completed attendance goal. This does not check whether the process is alive. Do not delete state files to force retries. Use `uv run main.py --new-task` to recheck a completed goal, including tasks completed before this update that need the new overlap-counting rules.
 
 ## Common settings
 

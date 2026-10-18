@@ -1,10 +1,12 @@
 # 联合宣传海报
 
+本文及生成脚本用于复现 2026-10-16 的历史宣传素材；截图和海报中的旧版行为不代表当前实现。当前 HTTPS 功能、通知和验收边界见[README](../../README.md)与[使用指南](../usage.md)，浏览器版以其仓库最新说明为准。本轮逻辑修复不重新生成图片或修改原始截图。
+
 [查看高清 PNG](seu-lecture-poster.png) · [生成脚本](render_poster.py)
 
 海报标题为“东南大学素养讲座预约脚本”，采用 1800 × 3200 像素竖版，适合手机传播。使用橙黑底色、奶油色标题、技术标签和卡片布局，参考用户提供的 Cyber Ronin 模板风格；不使用模板的远程图片、字体或网页交互。两枚项目二维码下方分别印有对应仓库的完整 HTTPS 链接，与二维码复用相同的 URL。
 
-两个项目按各自文档定位展示：
+海报生成时的项目定位如下：
 
 - Windows 浏览器版：[SEU_Lecture_Reserve](https://github.com/MuZiJin701/SEU_Lecture_Reserve)，使用 Chrome，持续扫描，确认一场预约后退出。
 - Linux 服务器版：[seu-lecture-reserve-http](https://github.com/MuZiJin701/seu-lecture-reserve-http)，无需浏览器，按选听目标持续查找，支持后台运行和可选邮件通知，也兼容 Windows。

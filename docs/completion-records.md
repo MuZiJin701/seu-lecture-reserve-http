@@ -18,7 +18,7 @@
 
 ### 我的活动与状态字段
 
-来源为学校当前的[活动预约前端 hdyy.js](https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/modules/hdyy/hdyy.js)。该静态文件在已认证的只读会话中取得；匿名请求可能被网关拦截。下表行号对应本次读取的源码。
+来源为调查时读取的[活动预约前端 hdyy.js](https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/modules/hdyy/hdyy.js)。该静态文件在已认证的只读会话中取得；匿名请求可能被网关拦截。下表行号对应本次读取的源码。
 
 | 字段或行为 | 前端证据 | 能证明的含义 |
 | --- | --- | --- |
@@ -35,7 +35,7 @@
 
 另核对了[页面模板 hdyyIndexPage.html](https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/modules/hdyy/hdyyIndexPage.html)：`count` 位于“通知公告”的消息徽标；活动和我的活动均交由 `common-activity` 组件呈现。[hdyyBS.js](https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/modules/hdyy/hdyyBS.js)仅声明 `/modules/hdyy.do` 模型地址，没有新增完成记录接口。此次调查没有证明整个学校系统是否存在独立的考核认可接口；用户已接受已打卡口径，本次不再追查其他路由。
 
-2026-10-16，一次真实只读认证与 `Client.mine()` 查询成功。验证输出仅包含字段名及布尔检查结果，没有保存个人行数据、身份、票据或 Cookie。当前记录包含 `JZXL`、`JZXL_DISPLAY`、`JZMC`、`JZSJ`、`HDJSSJ`、`SFDK`、`SFWY`、`DKSJ`、`SFPJ` 等字段；未出现当前候选解析所使用的 `HDLX_DISPLAY`。字段存在不等于其全部取值和业务语义均已验证。
+2026-10-16，一次真实只读认证与 `Client.mine()` 查询成功。验证输出仅包含字段名及布尔检查结果，没有保存个人行数据、身份、票据或 Cookie。当前记录包含 `JZXL`、`JZXL_DISPLAY`、`JZMC`、`JZSJ`、`HDJSSJ`、`SFDK`、`SFWY`、`DKSJ`、`SFPJ` 等字段；未出现当时候选解析器仍依赖的 `HDLX_DISPLAY`；该不匹配已在 2026-10-18 修复。字段存在不等于其全部取值和业务语义均已验证。
 
 同日针对当前账号样本，得到以下脱敏验证结果；不记录活动标题、ID、次数或个人字段值：
 
@@ -57,6 +57,8 @@
 - `SFDK`、`SFWY` 必须为已知值；违约或取消不计入完成和计划。未打卡且尚未结束的有效预约占用计划缺口；已经结束、既未打卡也未标记违约的记录暂无法区分登记延迟与缺席，因此暂停新增并继续核对，不立即补约。
 - 完成总量达到 8 且法律、艺术、心理健康各至少 1 才结束；已选听与待参加预约覆盖目标仅暂停新增。旧单场任务的 `done` 不代表新目标完成，旧任务迁移后重新查询学校记录。
 - [`Lecture.read`](../seu_reserve/model.py)处理候选，完成统计单独处理我的活动记录；两类响应不能直接套用同一解析器。2026-10-18 已核对非空真实列表的 `JZMC`、`JZXL_DISPLAY`、预约时间窗及明确的线上线下标题标记，修正原构造字段不匹配造成的静默跳过；具体规则及验证边界见[数据契约](usage.md#当前业务数据契约与限制)。真实开放场景及完整预约流程仍待验收。
+
+当前程序每次正常启动都会重新认证并读取学校进度，即使本地曾标记目标完成；规则见[需求 Q32](requirements.md)。任务检查点仅辅助本机恢复，损坏时保留原文件并停止，不能替代学校记录或证明预约成功。必要的当前列表筛选快照见[运行诊断](usage.md#运行诊断)，不保存完整个人历史。
 
 ## 限制与验证范围
 

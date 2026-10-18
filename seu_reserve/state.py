@@ -3,13 +3,14 @@
 import hashlib
 import errno
 import json
-import math
 import os
 import stat
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+from .mail import mail_history
 
 
 def lock_file(fd: int) -> None:
@@ -81,22 +82,23 @@ class Task:
                         or (data['status'] == 'pending' and not data['activity'])
                         or (data['version'] == 1 and data['status'] == 'done' and not data['activity'])
                         or type(data.get('retry_at', 0)) not in (int, float)
-                        or not math.isfinite(data.get('retry_at', 0))
-                        or any(not isinstance(k, str) or type(v) not in (int, float) or not math.isfinite(v)
-                               for k, v in data['cooldowns'].items())):
+                        or not 0 <= data.get('retry_at', 0) <= 253402214400
+                        or any(not isinstance(k, str) or type(v) not in (int, float)
+                               or not 0 <= v <= 253402214400 for k, v in data['cooldowns'].items())):
                     raise ValueError('state_invalid')
                 alerts = data.get('alerts', {})
                 if (not isinstance(alerts, dict)
                         or any(key not in ('query_failure', 'authentication_required', 'reservation_unconfirmed')
                                for key in alerts)
-                        or any(type(value) not in (int, float) or not math.isfinite(value)
-                               or not 0 <= value <= 253402214400 for value in (
+                        or any(type(value) not in (int, float) or not 0 <= value <= 253402214400 for value in (
                                    data.get('last_report_at', 0), data.get('last_query_alert_at', 0), *alerts.values()))):
                     raise ValueError('state_invalid')
                 if username and account != data['account']:
                     raise ValueError('state_account_mismatch')
                 if not username and (data['status'] != 'done' or data['version'] == 1):
                     raise ValueError('credentials_missing')
+                if isinstance(data.get('health'), dict):
+                    mail_history(data['health'])
                 self.data = data
                 if data['version'] == 1:
                     data['version'] = 2

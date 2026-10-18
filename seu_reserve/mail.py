@@ -1,5 +1,6 @@
 """Optional SMTP notifications and aggregate progress, without credentials or lecture details."""
 
+import math
 import re
 import smtplib
 import socket
@@ -7,6 +8,7 @@ import ssl
 from collections.abc import Mapping
 from datetime import datetime
 from email.message import EmailMessage
+from typing import Any
 
 from .model import SHANGHAI
 
@@ -42,6 +44,25 @@ MAIL_FAILURES = {
     OSError: 'network_failed',
 }
 MAIL_ERROR_REASONS = {'none', 'unknown', *MAIL_FAILURES.values()}
+
+
+def mail_history(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    timestamp = snapshot.get('last_mail_at', 0)
+    status = snapshot.get('last_mail_status', snapshot.get('mail_status', 'never'))
+    if 'last_mail_status' not in snapshot and status in ('disabled', 'ready'):
+        status = 'never'
+    error = snapshot.get('last_mail_error', 'unknown' if status == 'failed' else 'none')
+    event = snapshot.get('last_mail_event', 'unknown' if timestamp else 'none')
+    duration = snapshot.get('last_mail_duration_seconds')
+    if (type(timestamp) not in (int, float) or not 0 <= timestamp <= 253402214400
+            or status not in ('never', 'sending', 'accepted', 'failed')
+            or not isinstance(error, str) or error not in MAIL_ERROR_REASONS
+            or not isinstance(event, str) or event not in (*MESSAGES, 'none', 'unknown')
+            or duration is not None and (type(duration) not in (int, float)
+                or duration < 0 or type(duration) is float and not math.isfinite(duration))):
+        raise ValueError('invalid_mail_history')
+    return dict(last_mail_at=timestamp, last_mail_status=status, last_mail_error=error,
+                last_mail_event=event, last_mail_duration_seconds=duration)
 
 
 def mail_failure_reason(exc: Exception) -> str:

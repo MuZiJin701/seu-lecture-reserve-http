@@ -16,7 +16,7 @@ Background startup and local task status on a Linux server:
 
 `status=scanning` is a local task state; it does not confirm process health or a successful reservation. See the [usage guide](docs/usage.md#服务器后台运行) (Chinese) for process and log checks. Actual reservations and long-running operation still need acceptance testing.
 
-Joint project poster: [high-resolution PNG](docs/promo/seu-lecture-poster.png) · [Python generation guide](docs/promo/usage.md) (Chinese), featuring the Windows browser edition and Linux HTTPS edition.
+Historical joint poster (2026-10-16; use current docs for behavior): [high-resolution PNG](docs/promo/seu-lecture-poster.png) · [Python generation guide](docs/promo/usage.md) (Chinese), featuring the Windows browser edition and Linux HTTPS edition.
 
 ## Quick start
 
@@ -193,6 +193,8 @@ Stopping does not cancel school reservations. Keep the `state` directory, then r
 
 ## Before relying on it
 
+- A submission reply with a missing, string or boolean result code remains pending until the original activity is checked. Error wording alone never triggers another submission.
+- Corrupt mail history or recovery deadlines stop startup and preserve the original state file, including before legacy migration. `--status` shows unknown for invalid snapshots. Do not delete tasks to bypass pending-result protection.
 - A nonempty live lecture list has been checked. Selection uses the reservation window and publication status; online/offline classification accepts only an explicit leading `【线上】` / `【线下】` title marker. Unknown schemas raise errors. University preflight checks remain authoritative for capacity and eligibility; keep the server clock accurate. See [API boundaries](docs/usage.md#当前业务数据契约与限制) (Chinese).
 - Earlier versions have live login, read-only query and test-mail delivery records. This update uses offline regression checks; actual reservations, SMS recovery and long-running operation after the update still need acceptance testing. Confirm bookings and attendance in the [SEU portal](https://ehall.seu.edu.cn/); these counts do not replace final departmental assessment.
 - `.env` contains credentials; do not upload it. When a submission result is unclear, the client checks that activity before proceeding instead of blindly resubmitting.

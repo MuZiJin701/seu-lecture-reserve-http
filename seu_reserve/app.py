@@ -1,7 +1,6 @@
 """Application entry point: one task, with replaceable external dependencies."""
 
 import json
-import math
 import os
 import sys
 import time
@@ -17,7 +16,7 @@ import requests
 from .client import AuthenticationExpired, AuthenticationRejected, Client, RemoteError, has_code
 from .model import (Lecture, Progress, REQUIRED_CATEGORIES, SERIES_CATEGORIES, SHANGHAI,
                     activity_id, interval, moment, progress, reserved)
-from .mail import MAIL_ERROR_REASONS, MESSAGES, Mailer, mail_failure_reason
+from .mail import Mailer, mail_failure_reason, mail_history
 from .state import Task, open_nofollow
 
 DEFAULT_CATEGORIES = SERIES_CATEGORIES
@@ -263,27 +262,9 @@ def run(settings: Settings, *, session: Any = None,
             announced.update(alerts)
         previous = task.data.get('health', {})
         if isinstance(previous, dict):
-            last_mail_at = previous.get('last_mail_at', 0)
-            last_mail_status = previous.get('last_mail_status', previous.get('mail_status', 'never'))
-            if (type(last_mail_at) not in (int, float) or not math.isfinite(last_mail_at)
-                    or not 0 <= last_mail_at <= 253402214400):
-                raise ValueError('invalid_mail_history')
-            snapshot['last_mail_at'] = last_mail_at
-            last_mail_error = previous.get('last_mail_error', 'unknown' if last_mail_status == 'failed' else 'none')
-            if not isinstance(last_mail_error, str) or last_mail_error not in MAIL_ERROR_REASONS:
-                raise ValueError('invalid_mail_history')
-            snapshot['last_mail_error'] = last_mail_error
-            event = previous.get('last_mail_event', 'unknown' if last_mail_at else 'none')
-            duration = previous.get('last_mail_duration_seconds')
-            if (not isinstance(event, str) or event not in (*MESSAGES, 'none', 'unknown')
-                    or duration is not None and (type(duration) not in (int, float)
-                       or not math.isfinite(duration) or duration < 0)):
-                raise ValueError('invalid_mail_history')
-            snapshot.update(last_mail_event=event, last_mail_duration_seconds=duration)
-            if last_mail_status in ('accepted', 'failed', 'sending'):
-                snapshot['last_mail_status'] = last_mail_status
-                if notify:
-                    snapshot['mail_status'] = last_mail_status
+            snapshot.update(mail_history(previous))
+            if notify and snapshot['last_mail_status'] in ('accepted', 'failed', 'sending'):
+                snapshot['mail_status'] = snapshot['last_mail_status']
         health(phase='starting')
         if new_task and task.data['status'] != 'done':
             raise ValueError('active_task_cannot_be_reset')
@@ -392,7 +373,8 @@ def run(settings: Settings, *, session: Any = None,
                         captcha_wrong = (isinstance(message, str) and '验证码' in message
                                          and any(word in message for word in ('错误', '不正确', '失效', '过期')))
                         unavailable = isinstance(message, str) and message in ('已满', '名额已满', '不可预约', '预约已结束', '预约未开始')
-                        if has_code(reply, 0) or not (captcha_wrong or unavailable):
+                        if (has_code(reply, 0) or type(reply.get('code')) is not int
+                                or not (captcha_wrong or unavailable)):
                             break
                         task.data.update(status='scanning', activity='')
                         if captcha_wrong and attempt == 3:
@@ -409,7 +391,6 @@ def run(settings: Settings, *, session: Any = None,
                     pause(10)
                 else:
                     health(phase='confirming', failure_count=0)
-                    query_recovered()
             except AuthenticationRejected:
                 raise
             except AuthenticationExpired:

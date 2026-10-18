@@ -2,6 +2,7 @@
 
 import base64
 import json
+import math
 import re
 import socket
 import ssl
@@ -143,7 +144,9 @@ class Client:
             retry = response.headers.get('Retry-After', '')
             try:
                 seconds = float(retry) if retry.isdigit() else parsedate_to_datetime(retry).timestamp() - time.time()
-            except (ValueError, TypeError, OverflowError):
+            except (ValueError, TypeError, OverflowError, OSError):
+                seconds = 0
+            if not math.isfinite(seconds) or seconds > 253402214400 - time.time():
                 seconds = 0
             raise RemoteError('server_backoff', max(0, seconds), http_status=response.status_code)
         return response

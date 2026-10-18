@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import math
 import os
 import re
 import signal
@@ -20,7 +19,7 @@ from dotenv import dotenv_values
 from dotenv.parser import parse_stream
 
 from .app import SELECTION_REASONS, Settings, run
-from .mail import MAIL_ERROR_REASONS, MESSAGES, Mailer, mail_failure_reason
+from .mail import Mailer, mail_failure_reason, mail_history
 from .model import SHANGHAI
 from .state import read_json, task_running
 
@@ -48,21 +47,17 @@ def show_status(directory: Path) -> None:
     if (not isinstance(snapshot, dict) or not isinstance(snapshot.get('phase'), str)
             or snapshot['phase'] not in phases
             or snapshot.get('mail_status') not in ('disabled', 'ready', 'sending', 'accepted', 'failed')
-            or snapshot.get('last_mail_status', 'never') not in ('never', 'sending', 'accepted', 'failed')
-            or not isinstance(snapshot.get('last_mail_error', 'none'), str)
-            or snapshot.get('last_mail_error', 'none') not in MAIL_ERROR_REASONS
-            or not isinstance(snapshot.get('last_mail_event', 'unknown'), str)
-            or snapshot.get('last_mail_event', 'unknown') not in (*MESSAGES, 'none', 'unknown')
-            or snapshot.get('last_mail_duration_seconds') is not None and (
-                type(snapshot['last_mail_duration_seconds']) not in (int, float)
-                or not math.isfinite(snapshot['last_mail_duration_seconds']) or snapshot['last_mail_duration_seconds'] < 0)
             or not isinstance(snapshot.get('last_error'), str)
             or not re.fullmatch('[a-z_]{1,80}', snapshot['last_error'])
-            or any(type(snapshot.get(key)) not in (int, float) or not math.isfinite(snapshot[key])
-                   or not 0 <= snapshot[key] <= 253402214400 for key in timestamps)
+            or any(type(snapshot.get(key)) not in (int, float) or not 0 <= snapshot[key] <= 253402214400 for key in timestamps)
             or type(snapshot.get('failure_count')) is not int or snapshot['failure_count'] < 0
             or any(snapshot.get(key) is not None and (type(snapshot[key]) is not int or snapshot[key] < 0)
                    for key in ('activity_count', 'candidate_count'))):
+        print('phase=unknown')
+        return
+    try:
+        history = mail_history(snapshot)
+    except ValueError:
         print('phase=unknown')
         return
     print('phase=' + (snapshot['phase'] if running else 'stopped'))
@@ -75,18 +70,13 @@ def show_status(directory: Path) -> None:
         print(label + '=' + (str(max(0, round(time.time() - snapshot[key]))) if snapshot[key] else 'unknown'))
     for key in ('last_error', 'failure_count', 'mail_status', 'activity_count', 'candidate_count'):
         print(key + '=' + (str(snapshot[key]) if snapshot.get(key) is not None else 'unknown'))
-    print('last_mail_status=' + str(snapshot.get('last_mail_status',
-          snapshot['mail_status'] if snapshot['mail_status'] in ('sending', 'accepted', 'failed') else 'never')))
-    print('last_mail_error=' + snapshot.get('last_mail_error',
-          'unknown' if snapshot.get('last_mail_status', snapshot['mail_status']) == 'failed' else 'none'))
-    print('last_mail_event=' + snapshot.get('last_mail_event', 'unknown' if snapshot['last_mail_at'] else 'none'))
-    print('last_mail_duration_seconds=' + (str(snapshot['last_mail_duration_seconds'])
-          if snapshot.get('last_mail_duration_seconds') is not None else 'unknown'))
+    for key in ('last_mail_status', 'last_mail_error', 'last_mail_event', 'last_mail_duration_seconds'):
+        print(key + '=' + (str(history[key]) if history[key] is not None else 'unknown'))
     selection = saved.get('selection')
     if selection is None:
         return
     if (not isinstance(selection, dict) or type(selection.get('updated_at')) not in (int, float)
-            or not math.isfinite(selection['updated_at']) or not 0 <= selection['updated_at'] <= 253402214400
+            or not 0 <= selection['updated_at'] <= 253402214400
             or not isinstance(selection.get('activities'), list)
             or any(not isinstance(item, dict) or not isinstance(item.get('title'), str)
                    or not isinstance(item.get('reason'), str) or item['reason'] not in SELECTION_REASONS

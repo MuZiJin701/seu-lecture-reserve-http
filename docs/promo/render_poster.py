@@ -1,4 +1,4 @@
-"""Render the agreed 1800 × 3200 poster, using only local screenshot assets."""
+"""Reproduce the historical 2026-10-16 poster, using only local screenshot assets."""
 
 from functools import lru_cache
 from pathlib import Path

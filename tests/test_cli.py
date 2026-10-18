@@ -50,12 +50,14 @@ def test_invalid_configuration_is_rejected_without_echoing_its_value(tmp_path):
     assert 'SECRET' not in result.stdout + result.stderr
 
 
-def test_completed_task_restart_does_not_prompt_for_credentials(tmp_path):
+def test_completed_task_restart_requires_credentials_to_recheck_school(tmp_path):
     state = tmp_path / 'state'
     state.mkdir()
     (state / 'task.json').write_text(json.dumps({'version': 2, 'account': '0' * 64,
         'status': 'done', 'activity': 'one', 'cooldowns': {}}))
-    assert cli(tmp_path).returncode == 0
+    result = cli(tmp_path)
+    assert result.returncode == 1
+    assert 'credentials_require_terminal' in result.stdout
 
 
 def test_legacy_single_success_requires_credentials_to_recheck_goal(tmp_path):
@@ -106,7 +108,11 @@ def test_process_account_aliases_override_file_and_resume_the_correct_account(tm
     (state / 'task.json').write_text(json.dumps({'version': 2,
         'account': hashlib.sha256(expected.encode()).hexdigest(), 'status': 'done',
         'activity': 'one', 'cooldowns': {}}))
-    assert cli(tmp_path, environment=environment).returncode == 0
+    from seu_reserve.cli import configuration_from
+    assert configuration_from(tmp_path / '.env', environment)[1]['SEU_USERNAME'] == expected
+    before = (state / 'task.json').read_text()
+    assert cli(tmp_path, environment=environment).returncode == 1
+    assert (state / 'task.json').read_text() == before
 
 
 @pytest.mark.parametrize('text', [
@@ -239,7 +245,7 @@ def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
     monkeypatch.setattr('ddddocr.DdddOcr', lambda **kwargs: SimpleNamespace(classification=lambda _: '1234'))
     school.close = lambda: None
     monkeypatch.setattr('seu_reserve.cli.run', lambda settings, **options:
-                        run_application(settings, **options, sleep=interrupted, prompt=interrupted))
+                        run_application(settings, **options, sleep=interrupted, prompt=interrupted, clock=lambda: 1000))
     assert main([]) == 130
     assert school.submitted == ['chosen']
     assert len(messages) == 1

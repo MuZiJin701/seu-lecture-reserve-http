@@ -50,7 +50,7 @@ def test_backoff_mail_failure_and_recovery_are_visible_without_repeated_notifica
         if len(states) == 4:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, notify=notify, sleep=wait, clock=lambda: 1000) == 130
-    assert messages == ['query_failure']
+    assert messages == ['query_failure', 'query_recovered']
     assert [entry['failure_count'] for entry in states] == [1, 2, 3, 0]
     assert [entry['phase'] for entry in states] == ['backoff'] * 3 + ['waiting']
     assert states[0]['last_query_at'] == 0
@@ -109,7 +109,7 @@ def test_default_mailer_is_available_for_task_initialization_failure(tmp_path, m
     assert run(Settings(state_dir=tmp_path), session=School(), environ={
         'SEU_USERNAME': 'test-user', 'SMTP_USERNAME': 'sender@gmail.com', 'SMTP_PASSWORD': 'SECRET'}) == 1
     assert len(messages) == 1
-    assert messages[0]['Subject'] == 'SEU reservation: task_failed'
+    assert '任务异常退出' in messages[0]['Subject']
     assert 'SECRET' not in messages[0].get_content()
 
 

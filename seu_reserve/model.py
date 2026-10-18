@@ -128,6 +128,9 @@ class Lecture:
     online: bool
     start: datetime
     end: datetime
+    availability: str
+    reservation_start: datetime | None
+    reservation_end: datetime | None
 
     @classmethod
     def read(cls, row: dict[str, Any], *, now: float) -> 'Lecture':
@@ -139,6 +142,7 @@ class Lecture:
             raise ValueError('lecture_schema_unknown')
         if not isinstance(location, str) or not location.strip():
             raise ValueError('location_missing')
+        opens = closes = None
         if native:
             if not title.startswith(('【线上】', '【线下】')) or row.get('FBZT') not in ('1', '-1'):
                 raise ValueError('lecture_schema_unknown')
@@ -150,7 +154,10 @@ class Lecture:
             if closes <= opens or row.get('YY_WID') is not None and not isinstance(row['YY_WID'], str):
                 raise ValueError('lecture_schema_unknown')
             # The school UI uses this window, not SFKSYY; preflight remains authoritative for availability.
-            available = row['FBZT'] == '1' and not row.get('YY_WID') and opens.timestamp() <= now <= closes.timestamp()
+            availability = ('not_reservable' if row['FBZT'] != '1' else
+                            'already_reserved' if row.get('YY_WID') else
+                            'reservation_not_started' if now < opens.timestamp() else
+                            'reservation_ended' if now > closes.timestamp() else 'candidate')
         else:
             explicit_online = row.get('IS_ONLINE')
             if not isinstance(explicit_online, bool) or row['YYZT'] not in (
@@ -158,10 +165,12 @@ class Lecture:
                     '未开放', '已结束', '已满', '活动取消'):
                 raise ValueError('lecture_schema_unknown')
             online = explicit_online
-            available = row['YYZT'] == '预约'
+            availability = {'预约': 'candidate', '未开放': 'reservation_not_started',
+                            '已结束': 'reservation_ended', '已满': 'capacity_full',
+                            '已预约': 'already_reserved', '预约成功': 'already_reserved',
+                            '取消预约': 'already_reserved'}.get(row['YYZT'], 'not_reservable')
         wid = activity_id(row)
         match = re.match(r'^(.+?校区)', location)
         start, end = interval(row)
-        if not available:
-            raise ValueError('not_reservable')
-        return cls(wid, title, category, match[1] if match else location, online, start, end)
+        return cls(wid, title, category, match[1] if match else location, online, start, end,
+                   availability, opens, closes)

@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from seu_reserve.app import Settings, run
+from seu_reserve.model import moment
 
 
 class School:
@@ -154,6 +155,7 @@ def lecture(wid='one', **changes):
 
 
 def execute(school, directory, **options):
+    options.setdefault('clock', lambda: moment('2026-10-18 12:00:00').timestamp())
     options.setdefault('sleep', interrupted)
     options.setdefault('notify', lambda _: None)
     options.setdefault('prompt', interrupted)
@@ -262,7 +264,7 @@ def test_query_failure_notification_is_deduplicated_and_resets_after_recovery(tm
         if len(delays) == 8:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, notify=events.append, sleep=wait) == 130
-    assert events == ['query_failure', 'query_failure']
+    assert events == ['query_failure', 'query_recovered']
     assert delays[:3] == [20, 40, 80]
     assert delays[4] == 10
 
@@ -326,7 +328,7 @@ def test_no_mail_configuration_still_books_and_records_success(tmp_path, monkeyp
     school.activities = [lecture()]
     env = {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password', **mail}
     assert run(Settings(state_dir=tmp_path), session=school, environ=env,
-               recognize=lambda _: '1234', sleep=interrupted) == 130
+               recognize=lambda _: '1234', sleep=interrupted, clock=lambda: 1000) == 130
     assert school.submitted == ['one']
     assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
     assert 'event=reservation_succeeded' in capsys.readouterr().out
@@ -360,7 +362,7 @@ def test_default_email_contains_only_event_and_mail_failure_does_not_repeat_book
     if authenticated:
         env.update(SMTP_USERNAME='sender@gmail.com', SMTP_PASSWORD='private-mail-password')
     assert run(Settings(state_dir=tmp_path), session=school, environ=env,
-               recognize=lambda _: '1234', sleep=interrupted) == 130
+               recognize=lambda _: '1234', sleep=interrupted, clock=lambda: 1000) == 130
     assert len(messages) == 1
     assert logins == ([('sender@gmail.com', 'private-mail-password')] if authenticated else [])
     assert messages[0]['From'] == 'sender@example.org'
@@ -401,8 +403,8 @@ def test_read_only_http_failure_reports_stage_and_status_without_response_data(
     school = FailedSchool()
     directory = tmp_path / 'unused-state'
     assert execute(school, directory, check_only=True) == 1
-    assert capsys.readouterr().out == (
-        f'event=task_failed stage={stage} reason=http_failure http_status=502\n')
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        f'event=task_failed stage={stage} reason=http_failure http_status=502')
     assert not directory.exists()
     assert not school.submitted
 

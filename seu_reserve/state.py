@@ -85,6 +85,14 @@ class Task:
                         or any(not isinstance(k, str) or type(v) not in (int, float) or not math.isfinite(v)
                                for k, v in data['cooldowns'].items())):
                     raise ValueError('state_invalid')
+                alerts = data.get('alerts', {})
+                if (not isinstance(alerts, dict)
+                        or any(key not in ('query_failure', 'authentication_required', 'reservation_unconfirmed')
+                               for key in alerts)
+                        or any(type(value) not in (int, float) or not math.isfinite(value)
+                               or not 0 <= value <= 253402214400 for value in (
+                                   data.get('last_report_at', 0), data.get('last_query_alert_at', 0), *alerts.values()))):
+                    raise ValueError('state_invalid')
                 if username and account != data['account']:
                     raise ValueError('state_account_mismatch')
                 if not username and (data['status'] != 'done' or data['version'] == 1):

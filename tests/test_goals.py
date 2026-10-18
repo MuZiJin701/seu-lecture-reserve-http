@@ -27,9 +27,10 @@ def test_only_eight_attended_with_all_required_categories_complete_goal(tmp_path
     assert saved['version'] == 2 and saved['status'] == 'done'
     assert not saved['activity']
     requests_before_restart = len(school.requests)
-    assert execute(school, tmp_path) == 0
-    assert len(school.requests) == requests_before_restart
-    assert execute(school, tmp_path, new_task=True) == 0
+    assert execute(school, tmp_path, notify=events.append) == 0
+    assert len(school.requests) > requests_before_restart
+    assert execute(school, tmp_path, new_task=True, notify=events.append) == 0
+    assert events == ['goal_completed']
     assert not school.submitted
 
 

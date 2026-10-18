@@ -19,8 +19,8 @@ from typing import Any
 from dotenv import dotenv_values
 from dotenv.parser import parse_stream
 
-from .app import Settings, run
-from .mail import Mailer
+from .app import SELECTION_REASONS, Settings, run
+from .mail import MAIL_ERROR_REASONS, MESSAGES, Mailer, mail_failure_reason
 from .model import SHANGHAI
 from .state import read_json, task_running
 
@@ -48,6 +48,14 @@ def show_status(directory: Path) -> None:
     if (not isinstance(snapshot, dict) or not isinstance(snapshot.get('phase'), str)
             or snapshot['phase'] not in phases
             or snapshot.get('mail_status') not in ('disabled', 'ready', 'sending', 'accepted', 'failed')
+            or snapshot.get('last_mail_status', 'never') not in ('never', 'sending', 'accepted', 'failed')
+            or not isinstance(snapshot.get('last_mail_error', 'none'), str)
+            or snapshot.get('last_mail_error', 'none') not in MAIL_ERROR_REASONS
+            or not isinstance(snapshot.get('last_mail_event', 'unknown'), str)
+            or snapshot.get('last_mail_event', 'unknown') not in (*MESSAGES, 'none', 'unknown')
+            or snapshot.get('last_mail_duration_seconds') is not None and (
+                type(snapshot['last_mail_duration_seconds']) not in (int, float)
+                or not math.isfinite(snapshot['last_mail_duration_seconds']) or snapshot['last_mail_duration_seconds'] < 0)
             or not isinstance(snapshot.get('last_error'), str)
             or not re.fullmatch('[a-z_]{1,80}', snapshot['last_error'])
             or any(type(snapshot.get(key)) not in (int, float) or not math.isfinite(snapshot[key])
@@ -67,6 +75,31 @@ def show_status(directory: Path) -> None:
         print(label + '=' + (str(max(0, round(time.time() - snapshot[key]))) if snapshot[key] else 'unknown'))
     for key in ('last_error', 'failure_count', 'mail_status', 'activity_count', 'candidate_count'):
         print(key + '=' + (str(snapshot[key]) if snapshot.get(key) is not None else 'unknown'))
+    print('last_mail_status=' + str(snapshot.get('last_mail_status',
+          snapshot['mail_status'] if snapshot['mail_status'] in ('sending', 'accepted', 'failed') else 'never')))
+    print('last_mail_error=' + snapshot.get('last_mail_error',
+          'unknown' if snapshot.get('last_mail_status', snapshot['mail_status']) == 'failed' else 'none'))
+    print('last_mail_event=' + snapshot.get('last_mail_event', 'unknown' if snapshot['last_mail_at'] else 'none'))
+    print('last_mail_duration_seconds=' + (str(snapshot['last_mail_duration_seconds'])
+          if snapshot.get('last_mail_duration_seconds') is not None else 'unknown'))
+    selection = saved.get('selection')
+    if selection is None:
+        return
+    if (not isinstance(selection, dict) or type(selection.get('updated_at')) not in (int, float)
+            or not math.isfinite(selection['updated_at']) or not 0 <= selection['updated_at'] <= 253402214400
+            or not isinstance(selection.get('activities'), list)
+            or any(not isinstance(item, dict) or not isinstance(item.get('title'), str)
+                   or not isinstance(item.get('reason'), str) or item['reason'] not in SELECTION_REASONS
+                   or any(item.get(key) is not None and (not isinstance(item[key], str)
+                          or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+08:00', item[key]))
+                          for key in ('reservation_start', 'reservation_end'))
+                   for item in selection['activities'])):
+        print('activity_details=unknown')
+        return
+    print('selection_updated_at=' + datetime.fromtimestamp(selection['updated_at'], SHANGHAI).isoformat(timespec='seconds'))
+    details = [{key: item.get(key) for key in ('title', 'reason', 'reservation_start', 'reservation_end')}
+               for item in selection['activities']]
+    print('activity_details=' + json.dumps(details, ensure_ascii=False))
 
 
 def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[Settings, dict[str, str]]:
@@ -118,9 +151,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='SEU lecture goal: 8 attended, including law, art and mental health')
     parser.add_argument('--config', type=Path, help='dotenv file (default: .env in the current directory)')
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument('--check', action='store_true', help='authenticate and fetch data/captcha without submitting')
-    mode.add_argument('--new-task', action='store_true', help='recheck a completed goal against school records')
-    mode.add_argument('--status', action='store_true', help='show local task status without network access')
+    mode.add_argument('--check', action='store_true', help='authenticate, explain lecture selection and fetch captcha without submitting or saving a task')
+    mode.add_argument('--new-task', action='store_true', help='compatibility: recheck a completed goal (normal startup also rechecks)')
+    mode.add_argument('--status', action='store_true', help='show local task status and private selection details without network access')
     mode.add_argument('--test-mail', action='store_true', help='send one test email without school login or reservations')
     args = parser.parse_args(argv)
     if not args.status:
@@ -145,18 +178,11 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             try:
                 mailer('test_notification')
-            except Exception:
-                print('event=notification_failed', flush=True)
+            except Exception as exc:
+                print('event=notification_failed reason=' + mail_failure_reason(exc), flush=True)
                 return 1
             print('event=test_mail_accepted', flush=True)
             return 0
-        checkpoint = settings.state_dir / 'task.json'
-        if not args.check and not args.new_task and checkpoint.exists():
-            if checkpoint.is_symlink():
-                raise ValueError('unsafe_state')
-            saved = json.loads(checkpoint.read_text())
-            if isinstance(saved, dict) and saved.get('version') == 2 and saved.get('status') == 'done':
-                return run(settings, environ=environ)
         if not sys.stdin.isatty() and any(not environ.get(key) for key in ('SEU_USERNAME', 'SEU_PASSWORD')):
             print('event=credentials_require_terminal', flush=True)
             return 1

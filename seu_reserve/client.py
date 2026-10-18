@@ -330,7 +330,13 @@ class Client:
         return self.rows('queryMyActivityList.do', 'wdhdList', {'param': '{}'})
 
     def preflight(self, wid: str) -> bool:
-        return has_code(self.business('appiontCheck.do', method='GET', params={'wid': wid}), 0)
+        reply = self.business('appiontCheck.do', method='GET', params={'wid': wid})
+        if has_code(reply, 0):
+            return True
+        if type(reply.get('code')) is int and reply.get('msg') in (
+                '已满', '名额已满', '不可预约', '预约已结束', '预约未开始', '已预约'):
+            return False
+        raise RemoteError('preflight_response_unknown')
 
     def captcha(self) -> bytes:
         from io import BytesIO

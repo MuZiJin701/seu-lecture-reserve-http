@@ -86,6 +86,13 @@ def run(settings: Settings, *, session: Any = None,
     def ask(label: str) -> str:
         health(phase='manual_required', next_check_at=0)
         return prompt(label)
+    def read_lecture(row: dict[str, Any]) -> Lecture | None:
+        try:
+            return Lecture.read(row, now=clock())
+        except ValueError as exc:
+            if str(exc) in ('lecture_schema_unknown', 'activity_id_missing', 'location_missing'):
+                raise RemoteError('activity_schema_unknown') from None
+            return None
     try:
         if not check_only:
             if notify is None and Mailer.configured(environ):
@@ -105,7 +112,8 @@ def run(settings: Settings, *, session: Any = None,
             stage = 'my_activities'
             progress(client.mine(), clock())
             stage = 'activities'
-            client.activities()
+            for row in client.activities():
+                read_lecture(row)
             stage = 'captcha'
             client.captcha()
             print('event=read_only_complete', flush=True)
@@ -180,11 +188,8 @@ def run(settings: Settings, *, session: Any = None,
                 health(phase='activities')
                 rows = client.activities()
                 for row in rows:
-                    try:
-                        lecture = Lecture.read(row)
-                    except ValueError as exc:
-                        if str(exc) in ('lecture_schema_unknown', 'activity_id_missing', 'location_missing'):
-                            raise RemoteError('activity_schema_unknown') from None
+                    lecture = read_lecture(row)
+                    if lecture is None:
                         continue
                     if (lecture.wid in booked or lecture.category not in settings.categories
                             or not current.needs(lecture.category)

@@ -130,16 +130,38 @@ class Lecture:
     end: datetime
 
     @classmethod
-    def read(cls, row: dict[str, Any]) -> 'Lecture':
-        if row.get('YYZT') != '预约':
-            raise ValueError('not_reservable')
-        title, category = row.get('HDMC'), row.get('HDLX_DISPLAY')
-        online, location = row.get('IS_ONLINE'), row.get('JZDD')
-        # shortcut: accept explicit fields only; extend mappings after validating real activity responses.
-        if not isinstance(title, str) or not isinstance(category, str) or not isinstance(online, bool):
+    def read(cls, row: dict[str, Any], *, now: float) -> 'Lecture':
+        native = 'YYZT' not in row or any(key in row for key in ('JZMC', 'JZXL_DISPLAY', 'YYKSSJ', 'YYJSSJ'))
+        title = row.get('JZMC' if native else 'HDMC')
+        category = row.get('JZXL_DISPLAY' if native else 'HDLX_DISPLAY')
+        location = row.get('JZDD')
+        if not isinstance(title, str) or not title.strip() or not isinstance(category, str) or not category.strip():
             raise ValueError('lecture_schema_unknown')
-        if not isinstance(location, str):
+        if not isinstance(location, str) or not location.strip():
             raise ValueError('location_missing')
+        if native:
+            if not title.startswith(('【线上】', '【线下】')) or row.get('FBZT') not in ('1', '-1'):
+                raise ValueError('lecture_schema_unknown')
+            online = title.startswith('【线上】')
+            try:
+                opens, closes = moment(row.get('YYKSSJ')), moment(row.get('YYJSSJ'))
+            except ValueError:
+                raise ValueError('lecture_schema_unknown') from None
+            if closes <= opens or row.get('YY_WID') is not None and not isinstance(row['YY_WID'], str):
+                raise ValueError('lecture_schema_unknown')
+            # The school UI uses this window, not SFKSYY; preflight remains authoritative for availability.
+            available = row['FBZT'] == '1' and not row.get('YY_WID') and opens.timestamp() <= now <= closes.timestamp()
+        else:
+            explicit_online = row.get('IS_ONLINE')
+            if not isinstance(explicit_online, bool) or row['YYZT'] not in (
+                    '预约', '已预约', '预约成功', '取消预约', '已取消', '取消成功', '未预约',
+                    '未开放', '已结束', '已满', '活动取消'):
+                raise ValueError('lecture_schema_unknown')
+            online = explicit_online
+            available = row['YYZT'] == '预约'
+        wid = activity_id(row)
         match = re.match(r'^(.+?校区)', location)
         start, end = interval(row)
-        return cls(activity_id(row), title, category, match[1] if match else location, online, start, end)
+        if not available:
+            raise ValueError('not_reservable')
+        return cls(wid, title, category, match[1] if match else location, online, start, end)

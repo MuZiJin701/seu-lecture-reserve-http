@@ -55,7 +55,7 @@ Campus names must match the university system; change the example to suit your n
 uv run main.py --check
 ```
 
-`event=read_only_complete` means the check passed. This does not submit reservations or send mail. Follow the terminal prompts if SMS verification is needed. On failure, check the `event=task_failed` line against the [troubleshooting guide](docs/usage.md#先做只读检查) (Chinese).
+`event=read_only_complete` means login, current query data and the CAPTCHA image passed validation; it does not verify an actual reservation. Lecture fields are checked when the list is nonempty; an empty list cannot validate them. This does not submit reservations or send mail. Follow the terminal prompts if SMS verification is needed. On failure, check the `event=task_failed` line against the [troubleshooting guide](docs/usage.md#先做只读检查) (Chinese).
 
 **4. Start reservations**
 
@@ -105,7 +105,7 @@ The first line remains `status=...`, followed by runtime information:
 | `activity_count` / `candidate_count` | Last activity-list size and matching candidate count; `unknown` means the list was not queried in that cycle |
 | `mail_status` | `disabled`, `ready`, `sending`, `accepted` by SMTP, or `failed`; this does not prove inbox delivery |
 
-Check `process_running=true`, a recent successful query and the current phase together. Zero candidates with an advancing success timestamp means normal waiting. Normal polling stays quiet. `phase=unknown` means an old task has no new runtime information, or its information is invalid; it is not evidence of health.
+Check `process_running=true`, a recent successful query and the current phase together. Zero candidates with an advancing success timestamp means no candidate was selectable in that cycle: booking may not have opened, or filters may exclude the lectures. It does not verify reservation submission. Normal polling stays quiet. `phase=unknown` means an old task has no new runtime information, or its information is invalid; it is not evidence of health.
 
 **`scanning` alone does not prove the process is running.** For the background startup method above, you can also check the process recorded in the PID file:
 
@@ -175,7 +175,8 @@ uv run main.py --test-mail
 
 ## Before relying on it
 
-- Live login, read-only queries and delivery of the test email have been verified. Actual reservations, SMS recovery and long-running operation still need acceptance testing. Confirm bookings and attendance in the [SEU portal](https://ehall.seu.edu.cn/); these counts do not replace final departmental assessment.
+- A nonempty live lecture list has been checked. Selection uses the reservation window and publication status; online/offline classification accepts only an explicit leading `【线上】` / `【线下】` title marker. Unknown schemas raise errors. University preflight checks remain authoritative for capacity and eligibility; keep the server clock accurate. See [API boundaries](docs/usage.md#当前业务数据契约与限制) (Chinese).
+- Live login, read-only queries and delivery of the test email have been verified. Actual reservations, SMS recovery and long-running operation after this fix still need acceptance testing. Confirm bookings and attendance in the [SEU portal](https://ehall.seu.edu.cn/); these counts do not replace final departmental assessment.
 - `.env` contains credentials; do not upload it. When a submission result is unclear, the client checks that activity before proceeding instead of blindly resubmitting.
 - Development checks, detailed settings and acceptance records are in the [usage guide](docs/usage.md) (Chinese).
 

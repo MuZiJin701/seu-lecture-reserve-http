@@ -15,6 +15,42 @@ def details(output):
                            if line.startswith('activity_details=')))
 
 
+@pytest.mark.parametrize('excluded', [
+    {'JZXL_DISPLAY': '通知公告'},
+    {'JZXL_DISPLAY': SERIES_CATEGORIES[1]},
+    {'HDLX_DISPLAY': '“SEU咖啡间"系列沙龙活动', 'HDMC': 42, 'YYKSSJ': 'invalid'},
+])
+@pytest.mark.parametrize('check_only', [False, True])
+def test_excluded_category_missing_fields_does_not_block_target_or_status(
+        tmp_path, capsys, excluded, check_only):
+    school = ActivitySchool()
+    school.activities = [excluded, activity()]
+    settings = Settings(state_dir=tmp_path, categories=(SERIES_CATEGORIES[0],))
+    assert execute(school, tmp_path, settings=settings, clock=lambda: OPEN,
+                   check_only=check_only) == (0 if check_only else 130)
+    if not check_only:
+        capsys.readouterr()
+        show_status(tmp_path)
+    result = details(capsys.readouterr().out)
+    assert result[0] == dict(title='', reason='category_not_allowed',
+                             reservation_start=None, reservation_end=None)
+    assert result[1]['reason'] == ('candidate' if check_only else 'already_reserved')
+    assert school.submitted == ([] if check_only else ['native'])
+    if check_only:
+        assert not (tmp_path / 'task.json').exists()
+
+
+@pytest.mark.parametrize('category', [None, '', ' ', 42, [], SERIES_CATEGORIES[0]])
+@pytest.mark.parametrize('check_only', [False, True])
+def test_missing_invalid_or_target_category_still_requires_valid_lecture(
+        tmp_path, capsys, category, check_only):
+    school = ActivitySchool()
+    school.activities = [{'JZXL_DISPLAY': category, 'HDLX_DISPLAY': '通知公告'}, activity()]
+    assert execute(school, tmp_path, clock=lambda: OPEN, check_only=check_only) == (1 if check_only else 130)
+    assert not school.submitted
+    assert 'activity_schema_unknown' in capsys.readouterr().out
+
+
 @pytest.mark.parametrize('changes, filters, now, reason', [
     ({}, {}, OPEN - 1, 'reservation_not_started'),
     ({}, {}, CLOSE + 1, 'reservation_ended'),

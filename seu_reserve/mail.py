@@ -80,8 +80,10 @@ class Mailer:
     def __init__(self, environ: Mapping[str, str]):
         self.username = environ.get('SMTP_USERNAME', '')
         self.password = environ.get('SMTP_PASSWORD', '')
-        self.host = environ.get('SMTP_HOST') or (
-            'smtp.gmail.com' if self.username.rpartition('@')[2].lower() == 'gmail.com' else '')
+        self.host = environ.get('SMTP_HOST') or {
+            'qq.com': 'smtp.qq.com', '163.com': 'smtp.163.com',
+            '126.com': 'smtp.126.com', 'gmail.com': 'smtp.gmail.com',
+        }.get(self.username.rpartition('@')[2].lower(), '')
         self.port = int(environ.get('SMTP_PORT') or '465')
         self.sender = environ.get('MAIL_FROM') or self.username
         self.recipient = environ.get('MAIL_TO') or self.sender

@@ -89,7 +89,7 @@ class School:
                 payload = self.submit_replies.pop(0)
                 response._content = json.dumps(payload).encode()
                 return response
-            self.mine.append({**next(row for row in self.activities if row['WID'] == wid), 'YYZT': '已预约', 'HD_WID': wid})
+            self.mine.append({**next(row for row in self.activities if row.get('WID') == wid), 'YYZT': '已预约', 'HD_WID': wid})
             payload = {'code': 0}
         elif path.endswith('needCaptcha'):
             payload = {"code": 200}
@@ -296,6 +296,9 @@ def test_unsupported_activity_schema_alerts_instead_of_looking_like_empty_list(t
     {'SMTP_PASSWORD': 'SECRET-app-password'},
     {'SMTP_USERNAME': '@gmail.com', 'SMTP_PASSWORD': 'SECRET-app-password'},
     {'SMTP_USERNAME': 'sender@@gmail.com', 'SMTP_PASSWORD': 'SECRET-app-password'},
+    {'SMTP_USERNAME': 'sender@sub.qq.com', 'SMTP_PASSWORD': 'SECRET'},
+    {'SMTP_USERNAME': 'sender@qq.com.evil.test', 'SMTP_PASSWORD': 'SECRET'},
+    {'SMTP_USERNAME': 'sender@foxmail.com', 'SMTP_PASSWORD': 'SECRET'},
     {'SMTP_USERNAME': 'sender@example.org', 'SMTP_PASSWORD': 'SECRET-app-password'},
     {'SMTP_USERNAME': 'sender@gmail.com', 'SMTP_PASSWORD': 'SECRET-app-password', 'MAIL_TO': 'invalid'},
     {'SMTP_PORT': 'SECRET-invalid-port'},
@@ -335,9 +338,10 @@ def test_no_mail_configuration_still_books_and_records_success(tmp_path, monkeyp
     assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
 
 
-@pytest.mark.parametrize('authenticated', [False, True])
+@pytest.mark.parametrize('username', [None, 'sender@gmail.com', 'sender@qq.com',
+                                     'sender@163.com', 'sender@126.com'])
 def test_default_email_contains_only_event_and_mail_failure_does_not_repeat_booking(
-        tmp_path, monkeypatch, capsys, authenticated):
+        tmp_path, monkeypatch, capsys, username):
     messages = []
     logins = []
     class SMTP:
@@ -359,12 +363,12 @@ def test_default_email_contains_only_event_and_mail_failure_does_not_repeat_book
     env = {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password',
            'SMTP_HOST': 'smtp.example.org', 'SMTP_PORT': '2465',
            'MAIL_FROM': 'sender@example.org', 'MAIL_TO': 'receiver@example.org'}
-    if authenticated:
-        env.update(SMTP_USERNAME='sender@gmail.com', SMTP_PASSWORD='private-mail-password')
+    if username:
+        env.update(SMTP_USERNAME=username, SMTP_PASSWORD='private-mail-password')
     assert run(Settings(state_dir=tmp_path), session=school, environ=env,
                recognize=lambda _: '1234', sleep=interrupted, clock=lambda: 1000) == 130
     assert len(messages) == 1
-    assert logins == ([('sender@gmail.com', 'private-mail-password')] if authenticated else [])
+    assert logins == ([(username, 'private-mail-password')] if username else [])
     assert messages[0]['From'] == 'sender@example.org'
     assert messages[0]['To'] == 'receiver@example.org'
     assert 'reservation_succeeded' in messages[0].get_content()

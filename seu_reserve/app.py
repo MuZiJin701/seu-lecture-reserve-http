@@ -52,6 +52,18 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
     details: list[dict[str, Any]] = []
     seen: dict[str, dict[str, Any]] = {}
     for row in rows:
+        category = row.get('JZXL_DISPLAY', row.get('HDLX_DISPLAY'))
+        if isinstance(category, str) and category.strip() and category not in settings.categories:
+            window: dict[str, str | None] = {}
+            for key, field in (('reservation_start', 'YYKSSJ'), ('reservation_end', 'YYJSSJ')):
+                try:
+                    window[key] = moment(row[field]).isoformat(timespec='seconds') if row.get(field) is not None else None
+                except ValueError:
+                    window[key] = None
+            title = row.get('JZMC', row.get('HDMC'))
+            details.append(dict(title=title if isinstance(title, str) else '',
+                                reason='category_not_allowed', **window))
+            continue
         try:
             wid = activity_id(row)
             if wid in seen:
@@ -72,8 +84,6 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
             reason = lecture.availability
         elif lecture.wid in booked:
             reason = 'already_reserved'
-        elif lecture.category not in settings.categories:
-            reason = 'category_not_allowed'
         elif not current.needs(lecture.category):
             reason = 'category_not_needed'
         elif settings.titles and lecture.title not in settings.titles:
@@ -237,8 +247,8 @@ def run(settings: Settings, *, session: Any = None,
                     notify = lambda event: mailer(event, notification_details())
                 except ValueError:
                     print('event=mail_configuration_invalid', flush=True)
-                    print('邮件配置不完整或格式错误。Gmail 只需在 .env 中填写 SMTP_USERNAME（完整邮箱地址）'
-                          '和 SMTP_PASSWORD（应用专用密码）；其他邮箱需指定 SMTP_HOST。'
+                    print('邮件配置不完整或格式错误。QQ、163、126、Gmail 只需在 .env 中填写 SMTP_USERNAME（完整邮箱地址）'
+                          '和 SMTP_PASSWORD（授权码或应用专用密码）；其他邮箱需指定 SMTP_HOST。'
                           '高级配置请检查 SMTP_PORT、MAIL_FROM、MAIL_TO。清空邮件配置可关闭通知。', flush=True)
                     return 1
             snapshot['mail_status'] = 'ready' if notify else 'disabled'

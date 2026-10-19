@@ -195,9 +195,13 @@ def test_test_mail_failure_is_safe_and_does_not_create_task(tmp_path, monkeypatc
     assert not (tmp_path / 'state').exists()
 
 
-@pytest.mark.parametrize('simple_gmail', [False, True])
+@pytest.mark.parametrize('mailbox, host', [
+    (None, 'smtp.example.org'), ('sender@gmail.com', 'smtp.gmail.com'),
+    ('sender@QQ.COM', 'smtp.qq.com'), ('sender@163.com', 'smtp.163.com'),
+    ('sender@126.com', 'smtp.126.com'),
+])
 def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
-        tmp_path, monkeypatch, capsys, simple_gmail):
+        tmp_path, monkeypatch, capsys, mailbox, host):
     import base64
     from types import SimpleNamespace
     from cryptography.hazmat.primitives.asymmetric import padding
@@ -218,15 +222,15 @@ def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
                          lecture('chosen', HDMC='指定讲座', IS_ONLINE=False, JZDD='无锡校区会议室')]
     messages = []
     class SMTP:
-        def __init__(self, host, port, **kwargs):
-            assert (host, port) == ('smtp.gmail.com' if simple_gmail else 'smtp.example.org', 465)
+        def __init__(self, server, port, **kwargs):
+            assert (server, port) == (host, 465)
             assert kwargs['context'].check_hostname
         def __enter__(self):
             return self
         def __exit__(self, *args):
             return False
         def login(self, username, secret):
-            assert username == ('sender@gmail.com' if simple_gmail else 'mail-user')
+            assert username == (mailbox or 'mail-user')
             assert secret == 'test ${mail} # = password'
         def send_message(self, message):
             messages.append(message)
@@ -234,8 +238,8 @@ def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
         "SEU_CARD_NUMBER=test-user\nSEU_PASSWORD='test ${literal} # = password'\n"
         "SEU_PREFERRED_LECTURES='[\"指定讲座\"]'\nSEU_PREFERRED_CAMPUS='[\"无锡校区\"]'\n"
         "SEU_ENABLE_ONLINE=false\nSEU_ENABLE_OFFLINE=true\nSEU_STATE_DIR=jobs\n" +
-        ("SMTP_USERNAME=sender@gmail.com\nSMTP_PASSWORD='test ${mail} # = password'\n"
-         "SMTP_HOST=\nSMTP_PORT=\nMAIL_FROM=\nMAIL_TO=\n" if simple_gmail else
+        (f"SMTP_USERNAME={mailbox}\nSMTP_PASSWORD='test ${{mail}} # = password'\n"
+         "SMTP_HOST=\nSMTP_PORT=\nMAIL_FROM=\nMAIL_TO=\n" if mailbox else
          "SMTP_HOST=smtp.example.org\nSMTP_USERNAME=mail-user\nSMTP_PASSWORD='test ${mail} # = password'\n"
          "MAIL_FROM=sender@example.org\nMAIL_TO=receiver@example.org\n"))
     monkeypatch.chdir(tmp_path)
@@ -249,6 +253,6 @@ def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
     assert main([]) == 130
     assert school.submitted == ['chosen']
     assert len(messages) == 1
-    assert messages[0]['From'] == ('sender@gmail.com' if simple_gmail else 'sender@example.org')
-    assert messages[0]['To'] == ('sender@gmail.com' if simple_gmail else 'receiver@example.org')
+    assert messages[0]['From'] == (mailbox or 'sender@example.org')
+    assert messages[0]['To'] == (mailbox or 'receiver@example.org')
     assert password not in capsys.readouterr().out

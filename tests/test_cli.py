@@ -140,11 +140,15 @@ def test_startup_credit_appears_once_except_status_and_help(tmp_path, args, expe
 
 
 def test_example_is_valid_dotenv_with_the_confirmed_default_categories(tmp_path):
+    from seu_reserve.cli import configuration_from
+    from seu_reserve.model import COFFEE_CATEGORY, GOAL_CATEGORIES
     example = Path(__file__).resolve().parents[1] / '.env.example'
     (tmp_path / '.env').write_text(example.read_text())
     result = cli(tmp_path, '--status')
     assert result.returncode == 0
     assert result.stdout.splitlines()[0] == 'status=not_started'
+    settings, _ = configuration_from(tmp_path / '.env', {})
+    assert settings.categories == GOAL_CATEGORIES and COFFEE_CATEGORY in settings.categories
 
 
 def test_gateway_ip_is_loaded_from_dotenv_and_process_takes_precedence(tmp_path):
@@ -211,11 +215,16 @@ def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
 
     password = 'test ${literal} # = password'
     class ConfiguredSchool(School):
+        booked = False
         def request(self, method, url, **kwargs):
             if method == 'POST' and url.endswith('casLogin'):
                 assert kwargs['json']['username'] == 'test-user'
                 decoded = self.key.decrypt(base64.b64decode(kwargs['json']['password']), padding.PKCS1v15()).decode()
                 assert decoded == password
+            if self.booked and url.endswith('queryActivityList.do'):
+                raise OSError('PRIVATE failure after booking')
+            if method == 'POST' and url.endswith('addReservation.do'):
+                self.booked = True
             return super().request(method, url, **kwargs)
     school = ConfiguredSchool()
     school.activities = [lecture('skip', HDMC='不匹配'),
@@ -250,7 +259,7 @@ def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
     school.close = lambda: None
     monkeypatch.setattr('seu_reserve.cli.run', lambda settings, **options:
                         run_application(settings, **options, sleep=interrupted, prompt=interrupted, clock=lambda: 1000))
-    assert main([]) == 130
+    assert main([]) == 1
     assert school.submitted == ['chosen']
     assert len(messages) == 1
     assert messages[0]['From'] == (mailbox or 'sender@example.org')

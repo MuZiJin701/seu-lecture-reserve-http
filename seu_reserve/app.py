@@ -14,17 +14,24 @@ from typing import Any
 import requests
 
 from .client import AuthenticationExpired, AuthenticationRejected, Client, RemoteError, has_code
-from .model import (Lecture, Progress, REQUIRED_CATEGORIES, SERIES_CATEGORIES, SHANGHAI,
-                    activity_id, interval, moment, progress, reserved)
+from .model import (GOAL_CATEGORIES, Lecture, Progress, REQUIRED_CATEGORIES, SHANGHAI,
+                    activity_id, category_name, interval, moment, progress, reserved,
+                    test_notice)
 from .mail import Mailer, mail_failure_reason, mail_history
 from .state import Task, open_nofollow
 
-DEFAULT_CATEGORIES = SERIES_CATEGORIES
-QUERY_ALERT_COOLDOWN = 15 * 60
+DEFAULT_CATEGORIES = GOAL_CATEGORIES
+QUERY_FAILURE_SECONDS = 5 * 60
+MAJOR_MAIL_EVENTS = {'authentication_required', 'query_failure', 'task_failed', 'unexpected_failure'}
+SCAN_INTERVAL = 10
+FAST_INTERVAL = 0.25
+FAST_RETRY_REASONS = {'network_timeout', 'network_failure', 'connection_failure', 'proxy_failure',
+                      'invalid_json', 'invalid_response', 'http_failure', 'business_response_invalid',
+                      'business_rows_invalid', 'business_rows_incomplete'}
 SELECTION_REASONS = {'candidate', 'reservation_not_started', 'reservation_ended', 'capacity_full',
     'not_reservable', 'already_reserved', 'category_not_allowed', 'category_not_needed',
     'title_not_selected', 'online_disabled', 'offline_disabled', 'campus_not_selected',
-    'time_conflict', 'cooldown', 'invalid_activity_time'}
+    'time_conflict', 'cooldown', 'invalid_activity_time', 'notice_test_only'}
 
 
 def terminal_prompt(label: str) -> str:
@@ -51,13 +58,21 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
     candidates: list[Lecture] = []
     details: list[dict[str, Any]] = []
     seen: dict[str, dict[str, Any]] = {}
+    categories = tuple(category_name(value) for value in settings.categories)
     for row in rows:
-        category = row.get('JZXL_DISPLAY', row.get('HDLX_DISPLAY'))
-        if isinstance(category, str) and category.strip() and category not in settings.categories:
+        category = category_name(row.get('JZXL_DISPLAY', row.get('HDLX_DISPLAY')))
+        if test_notice(row):
+            title = row.get('JZMC', row.get('HDMC'))
+            details.append(dict(title=title if isinstance(title, str) else '',
+                                reason='notice_test_only',
+                                reservation_start=None, reservation_end=None))
+            continue
+        if isinstance(category, str) and category.strip() and category not in categories:
             window: dict[str, str | None] = {}
             for key, field in (('reservation_start', 'YYKSSJ'), ('reservation_end', 'YYJSSJ')):
                 try:
-                    window[key] = moment(row[field]).isoformat(timespec='seconds') if row.get(field) is not None else None
+                    window[key] = (moment(row[field]).isoformat(timespec='seconds')
+                                   if row.get(field) is not None else None)
                 except ValueError:
                     window[key] = None
             title = row.get('JZMC', row.get('HDMC'))
@@ -105,8 +120,30 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
             reservation_start=lecture.reservation_start.isoformat(timespec='seconds') if lecture.reservation_start else None,
             reservation_end=lecture.reservation_end.isoformat(timespec='seconds') if lecture.reservation_end else None))
     candidates.sort(key=lambda row: (row.category not in current.missing,
-                    settings.categories.index(row.category), not row.online, row.start, row.wid))
+                    categories.index(row.category), not row.online, row.start, row.wid))
     return candidates, details
+
+
+def scan_delay(details: list[dict[str, Any]], now: float, elapsed: float,
+               interval: float) -> tuple[float, bool]:
+    openings: list[tuple[float, float]] = []
+    for item in details if isinstance(details, list) else []:
+        if not isinstance(item, dict) or item.get('reason') not in (
+                'reservation_not_started', 'candidate', 'capacity_full', 'not_reservable'):
+            continue
+        try:
+            start = datetime.fromisoformat(item['reservation_start'])
+            end = (datetime.fromisoformat(item['reservation_end']) if item.get('reservation_end')
+                   else start + timedelta(minutes=10))
+            if start.tzinfo is None or end.tzinfo is None or end <= start:
+                continue
+            openings.append((start.timestamp(), min(end.timestamp(), start.timestamp() + 600)))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    fast = any(start - 30 <= now <= end for start, end in openings)
+    delay = max(0, min(interval, FAST_INTERVAL) - elapsed) if fast else interval
+    boundaries = [start - 30 - now for start, _ in openings if start - 30 > now]
+    return min([delay, *boundaries]), fast
 
 
 def run(settings: Settings, *, session: Any = None,
@@ -122,6 +159,7 @@ def run(settings: Settings, *, session: Any = None,
     progress_at = 0.0
     task: Task | None = None
     client = None
+    mail_state_ready = False
     final_phase = 'stopped'
     stage = 'configuration'
     snapshot: dict[str, Any] = dict(phase='starting', last_query_at=0, last_error='none',
@@ -146,24 +184,29 @@ def run(settings: Settings, *, session: Any = None,
                 target.write(f'{clock():.0f} event={event}\n')
         except OSError:
             print('event=local_log_failed', flush=True)
-    def emit(event: str) -> None:
+    def diagnostic(event: str, **fields: Any) -> None:
+        # Detailed history stays in the private state directory, never SMTP or stdout.
         if check_only:
-            record(event)
             return
-        if event in ('authentication_required', 'reservation_unconfirmed', 'query_failure'):
-            if event in announced:
-                return
-            if event == 'query_failure' and notify and task is not None:
-                previous_alert = task.data.get('last_query_alert_at', 0)
-                if previous_alert and clock() - previous_alert < QUERY_ALERT_COOLDOWN:
-                    return
-            announced.add(event)
-            if notify and task is not None:
-                alerts[event] = clock()
-                if event == 'query_failure':
-                    task.data['last_query_alert_at'] = clock()
-                task.save()
+        try:
+            fd = open_nofollow(settings.state_dir / 'diagnostics.jsonl',
+                               os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+            with os.fdopen(fd, 'a') as target:
+                target.write(json.dumps(dict(at=clock(), event=event, **fields),
+                                        ensure_ascii=False, allow_nan=False) + '\n')
+        except (OSError, ValueError):
+            record('diagnostic_write_failed')
+    def emit(event: str) -> None:
         record(event)
+        if check_only or event not in MAJOR_MAIL_EVENTS:
+            return
+        alert = 'task_failed' if event == 'unexpected_failure' else event
+        if alert in announced:
+            return
+        announced.add(alert)
+        if notify and task is not None and mail_state_ready:
+            alerts[alert] = clock()
+            task.save()
         if notify:
             health(mail_status='sending', last_mail_status='sending', last_mail_error='none',
                    last_mail_at=clock(), last_mail_event=event, last_mail_duration_seconds=None)
@@ -187,7 +230,14 @@ def run(settings: Settings, *, session: Any = None,
             del alerts[event]
             task.save()
 
+    def query_failed(started: float) -> None:
+        if task is not None and task.data.get('query_failure_since') is None:
+            task.data['query_failure_since'] = started
+            task.save()
+
     def query_recovered() -> None:
+        if task is not None and task.data.pop('query_failure_since', None) is not None:
+            task.save()
         if 'query_failure' in announced or 'query_failure' in alerts:
             clear_alert('query_failure')
             emit('query_recovered')
@@ -211,31 +261,20 @@ def run(settings: Settings, *, session: Any = None,
                    f'最近业务错误：{snapshot["last_error"]}\n下次检查计划：{next_check}\n'
                    '进度为最近一次成功核对的记录；未知或较旧时请检查本地运行状态。')
 
-    def daily_report() -> None:
-        if task is None or notify is None:
-            return
-        now = datetime.fromtimestamp(clock(), SHANGHAI)
-        previous = datetime.fromtimestamp(task.data.get('last_report_at', 0), SHANGHAI)
-        if now.hour < 20 or previous.date() >= now.date():
-            return
-        # Save the attempt before SMTP: restarting must not send the same day's report again.
-        task.data['last_report_at'] = now.timestamp()
-        task.save()
-        emit('daily_report')
-
     def pause(seconds: float) -> None:
-        while seconds > 0:
-            daily_report()
+        while True:
             duration = seconds
-            if notify is not None:
-                now = datetime.fromtimestamp(clock(), SHANGHAI)
-                due = now.replace(hour=20, minute=0, second=0, microsecond=0)
-                if now >= due:
-                    due += timedelta(days=1)
-                duration = min(duration, (due - now).total_seconds())
+            since = task.data.get('query_failure_since') if task is not None else None
+            if notify is not None and since is not None and 'query_failure' not in announced:
+                remaining = since + QUERY_FAILURE_SECONDS - clock()
+                if remaining <= 0:
+                    emit('query_failure')
+                else:
+                    duration = min(duration, remaining)
+            if seconds <= 0:
+                return
             sleep(duration)
             seconds -= duration
-        daily_report()
     def ask(label: str) -> str:
         health(phase='manual_required', next_check_at=0)
         return prompt(label)
@@ -275,6 +314,7 @@ def run(settings: Settings, *, session: Any = None,
             snapshot.update(mail_history(previous))
             if notify and snapshot['last_mail_status'] in ('accepted', 'failed', 'sending'):
                 snapshot['mail_status'] = snapshot['last_mail_status']
+        mail_state_ready = True
         health(phase='starting')
         if new_task and task.data['status'] != 'done':
             raise ValueError('active_task_cannot_be_reset')
@@ -284,8 +324,6 @@ def run(settings: Settings, *, session: Any = None,
             checkpoint.data['retry_at'] = clock() + seconds
             checkpoint.save()
             health(phase='backoff', next_check_at=checkpoint.data['retry_at'])
-            if snapshot['failure_count'] >= 3:
-                emit('query_failure')
             pause(seconds)
             checkpoint.data['retry_at'] = 0
             checkpoint.save()
@@ -294,8 +332,18 @@ def run(settings: Settings, *, session: Any = None,
             defer(remaining)
         authenticated = False
         failures = 0
+        unconfirmed_checks = 0
+        last_timing_at = 0.0
+        history: list[dict[str, Any]] | None = None
+        mine_at = 0.0
+        previous_selection = task.data.get('selection')
+        details: list[dict[str, Any]] = (previous_selection.get('activities', [])
+                                         if isinstance(previous_selection, dict) else [])
         while True:
             try:
+                scan_started = clock()
+                opening_scan = scan_delay(details, clock(), 0, SCAN_INTERVAL)[1]
+                client.timeout = 3 if opening_scan else 10
                 fresh = {wid: until for wid, until in task.data['cooldowns'].items() if until > clock()}
                 if len(fresh) != len(task.data['cooldowns']):
                     task.data['cooldowns'] = fresh
@@ -306,25 +354,50 @@ def run(settings: Settings, *, session: Any = None,
                     authenticated = True
                     clear_alert('authentication_required')
                     record('authentication_succeeded')
-                health(phase='my_activities', next_check_at=0, activity_count=None, candidate_count=None)
-                mine = client.mine()
-                booked = {activity_id(row) for row in mine if reserved(row)}
-                confirmed = task.data['status'] == 'pending' and task.data['activity'] in booked
-                if task.data['status'] == 'pending' and not confirmed:
-                    failures = 0
-                    health(last_query_at=clock(), failure_count=0)
-                    query_recovered()
-                    emit('reservation_unconfirmed')
-                    ask('预约结果待确认；核实后按回车重新查询（Ctrl+C 停止）：')
-                    continue
-                current = progress(mine, clock())
-                latest_progress, progress_at = current, clock()
+                refresh_mine = (history is None or task.data['status'] == 'pending' or not opening_scan
+                                or not 0 <= clock() - mine_at < 10)
+                health(phase='my_activities' if refresh_mine else 'activities', next_check_at=0,
+                       activity_count=None, candidate_count=None)
+                mine_started = clock()
+                if refresh_mine:
+                    history = client.mine()
+                    mine_at = clock()
+                mine_seconds = max(0, clock() - mine_started)
+                assert history is not None
+                booked = {activity_id(row) for row in history if reserved(row)}
+                confirmed = False
+                if task.data['status'] == 'pending':
+                    pending_wid = task.data['activity']
+                    if pending_wid in booked:
+                        confirmed = True
+                    else:
+                        failures = 0
+                        health(last_query_at=clock(), failure_count=0)
+                        query_recovered()
+                        unconfirmed_checks += 1
+                        diagnostic('reservation_checked', wid=pending_wid, checks=unconfirmed_checks)
+                        if unconfirmed_checks < 2:
+                            emit('reservation_unconfirmed')
+                            health(phase='confirming', next_check_at=clock() + 1)
+                            pause(1)
+                            continue
+                        # Two misses trade duplicate risk for another booking chance; they do not prove failure.
+                        diagnostic('reservation_unconfirmed_released', wid=pending_wid)
+                        record('reservation_unconfirmed_released')
+                        task.data.update(status='scanning', activity='')
+                        task.save()
+                        clear_alert('reservation_unconfirmed')
+                        unconfirmed_checks = 0
+                current = progress(history, clock())
+                latest_progress, progress_at = current, mine_at
                 if confirmed:
+                    diagnostic('reservation_confirmed', wid=pending_wid)
                     task.data.update(status='scanning', activity='')
                     task.save()
                     clear_alert('reservation_unconfirmed')
                     health(last_query_at=clock(), failure_count=0)
                     emit('reservation_succeeded')
+                    unconfirmed_checks = 0
                 if current.done:
                     newly_completed = task.data['status'] != 'done'
                     task.data.update(status='done', activity='')
@@ -332,6 +405,7 @@ def run(settings: Settings, *, session: Any = None,
                     final_phase = 'done'
                     health(phase='done', last_query_at=clock(), failure_count=0)
                     query_recovered()
+                    clear_alert('task_failed')
                     if newly_completed:
                         emit('goal_completed')
                     return 0
@@ -339,105 +413,162 @@ def run(settings: Settings, *, session: Any = None,
                     task.data.update(status='scanning', activity='')
                     task.save()
                 if not any(current.needs(category) for category in settings.categories):
+                    opening_scan = False
                     failures = 0
                     health(phase='waiting_for_attendance', last_query_at=clock(), failure_count=0,
                            next_check_at=clock() + 10)
                     query_recovered()
+                    clear_alert('task_failed')
                     pause(10)
                     continue
                 health(phase='activities')
+                activities_started = clock()
                 rows = client.activities()
-                candidates, selection_details = select_candidates(rows, settings, current, mine, task.data['cooldowns'], clock())
-                task.data['selection'] = dict(updated_at=clock(), activities=selection_details)
+                activities_seconds = max(0, clock() - activities_started)
+                candidates, details = select_candidates(rows, settings, current, history, task.data['cooldowns'], clock())
+                query_recovered()
+                opening_scan = scan_delay(details, clock(), 0, SCAN_INTERVAL)[1]
+                client.timeout = 3 if opening_scan else 10
+                previous_selection = task.data.get('selection')
+                if (not isinstance(previous_selection, dict)
+                        or previous_selection.get('activities') != details):
+                    diagnostic('selection_changed', activities=details)
+                task.data['selection'] = dict(updated_at=clock(), activities=details)
                 health(last_query_at=clock(), failure_count=failures, activity_count=len(rows),
-                       candidate_count=len(candidates), phase='preflight' if candidates else 'waiting')
+                       candidate_count=len(candidates), phase='captcha' if candidates else 'waiting')
                 for lecture in candidates:
-                    health(phase='preflight')
-                    if not client.preflight(lecture.wid):
-                        continue
                     for attempt in range(4):
                         health(phase='captcha')
-                        binary = client.captcha()
+                        try:
+                            binary = client.captcha()
+                        except RemoteError as exc:
+                            diagnostic('captcha_error', wid=lecture.wid, reason=str(exc),
+                                       attempt=attempt + 1)
+                            raise
                         if recognize is None:
+                            started = clock()
                             import ddddocr
                             recognize = ddddocr.DdddOcr(show_ad=False).classification
+                            diagnostic('ocr_ready', duration_seconds=max(0, clock() - started))
                         code = recognize(binary).strip()
                         if not code or not code.isascii() or not code.isalnum() or len(code) > 16:
+                            diagnostic('ocr_invalid', wid=lecture.wid, attempt=attempt + 1)
                             if attempt == 3:
                                 task.data['cooldowns'][lecture.wid] = clock() + 300
                                 task.save()
+                                diagnostic('captcha_cooldown', wid=lecture.wid, seconds=300)
                             continue
                         # Persist before sending: a crash must recover by querying, never resubmitting.
                         task.data.update(status='pending', activity=lecture.wid)
                         task.save()
+                        unconfirmed_checks = 0
                         health(phase='submitting')
+                        submission_started = clock()
+                        diagnostic('submission_started', wid=lecture.wid, attempt=attempt + 1)
                         try:
                             reply = client.submit(lecture.wid, code)
                         except RemoteError as exc:
+                            diagnostic('submission_error', wid=lecture.wid, reason=str(exc),
+                                       duration_seconds=max(0, clock() - submission_started))
                             health(last_error=str(exc), last_error_at=clock())
                             if isinstance(exc, AuthenticationExpired):
                                 authenticated = False
-                            defer(max(20, exc.retry_after))
+                            defer(max(1, exc.retry_after) if opening_scan else max(20, exc.retry_after))
                             break
                         message = reply.get('msg', '')
                         captcha_wrong = (isinstance(message, str) and '验证码' in message
                                          and any(word in message for word in ('错误', '不正确', '失效', '过期')))
                         unavailable = isinstance(message, str) and message in ('已满', '名额已满', '不可预约', '预约已结束', '预约未开始')
+                        outcome = ('reported_success' if has_code(reply, 0) else 'captcha_wrong' if captcha_wrong
+                                   else 'unavailable' if unavailable else 'unconfirmed')
+                        diagnostic('submission_reply', wid=lecture.wid, outcome=outcome,
+                                   feedback=reply.get('feedback') if reply.get('feedback') in (
+                                       'unrecognized_message', 'no_message') else None,
+                                   http_status=reply.get('http_status') if type(reply.get('http_status')) is int
+                                       and 100 <= reply['http_status'] <= 599 else None,
+                                   duration_seconds=max(0, clock() - submission_started))
                         if (has_code(reply, 0) or type(reply.get('code')) is not int
                                 or not (captcha_wrong or unavailable)):
                             break
                         task.data.update(status='scanning', activity='')
                         if captcha_wrong and attempt == 3:
                             task.data['cooldowns'][lecture.wid] = clock() + 300
+                            diagnostic('captcha_cooldown', wid=lecture.wid, seconds=300)
                         task.save()
                         if unavailable:
                             break
                     if task.data['status'] == 'pending':
                         break
                 failures = 0
+                clear_alert('task_failed')
                 if task.data['status'] != 'pending':
-                    health(phase='waiting', next_check_at=clock() + 10, failure_count=0)
+                    elapsed = max(0, clock() - scan_started)
+                    delay, fast = scan_delay(details, clock(), elapsed, SCAN_INTERVAL)
+                    if (fast != opening_scan or fast or not last_timing_at
+                            or clock() - last_timing_at >= 300):
+                        diagnostic('scan_timing', mode='opening' if fast else 'normal',
+                                   duration_seconds=elapsed, wait_seconds=delay,
+                                   history_reused=not refresh_mine,
+                                   mine_seconds=mine_seconds, activities_seconds=activities_seconds)
+                    last_timing_at = clock()
+                    opening_scan = fast
+                    health(phase='waiting', next_check_at=clock() + delay, failure_count=0)
                     query_recovered()
-                    pause(10)
+                    pause(delay)
                 else:
                     health(phase='confirming', failure_count=0)
             except AuthenticationRejected:
                 raise
             except AuthenticationExpired:
+                history = None
                 authenticated = False
+                unconfirmed_checks = 0
                 failures += 1
+                query_failed(scan_started)
                 health(last_error='authentication_expired', last_error_at=clock(), failure_count=failures)
                 defer(min(300, 10 * 2 ** min(failures, 5)))
             except (RemoteError, ValueError) as exc:
-                failures += 1
+                history = None
+                unconfirmed_checks = 0
                 reason = str(exc)
                 safe_reason = reason if isinstance(exc, RemoteError) or reason in (
                     'attendance_result_pending', 'attendance_category_unknown',
                     'attendance_status_unknown', 'attendance_record_conflict') else 'invalid_activity_data'
                 record(safe_reason)
-                health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
-                retry = exc.retry_after if isinstance(exc, RemoteError) else 0
-                defer(max(retry, min(300, 10 * 2 ** min(failures, 5))))
+                query_failed(scan_started)
+                opening_scan = scan_delay(details, clock(), 0, SCAN_INTERVAL)[1]
+                quick = (opening_scan and authenticated and isinstance(exc, RemoteError)
+                         and reason in FAST_RETRY_REASONS and not exc.retry_after)
+                if quick:
+                    # Opening seconds are scarce: retry transient request failures without counting them.
+                    health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
+                    delay = 1
+                else:
+                    failures += 1
+                    health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
+                    retry = exc.retry_after if isinstance(exc, RemoteError) else 0
+                    delay = max(retry, min(300, 10 * 2 ** min(failures, 5)))
+                defer(delay)
     except (KeyboardInterrupt, EOFError):
         return 130
     except (AuthenticationRejected, RemoteError, ValueError, OSError) as exc:
         final_phase = 'failed'
         health(last_error=str(exc) if isinstance(exc, RemoteError) else 'configuration_or_state_invalid',
                last_error_at=clock())
-        details = ''
+        failure_details = ''
         if check_only:
             reason = str(exc) if isinstance(exc, RemoteError) else type(exc).__name__
-            details = f' stage={stage} reason={reason}'
+            failure_details = f' stage={stage} reason={reason}'
             if isinstance(exc, RemoteError) and exc.http_status is not None:
-                details += f' http_status={exc.http_status}'
+                failure_details += f' http_status={exc.http_status}'
             if isinstance(exc, RemoteError) and exc.host is not None:
-                details += f' host={exc.host}'
+                failure_details += f' host={exc.host}'
             if isinstance(exc, RemoteError) and exc.tls_reason is not None:
-                details += f' tls_reason={exc.tls_reason}'
+                failure_details += f' tls_reason={exc.tls_reason}'
             if isinstance(exc, RemoteError) and exc.proxy_used is not None:
-                details += f' proxy_used={str(exc.proxy_used).lower()}'
+                failure_details += f' proxy_used={str(exc.proxy_used).lower()}'
         if check_only:
-            print('event=task_failed' + details, flush=True)
+            print('event=task_failed' + failure_details, flush=True)
         elif isinstance(exc, AuthenticationRejected):
             record('task_failed')
         else:

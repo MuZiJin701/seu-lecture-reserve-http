@@ -38,26 +38,54 @@ def test_successful_scan_is_observable_while_running_and_after_stop(tmp_path, ca
     assert 'process_running=false' in capsys.readouterr().out
 
 
-def test_backoff_mail_failure_and_recovery_are_visible_without_repeated_notifications(tmp_path):
+def test_status_displays_health_and_selection_snapshot_fields(tmp_path, capsys):
     school = School()
-    school.query_statuses = [500, 500, 500, 200]
+    school.activities = [lecture(YYZT='未开放')]
+    assert execute(school, tmp_path, clock=lambda: 1000, notify=None) == 130
+    capsys.readouterr()
+    show_status(tmp_path)
+    output = capsys.readouterr().out
+    assert all(key in output for key in (
+        'status=scanning', 'process_running=false', 'phase=stopped', 'last_phase=stopped',
+        'updated_at=', 'last_query_at=', 'last_error_at=', 'next_check_at=', 'last_mail_at=',
+        'last_error=none', 'failure_count=0', 'mail_status=disabled',
+        'activity_count=1', 'candidate_count=0', 'last_mail_status=never',
+        'last_mail_error=none', 'last_mail_event=none', 'last_mail_duration_seconds=unknown',
+        'selection_updated_at=1970-01-01T08:16:40+08:00'))
+
+
+def test_query_failure_mail_failure_and_recovery_are_visible_without_repeats(tmp_path):
+    school = School()
+    school.query_statuses = [500] * 10
     states, messages = [], []
+    now = 1000.0
     def notify(event):
         messages.append(event)
         raise OSError('SECRET SMTP failure')
     def wait(seconds):
+        nonlocal now
         states.append(snapshot(tmp_path))
-        if len(states) == 4:
+        now += seconds
+        if len(states) == 5:
             raise KeyboardInterrupt
-    assert execute(school, tmp_path, notify=notify, sleep=wait, clock=lambda: 1000) == 130
-    assert messages == ['query_failure', 'query_recovered']
-    assert [entry['failure_count'] for entry in states] == [1, 2, 3, 0]
-    assert [entry['phase'] for entry in states] == ['backoff'] * 3 + ['waiting']
+    assert execute(school, tmp_path, notify=notify, sleep=wait, clock=lambda: now) == 130
+    assert messages == ['query_failure']
+    assert [entry['failure_count'] for entry in states] == [1, 2, 3, 4, 5]
+    assert [entry['phase'] for entry in states] == ['backoff'] * 5
     assert states[0]['last_query_at'] == 0
-    assert states[2]['mail_status'] == 'failed'
-    assert states[3]['last_query_at'] == 1000
-    assert states[3]['last_error'] == 'http_failure'
+    assert states[4]['mail_status'] == 'failed'
     assert 'SECRET' not in (tmp_path / 'task.json').read_text()
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    saved['retry_at'] = 0
+    (tmp_path / 'task.json').write_text(json.dumps(saved))
+    school.query_statuses = []
+    def stop(seconds):
+        raise KeyboardInterrupt
+    assert execute(school, tmp_path, notify=notify, sleep=stop, clock=lambda: now) == 130
+    assert messages == ['query_failure']
+    assert 'event=query_recovered' in (tmp_path / 'events.log').read_text()
+    recovered = snapshot(tmp_path)
+    assert recovered['last_query_at'] == now and recovered['phase'] == 'stopped'
 
 
 @pytest.mark.parametrize('error, event', [(OSError, 'task_failed'), (RuntimeError, 'unexpected_failure')])
@@ -113,22 +141,23 @@ def test_default_mailer_is_available_for_task_initialization_failure(tmp_path, m
     assert 'SECRET' not in messages[0].get_content()
 
 
-def test_each_distinct_unconfirmed_submission_can_notify(tmp_path):
+def test_unconfirmed_submissions_are_recorded_but_not_mailed(tmp_path):
     school = School()
     school.activities = [lecture('one'), lecture('two',
         KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00')]
     school.submit_replies = [{'code': -1}, {'code': -1}]
-    events, prompts = [], []
-    def prompt(label):
-        prompts.append(label)
-        if len(prompts) == 2:
-            raise KeyboardInterrupt
-        school.mine.append({**lecture('one'), 'HD_WID': 'one', 'YYZT': '已预约'})
-        return ''
-    assert execute(school, tmp_path, notify=events.append, prompt=prompt) == 130
-    assert events == ['reservation_unconfirmed', 'reservation_succeeded', 'reservation_unconfirmed']
+    events = []
+    assert execute(school, tmp_path, notify=events.append) == 130
+    assert events == []
+    assert school.submitted == ['one']
+    school.mine = [{**lecture('one'), 'HD_WID': 'one', 'YYZT': '已预约'}]
+    assert execute(school, tmp_path, notify=events.append) == 130
+    assert events == []
     assert school.submitted == ['one', 'two']
-    assert snapshot(tmp_path)['phase'] == 'manual_required'
+    log = (tmp_path / 'events.log').read_text()
+    assert log.count('event=reservation_unconfirmed') == 2
+    assert 'event=reservation_succeeded' in log
+    assert snapshot(tmp_path)['phase'] == 'stopped'
 
 
 def test_successful_pending_query_breaks_consecutive_failure_count(tmp_path):
@@ -149,10 +178,11 @@ def test_successful_pending_query_breaks_consecutive_failure_count(tmp_path):
         waits.append(seconds)
         if len(waits) == 3:
             raise KeyboardInterrupt
-    assert execute(school, tmp_path, notify=events.append, prompt=lambda _: '', sleep=wait) == 130
-    assert waits == [20, 40, 20]
-    assert events == ['reservation_unconfirmed']
-    assert snapshot(tmp_path)['failure_count'] == 1
+    assert execute(school, tmp_path, notify=events.append, sleep=wait) == 130
+    assert waits == [20, 40, 1]
+    assert events == []
+    assert 'event=reservation_unconfirmed' in (tmp_path / 'events.log').read_text()
+    assert snapshot(tmp_path)['failure_count'] == 0
 
 
 @pytest.mark.parametrize('changes', [

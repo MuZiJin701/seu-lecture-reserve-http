@@ -10,7 +10,7 @@
 | --- | --- |
 | `SEU_CARD_NUMBER` / `SEU_PASSWORD` | 学校一卡通号与密码 |
 | `SEU_PREFERRED_LECTURES` | 完整标题 JSON 数组；`[]` 不限标题，仍受其他条件约束 |
-| `SEU_REQUIRED_CATEGORIES` | 类别及顺序，默认心理、法律、艺术、其他四类，不能为空；不约沙龙 |
+| `SEU_REQUIRED_CATEGORIES` | 类别及顺序，默认心理、法律、艺术、其他与沙龙五类，不能为空；沙龙计入选听总场次 |
 | `SEU_PREFERRED_CAMPUS` | 允许的线下校区数组；`[]` 不约线下 |
 | `SEU_ENABLE_ONLINE` / `SEU_ENABLE_OFFLINE` | 允许线上／线下，仅接受 `true` 或 `false` |
 | `SEU_STATE_DIR` | 状态目录，默认 `state` |
@@ -72,7 +72,7 @@ uv run --locked main.py --test-mail
 
 ### 通知规则
 
-单场成功、目标完成、需要人工处理、持续故障及恢复时通知；每天北京时间 20:00 汇报。日报和告警跨重启去重，失败不自动补发，关闭程序后不再汇报。具体时机和间隔见[邮件与告警](requirements.md#邮件与告警)。邮件只有中文说明、安全汇总与数据时间，没有讲座详情或凭据。
+只提醒重大问题：需要人工认证、连续五分钟无法完成查询、任务异常退出。不发预约成功、目标完成、待确认、恢复通知和日报。同一未解决告警跨重启只尝试一次，失败不自动补发，恢复只记录不发送；关闭程序后不再发信。具体时机见[邮件与告警](requirements.md#邮件与告警)。邮件只有中文说明、安全汇总与数据时间，没有讲座详情或凭据。
 
 发信使用同步 SMTP，每次网络操作超时为二十秒，并非整封邮件总时限。通知失败不改变预约结果；可用状态中的发送耗时判断是否影响查询。SMTP 接受与真实送达分别验收。
 
@@ -162,7 +162,7 @@ PID 可能过期或被复用，不能只凭文件杀进程；没有 PID 文件�
 | `last_mail_event` / `last_mail_duration_seconds` | 通知事件及实际耗时；旧记录或未结束尝试显示未知耗时 |
 | `selection_updated_at` / `activity_details` | 最近私有筛选快照及时间，损坏详情显示 `unknown` |
 
-常见阶段为 `authentication`、`my_activities`、`activities`、`preflight`、`captcha`、`submitting`、`confirming`、`waiting`、`waiting_for_attendance`、`backoff`、`manual_required` 和 `failed`。
+常见阶段为 `authentication`、`my_activities`、`activities`、`captcha`、`submitting`、`confirming`、`waiting`、`waiting_for_attendance`、`backoff`、`manual_required` 和 `failed`。
 
 结合进程、阶段、成功查询及 `next_check_at` 判断进展：零候选且成功时间在更新，可能是未开放或被筛选，不代表提交链路通过。退避可受学校要求延长，邮件或网络操作也需等待，不能只按固定时长无更新判断退出。快照写入失败会记录 `health_write_failed`，此后旧时间不可作为新证据。
 
@@ -174,17 +174,20 @@ tail -n 20 state/events.log
 
 日志每行带 Unix 时间戳，旧错误仍保留；未记录过事件时文件可能不存在。启动署名不代表登录成功。后台启动、`--check` 和 `--test-mail` 展示一次维护者及项目链接，`--status` 和 `--help` 保持简洁。
 
+私有诊断另写在 `state/diagnostics.jsonl`：扫描节奏、筛选变化、验证码、提交与核对结果；字段仅含活动 ID、标题、固定原因、计数与耗时。诊断不进入终端、邮件或事件日志；`--check` 不写诊断，按需在本地排查时读取。
+
 ### 筛选原因
 
 `--check` 展示当前结果；`--status` 展示最近成功快照，可能因等待打卡、待确认或查询失败而陈旧。每场仅保留标题、首个原因及学校预约时间，时间以北京时间显示，未知为 `null`。不为诊断额外查询学校，逐场详情不进入邮件或事件日志。
 
 | 原因 | 含义 |
 | --- | --- |
-| `candidate` | 通过筛选，仍需资格检查和提交后确认 |
+| `candidate` | 通过筛选与名额判定，提交后按活动 ID 确认 |
 | `category_not_allowed` / `category_not_needed` | 类别未启用／当前目标不需要 |
 | `reservation_not_started` / `reservation_ended` | 预约尚未开始／已经结束 |
-| `capacity_full` / `not_reservable` | 显式状态为已满或不可约；真实名额以学校检查为准 |
+| `capacity_full` / `not_reservable` | 已约人数达到总人数或不可约；以学校接口响应为准 |
 | `already_reserved` | 列表或我的活动已有预约 |
+| `notice_test_only` | 系统测试、请勿预约或购票公告，不预约 |
 | `title_not_selected` | 完整标题不匹配 |
 | `online_disabled` / `offline_disabled` | 对应授课方式关闭 |
 | `campus_not_selected` | 线下校区未选择 |
@@ -202,7 +205,7 @@ tail -n 20 state/events.log
 | --- | --- |
 | `credentials_require_terminal` / `authentication_rejected` | 补齐凭据或核对账号状态，避免反复登录 |
 | `authentication_required` / `interactive_terminal_required` | 确认后台退出后前台处理短信或其他挑战 |
-| `activity_schema_unknown` / `preflight_response_unknown` | 目标数据或预约前检查格式变化，暂停提交并核实接口，不能当作零候选 |
+| `activity_schema_unknown` / `business_response_invalid` | 目标数据或活动列表响应格式变化，暂停提交并核实接口，不能当作零候选 |
 | `invalid_activity_data` / `attendance_category_unknown` / `attendance_status_unknown` / `attendance_record_conflict` | 已有记录不可靠，不删除状态或绕过校验 |
 | `attendance_result_pending` | 已结束记录尚无打卡或违约结论，等学校更新 |
 | `reservation_unconfirmed` | 先核对原活动，不切换候选或盲目重提 |
@@ -227,7 +230,7 @@ tail -n 20 state/events.log
 
 真实学校列表使用 `JZMC`、`JZXL_DISPLAY`、`JZDD`、`JZSJ`／`HDJSSJ`、`FBZT`、`YYKSSJ`／`YYJSSJ`。活动 ID 使用非空 `HD_WID` 或 `WID`，我的预约优先使用 `HD_WID`，不能拿预约记录自身 ID 替代。
 
-`FBZT='1'` 且在预约起止时刻之间才可成为候选，边界包含；`FBZT='-1'` 或已有 `YY_WID` 时排除。线上线下只接受标题开头的 `【线上】`／`【线下】`，不猜测 `SFKSYY`。学校前端还合并人数和预约信息，本项目用独立“我的活动”防重与冲突检查，资格和实时名额以预约前检查及最终确认裁定。
+`FBZT='1'`、预约起止时刻之间、且已约人数（`hdrsList` 的 `YYRS`）小于总人数（`HDZRS`）才可成为候选，边界包含；`FBZT='-1'`、已有 `YY_WID` 或已满员时排除。开放与结束按学校返回的服务器时间 `xtdqsj` 判定。线上线下只接受标题开头的 `【线上】`／`【线下】`，不猜测 `SFKSYY`。学校前端会合并人数和预约信息，本项目同样按 `HD_WID` 合并，并保留独立“我的活动”防重与冲突检查；资格和实时名额不依赖单独预检，以提交响应及最终确认裁定。
 
 兼容构造响应的 `HDMC`、`HDLX_DISPLAY`、布尔 `IS_ONLINE`、`YYZT`，时间兼容 `KSSJ`／`JSSJ`、`HDKSSJ`／`HDJSSJ`。时间格式为 `YYYY-MM-DD HH:MM:SS`、`YYYY-MM-DD HH:MM` 或 `YYYY/MM/DD/HH:MM:SS`，按 Asia/Shanghai 解释，主机应准确校时。
 
@@ -253,10 +256,12 @@ Python 3.12、uv 和锁文件是开发入口；OCR 使用 ddddocr 自带模型�
 | 项目 | 当前证据及边界 |
 | --- | --- |
 | 2026-10-19 本轮改造 | 完整离线测试 331 项通过、3 项因 Windows 平台限制跳过（两项 Unix 信号、一项打开文件替换）；mypy、锁文件及依赖检查通过。全部 11 份 Markdown、49 个本地链接及锚点、28 段 shell 语法、双语命令与启动顺序、隔离样例配置检查通过 |
+| 2026-10-25 真实预约链路 | 用 HTTP 版对购票公告（非目标、测试活动）真实提交成功（`addReservation.do` 返回 `code=0`，按 `HD_WID` 在“我的活动”确认），验证码 OCR 单次识别成功；随后 `deleteReservation.do` 取消并在“我的活动”复核消失。本机与服务器均完成该验证；另实测连续 5 次/秒、10 次/秒的活动列表只读查询未触发 429。目标系列讲座的真实预约与命中率仍待验证 |
+| 2026-10-25 第二批改造 | 诊断文件、A 版重大告警策略（无日报/无冷却）、健康快照、沙龙计入目标及测试/购票公告排除完成；离线测试 353 项通过、3 项平台限制跳过，mypy 通过；未部署、未提交 |
 | 既有离线基线 | 2026-10-18 的 `d3e2b7b` 记录完整 307 项测试及类型检查通过，覆盖提交确认、状态损坏、恢复通知与异常退避 |
 | 学校只读接入 | 历史版本已验证认证、活动和我的活动查询、验证码图片；2026-10-18 核对六条非空列表的真实字段与开放时间解析，没有据此确认预约成功 |
 | 邮件送达 | 2026-10-16 一封真实测试邮件被 SMTP 接受，用户确认收到；新增服务商和真实业务通知仍需各自验收 |
-| 待验证 | 真实预约与按 ID 确认、资格与名额、实际 OCR 准确率、短信端到端恢复、修复后跨天会话、Windows 真实接入及故障恢复 |
+| 待验证 | 目标系列讲座的真实预约与按 ID 确认、开抢期命中率、短信端到端恢复、修复后跨天会话、Windows 真实接入及故障恢复 |
 | 服务器长期运行 | 至少二十四小时观察，覆盖等待、网络恢复、重启；systemd 实机、SSH 断开及服务器重启后手动恢复仍待验证 |
 
-本轮未访问学校、提交预约、发信或部署；Windows 下的静态检查不作为 Ubuntu systemd 实机证据。参考项目的验收记录也不能代替本项目。历史 [Linux 截图](images/使用截图.png)和[宣传素材](promo/usage.md)保留旧 `nohup` 等行为，仅供追溯。
+2026-10-19 本轮未访问学校、提交预约、发信或部署；Windows 下的静态检查不作为 Ubuntu systemd 实机证据。参考项目的验收记录也不能代替本项目。历史 [Linux 截图](images/使用截图.png)和[宣传素材](promo/usage.md)保留旧 `nohup` 等行为，仅供追溯。

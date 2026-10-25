@@ -2,9 +2,10 @@ import json
 from urllib.parse import urlsplit
 
 import pytest
+import requests
 
 from seu_reserve.app import Settings
-from seu_reserve.model import SERIES_CATEGORIES, moment
+from seu_reserve.model import Lecture, SERIES_CATEGORIES, moment
 from test_app import School, execute, lecture
 
 
@@ -36,7 +37,8 @@ def test_native_open_activity_is_submitted_then_confirmed_by_activity_id(tmp_pat
     events = []
     assert execute(school, tmp_path, clock=lambda: OPEN, notify=events.append) == 130
     assert school.submitted == ['native']
-    assert events == ['reservation_succeeded']
+    assert events == []
+    assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
     saved = json.loads((tmp_path / 'task.json').read_text())
     assert saved['status'] == 'scanning' and not saved['activity']
 
@@ -65,7 +67,7 @@ def test_unknown_native_schema_alerts_even_before_opening(tmp_path, changes):
             raise KeyboardInterrupt
     assert execute(school, tmp_path, clock=lambda: OPEN - 1,
                    notify=events.append, sleep=wait) == 130
-    assert events == ['query_failure']
+    assert events == []
     assert school.submitted == []
     saved = json.loads((tmp_path / 'task.json').read_text())
     assert saved['health']['last_error'] == 'activity_schema_unknown'
@@ -90,7 +92,7 @@ def test_completely_unknown_schema_cannot_look_like_successful_empty_scan(tmp_pa
     ({'JZMC': '【线下】测试讲座', 'JZDD': '九龙湖校区报告厅'}, False),
     ({'FBZT': '-1'}, False),
     ({'YY_WID': 'existing-reservation'}, False),
-    ({'JZXL_DISPLAY': '“SEU咖啡间"系列沙龙活动'}, False),
+    ({'JZXL_DISPLAY': '“SEU咖啡间"系列沙龙活动'}, True),
 ])
 def test_native_fields_obey_existing_campus_and_goal_filters(tmp_path, changes, allowed):
     school = ActivitySchool()
@@ -115,3 +117,74 @@ def test_read_only_check_validates_native_schema_without_booking_or_state(tmp_pa
     assert execute(school, tmp_path, clock=lambda: OPEN - 1, check_only=True) == expected
     assert not school.submitted
     assert not (tmp_path / 'task.json').exists()
+
+
+@pytest.mark.parametrize('clock_now, server_now, available', [
+    (OPEN, '2029-12-31 18:59:59', False),
+    (OPEN, '2030-01-01 09:00:01', False),
+    (OPEN - 86400, '2030-01-01 08:00:00', True),
+])
+def test_server_clock_controls_native_availability(tmp_path, clock_now, server_now, available):
+    school = ActivitySchool()
+    school.activities = [activity()]
+    school.server_now = server_now
+    assert execute(school, tmp_path, clock=lambda: clock_now) == 130
+    assert school.submitted == (['native'] if available else [])
+
+
+@pytest.mark.parametrize('changes, expected', [
+    ({'YYRS': 30, 'HDZRS': '30'}, 'capacity_full'),
+    ({'YYRS': '29', 'HDZRS': 30}, 'candidate'),
+    ({'YYRS': 1, 'HDZRS': '30'}, 'candidate'),
+    ({}, 'candidate'),
+])
+def test_native_capacity_uses_joined_counts(changes, expected):
+    row = {**activity(**changes), '_SERVER_NOW': '2030-01-01 08:00:00'}
+    assert Lecture.read(row, now=OPEN).availability == expected
+
+
+def test_capacity_full_activity_is_skipped_for_next_candidate(tmp_path):
+    school = ActivitySchool()
+    school.activities = [activity('full'), activity('open')]
+    school.activities[0]['HDZRS'] = '30'
+    school.activities[1]['HDZRS'] = '30'
+    school.hdrs = [{'HD_WID': 'full', 'YYRS': '30'}, {'HD_WID': 'open', 'YYRS': 0}]
+    assert execute(school, tmp_path, clock=lambda: OPEN) == 130
+    assert school.submitted == ['open']
+
+
+def test_opening_network_failure_retries_after_one_second_without_counting(tmp_path):
+    school = ActivitySchool()
+    school.activities = [activity()]
+    assert execute(school, tmp_path, clock=lambda: OPEN - 31) == 130
+
+    class Flaky(ActivitySchool):
+        def request(self, method, url, **kwargs):
+            if url.endswith('queryActivityList.do'):
+                raise requests.ConnectionError('SECRET network failure')
+            return super().request(method, url, **kwargs)
+    flaky = Flaky()
+    flaky.activities = [activity()]
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        raise KeyboardInterrupt
+    assert execute(flaky, tmp_path, clock=lambda: OPEN - 30, sleep=stop) == 130
+    assert waits == [1]
+    assert json.loads((tmp_path / 'task.json').read_text())['health']['failure_count'] == 0
+
+
+def test_opening_scan_reuses_history_until_cache_expires(tmp_path):
+    school = ActivitySchool()
+    school.activities = [activity()]
+    assert execute(school, tmp_path, clock=lambda: OPEN - 31) == 130
+    school.server_now = '2029-12-31 18:00:00'
+    school.requests.clear()
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 3:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop) == 130
+    assert sum(url.endswith('queryMyActivityList.do') for _, url, _ in school.requests) == 1
+    assert waits == [0.25, 0.25, 0.25]

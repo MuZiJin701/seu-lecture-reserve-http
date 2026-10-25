@@ -43,7 +43,7 @@ def test_invalid_mail_history_is_rejected_without_overwriting_pending_task(tmp_p
     assert not school.requests and not task_running(tmp_path)
 
 
-def test_submit_timeout_does_not_announce_recovery_before_pending_query(tmp_path):
+def test_pending_timeout_waits_for_history_before_claiming_success(tmp_path):
     class RecoveringSchool(School):
         fail_history = True
         def request(self, method, url, **kwargs):
@@ -60,13 +60,23 @@ def test_submit_timeout_does_not_announce_recovery_before_pending_query(tmp_path
         if len(waits) == 5:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, notify=events.append, sleep=wait, clock=lambda: 1000) == 130
-    assert events == ['query_failure']
+    assert events == []
     assert school.submitted == ['one']
     assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'pending'
     school.fail_history = False
-    assert execute(school, tmp_path, notify=events.append, clock=lambda: 5000) == 130
-    assert events == ['query_failure', 'query_recovered', 'reservation_unconfirmed']
-    assert school.submitted == ['one']
+    school.submit_timeout = False
+    waits.clear()
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 2:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, notify=events.append, sleep=stop, clock=lambda: 5000) == 130
+    assert events == []
+    log = (tmp_path / 'events.log').read_text()
+    assert all(event in log for event in (
+        'event=reservation_unconfirmed', 'event=reservation_unconfirmed_released',
+        'event=reservation_succeeded'))
+    assert school.submitted == ['one', 'one']
 
 
 @pytest.mark.parametrize('field, value', [('retry_at', -1), ('retry_at', 1e20),

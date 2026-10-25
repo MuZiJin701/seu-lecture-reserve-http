@@ -18,7 +18,7 @@ def details(output):
 @pytest.mark.parametrize('excluded', [
     {'JZXL_DISPLAY': '通知公告'},
     {'JZXL_DISPLAY': SERIES_CATEGORIES[1]},
-    {'HDLX_DISPLAY': '“SEU咖啡间"系列沙龙活动', 'HDMC': 42, 'YYKSSJ': 'invalid'},
+    {'HDLX_DISPLAY': '通知公告', 'HDMC': 42, 'YYKSSJ': 'invalid'},
 ])
 @pytest.mark.parametrize('check_only', [False, True])
 def test_excluded_category_missing_fields_does_not_block_target_or_status(
@@ -56,7 +56,7 @@ def test_missing_invalid_or_target_category_still_requires_valid_lecture(
     ({}, {}, CLOSE + 1, 'reservation_ended'),
     ({'FBZT': '-1'}, {}, OPEN, 'not_reservable'),
     ({'YY_WID': 'existing'}, {}, OPEN, 'already_reserved'),
-    ({'JZXL_DISPLAY': '“SEU咖啡间"系列沙龙活动'}, {}, OPEN, 'category_not_allowed'),
+    ({'JZXL_DISPLAY': '通知公告'}, {}, OPEN, 'category_not_allowed'),
     ({}, {'titles': ('another title',)}, OPEN, 'title_not_selected'),
     ({}, {'online': False}, OPEN, 'online_disabled'),
     ({'JZMC': '【线下】测试讲座', 'JZDD': '无锡校区会议室'}, {'offline': False}, OPEN, 'offline_disabled'),
@@ -75,6 +75,7 @@ def test_read_only_diagnostics_match_actual_selection_without_side_effects(
     assert len(result) == 1 and result[0]['reason'] == reason
     assert result[0]['reservation_start'] == '2029-12-31T19:00:00+08:00'
     assert not tmp_path.joinpath('task.json').exists() and not events and not school.submitted
+    assert not tmp_path.joinpath('diagnostics.jsonl').exists()
     assert execute(school, tmp_path, settings=settings, clock=lambda: now) == 130
     assert not school.submitted
     assert json.loads((tmp_path / 'task.json').read_text())['selection']['activities'] == result
@@ -145,17 +146,21 @@ def test_completed_task_reopens_on_school_change_and_notifies_only_on_new_comple
     school.activities = [lecture('replacement', HDLX_DISPLAY=SERIES_CATEGORIES[3])]
     assert execute(school, tmp_path, notify=events.append) == 130
     assert school.submitted == ['replacement']
-    assert events == ['goal_completed', 'reservation_succeeded']
+    assert events == []
     school.mine[-1]['SFDK'] = '1'
     assert execute(school, tmp_path, notify=events.append) == 0
     for new_task in (False, True):
         assert execute(school, tmp_path, notify=events.append, new_task=new_task) == 0
-    assert events == ['goal_completed', 'reservation_succeeded', 'goal_completed']
+    assert events == []
+    log = (tmp_path / 'events.log').read_text()
+    assert log.count('event=goal_completed') == 2
+    assert log.count('event=reservation_succeeded') == 1
 
 
-@pytest.mark.parametrize('field, value', [('last_report_at', float('nan')), ('last_report_at', True),
-    ('last_query_alert_at', -1), ('alerts', []), ('alerts', {'query_failure': float('inf')}),
-    ('alerts', {'PRIVATE': 1000})])
+@pytest.mark.parametrize('field, value', [('query_failure_since', float('nan')),
+    ('query_failure_since', True), ('query_failure_since', -1),
+    ('alerts', []), ('alerts', {'query_failure': float('inf')}),
+    ('alerts', {'PRIVATE': 1000}), ('alerts', {'query_failure': -1})])
 def test_invalid_alert_metadata_does_not_overwrite_original_or_contact_school(tmp_path, field, value):
     school = School()
     assert execute(school, tmp_path) == 130
@@ -167,3 +172,82 @@ def test_invalid_alert_metadata_does_not_overwrite_original_or_contact_school(tm
     school.requests.clear()
     assert execute(school, tmp_path) == 1
     assert path.read_bytes() == original and not school.requests
+
+
+def diagnostics(tmp_path):
+    return [json.loads(line) for line in (tmp_path / 'diagnostics.jsonl').read_text().splitlines()]
+
+
+def test_diagnostics_record_scan_timing_once_and_selection_only_on_change(tmp_path, capsys):
+    school = School()
+    school.activities = [lecture(YYZT='未开放', HDMC='PRIVATE TITLE')]
+    now = 1000.0
+    waits = []
+    def wait(seconds):
+        nonlocal now
+        waits.append(seconds)
+        now += seconds
+        if len(waits) == 2:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=lambda: now, sleep=wait) == 130
+    lines = diagnostics(tmp_path)
+    timings = [line for line in lines if line['event'] == 'scan_timing']
+    assert len(timings) == 1
+    timing = timings[0]
+    assert timing['at'] == 1000 and timing['mode'] == 'normal'
+    assert timing['wait_seconds'] == 10 and timing['duration_seconds'] >= 0
+    assert timing['history_reused'] is False
+    assert sum(line['event'] == 'selection_changed' for line in lines) == 1
+    assert 'PRIVATE TITLE' not in capsys.readouterr().out
+    assert 'private title' in (tmp_path / 'diagnostics.jsonl').read_text().lower()
+    assert 'password' not in (tmp_path / 'diagnostics.jsonl').read_text().lower()
+
+
+def test_selection_change_is_not_duplicated_across_restart(tmp_path):
+    school = School()
+    school.activities = [lecture(YYZT='未开放')]
+    assert execute(school, tmp_path) == 130
+    assert execute(school, tmp_path) == 130
+    lines = diagnostics(tmp_path)
+    assert sum(line['event'] == 'selection_changed' for line in lines) == 1
+
+
+def test_pending_checks_release_and_submission_are_diagnosed(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    saved['retry_at'] = 0
+    (tmp_path / 'task.json').write_text(json.dumps(saved))
+    school.submit_timeout = False
+    waits = []
+    def wait(seconds):
+        waits.append(seconds)
+        if len(waits) == 2:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, sleep=wait, clock=lambda: 2000) == 130
+    lines = diagnostics(tmp_path)
+    checks = [line['checks'] for line in lines if line['event'] == 'reservation_checked']
+    assert checks == [1, 2]
+    assert any(line['event'] == 'reservation_unconfirmed_released' for line in lines)
+    errors = [line for line in lines if line['event'] == 'submission_error']
+    assert errors and errors[0]['wid'] == 'one' and errors[0]['reason'] == 'network_timeout'
+
+
+def test_ocr_failures_cooldown_and_submission_reply_are_diagnosed(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    assert execute(school, tmp_path, recognize=lambda _: '') == 130
+    lines = diagnostics(tmp_path)
+    assert sum(line['event'] == 'ocr_invalid' for line in lines) == 4
+    assert any(line['event'] == 'captcha_cooldown' and line['seconds'] == 300 for line in lines)
+    school = School()
+    school.activities = [lecture()]
+    school.submit_replies = [{'code': -1, 'msg': 'PRIVATE server text'}]
+    other = tmp_path / 'other'
+    assert execute(school, other) == 130
+    lines = diagnostics(other)
+    assert [line['outcome'] for line in lines if line['event'] == 'submission_reply'] == ['unconfirmed']
+    assert [line['attempt'] for line in lines if line['event'] == 'submission_started'] == [1]
+    assert 'PRIVATE' not in (other / 'diagnostics.jsonl').read_text()

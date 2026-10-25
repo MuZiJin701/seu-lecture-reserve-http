@@ -1,4 +1,5 @@
 import datetime
+import json
 import socket
 import ssl
 import threading
@@ -229,3 +230,68 @@ def test_fallback_requires_gateway_backup_and_initial_authentication(monkeypatch
             client.authenticate()
         assert len(calls) == 1
         assert session.get_adapter(GATEWAY + '/') is original
+
+
+class StubSession:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        response = requests.Response()
+        response.url = url
+        response.status_code = 200
+        response._content = json.dumps(self.payload).encode()
+        return response
+
+
+def stub_client(payload):
+    session = StubSession(payload)
+    return Client(session, {}, input, lambda _: None), session
+
+
+def test_activities_joins_reservation_counts_and_server_clock():
+    payload = {'code': 0, 'datas': {
+        'hdlbList': [{'WID': 'one', 'HDZRS': '30'}, {'WID': 'two', 'HDZRS': 30}, {'WID': 'three'}],
+        'hdrsList': [{'HD_WID': 'one', 'YYRS': 30}, {'HD_WID': 'two', 'YYRS': '29'},
+                     {'HD_WID': 42, 'YYRS': 1}],
+        'xtdqsj': '2030-01-01 08:00:00'}}
+    client, session = stub_client(payload)
+    rows = client.activities()
+    assert [row.get('YYRS') for row in rows] == [30, '29', None]
+    assert all(row['_SERVER_NOW'] == '2030-01-01 08:00:00' for row in rows)
+    assert rows[0]['HDZRS'] == '30'
+    method, url, kwargs = session.calls[0]
+    assert method == 'POST' and kwargs['data'] == {}
+    assert url.endswith('/modules/hdyy/queryActivityList.do')
+
+
+@pytest.mark.parametrize('payload, reason', [
+    ({'code': 0, 'datas': {'hdlbList': ['private row']}}, 'business_rows_invalid'),
+    ({'code': 1, 'datas': {'hdlbList': []}}, 'business_response_invalid'),
+    ({'code': 0, 'datas': {'hdlbList': [{'WID': 'one'}], 'total': 2}}, 'business_rows_incomplete'),
+])
+def test_activities_rejects_unusable_payloads(payload, reason):
+    client, _ = stub_client(payload)
+    with pytest.raises(RemoteError) as error:
+        client.activities()
+    assert str(error.value) == reason
+
+
+def test_cancel_posts_activity_id_and_returns_raw_business_reply():
+    client, session = stub_client({'code': 1, 'msg': 'PRIVATE server message'})
+    assert client.cancel('activity-one') == {'code': 1, 'msg': 'PRIVATE server message'}
+    method, url, kwargs = session.calls[0]
+    assert method == 'POST' and kwargs['data'] == {'wid': 'activity-one'}
+    assert url.endswith('/modules/hdyy/deleteReservation.do')
+
+
+def test_request_uses_configurable_timeout():
+    client, session = stub_client({'code': 0})
+    assert client.timeout == 10.0
+    client.request('GET', 'https://ehall.seu.edu.cn/modules/hdyy/vcode.do')
+    client.timeout = 3
+    client.request('GET', 'https://ehall.seu.edu.cn/modules/hdyy/vcode.do')
+    assert [call[2]['timeout'] for call in session.calls] == [10.0, 3]
+    assert all(call[2]['verify'] is True for call in session.calls)

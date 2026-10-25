@@ -11,7 +11,18 @@ SHANGHAI = ZoneInfo('Asia/Shanghai')
 SERIES_CATEGORIES = ('人文与科学素养系列讲座_心理健康', '人文与科学素养系列讲座_法律',
                      '人文与科学素养系列讲座-艺术类', '人文与科学素养系列讲座_其他')
 REQUIRED_CATEGORIES = SERIES_CATEGORIES[:3]
-COFFEE_CATEGORY = '“SEU咖啡间"系列沙龙活动'
+COFFEE_CATEGORY = '“SEU咖啡间”系列沙龙活动'
+GOAL_CATEGORIES = SERIES_CATEGORIES + (COFFEE_CATEGORY,)
+
+
+def category_name(value: Any) -> Any:
+    # The school response uses both ASCII and full-width closing quotes for the salon series.
+    return COFFEE_CATEGORY if value == '“SEU咖啡间"系列沙龙活动' else value
+
+
+def test_notice(row: dict[str, Any]) -> bool:
+    title = row.get('HDMC', row.get('JZMC'))
+    return isinstance(title, str) and any(word in title for word in ('系统测试', '请勿预约', '购票'))
 
 
 @dataclass(frozen=True)
@@ -28,7 +39,8 @@ class Progress:
         return {c for c in REQUIRED_CATEGORIES if not self.completed[c] + self.planned[c]}
 
     def needs(self, category: str) -> bool:
-        return (category in SERIES_CATEGORIES and (category in self.missing
+        category = category_name(category)
+        return (category in GOAL_CATEGORIES and (category in self.missing
                 or sum(self.completed.values()) + sum(self.planned.values()) + len(self.missing) < 8))
 
 
@@ -48,12 +60,12 @@ def progress(rows: list[dict[str, Any]], now: float) -> Progress:
             raise ValueError('publication_status_unknown')
         if not reserved(row) or row.get('FBZT') == '-1':
             continue
-        category = row.get('JZXL_DISPLAY', row.get('HDLX_DISPLAY'))
+        if test_notice(row):
+            continue
+        category = category_name(row.get('JZXL_DISPLAY', row.get('HDLX_DISPLAY')))
         if not isinstance(category, str) or not category:
             raise ValueError('attendance_category_unknown')
-        if category == COFFEE_CATEGORY:
-            continue
-        if category not in SERIES_CATEGORIES:
+        if category not in GOAL_CATEGORIES:
             raise ValueError('attendance_category_unknown')
         checked, breached = row.get('SFDK'), row.get('SFWY')
         if checked not in ('0', '1') or breached not in ('0', '1'):
@@ -104,6 +116,14 @@ def interval(row: dict[str, Any]) -> tuple[datetime, datetime]:
     return start, end
 
 
+def headcount(value: Any) -> int | None:
+    if type(value) is int:
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
 def reserved(row: dict[str, Any]) -> bool:
     # The school UI identifies my reservations by HD_WID and publication status.
     if 'YYZT' not in row and isinstance(row.get('HD_WID'), str) and row['HD_WID']:
@@ -136,7 +156,7 @@ class Lecture:
     def read(cls, row: dict[str, Any], *, now: float) -> 'Lecture':
         native = 'YYZT' not in row or any(key in row for key in ('JZMC', 'JZXL_DISPLAY', 'YYKSSJ', 'YYJSSJ'))
         title = row.get('JZMC' if native else 'HDMC')
-        category = row.get('JZXL_DISPLAY' if native else 'HDLX_DISPLAY')
+        category = category_name(row.get('JZXL_DISPLAY' if native else 'HDLX_DISPLAY'))
         location = row.get('JZDD')
         if not isinstance(title, str) or not title.strip() or not isinstance(category, str) or not category.strip():
             raise ValueError('lecture_schema_unknown')
@@ -153,11 +173,26 @@ class Lecture:
                 raise ValueError('lecture_schema_unknown') from None
             if closes <= opens or row.get('YY_WID') is not None and not isinstance(row['YY_WID'], str):
                 raise ValueError('lecture_schema_unknown')
-            # The school UI uses this window, not SFKSYY; preflight remains authoritative for availability.
-            availability = ('not_reservable' if row['FBZT'] != '1' else
-                            'already_reserved' if row.get('YY_WID') else
-                            'reservation_not_started' if now < opens.timestamp() else
-                            'reservation_ended' if now > closes.timestamp() else 'candidate')
+            # The school UI decides availability from the server clock and the joined head counts.
+            if row['FBZT'] != '1':
+                availability = 'not_reservable'
+            elif row.get('YY_WID'):
+                availability = 'already_reserved'
+            else:
+                server_now = row.get('_SERVER_NOW')
+                try:
+                    current = moment(server_now).timestamp() if server_now else now
+                except ValueError:
+                    raise ValueError('lecture_schema_unknown') from None
+                taken, capacity = headcount(row.get('YYRS')), headcount(row.get('HDZRS'))
+                if current < opens.timestamp():
+                    availability = 'reservation_not_started'
+                elif current > closes.timestamp():
+                    availability = 'reservation_ended'
+                elif taken is not None and capacity is not None and taken >= capacity:
+                    availability = 'capacity_full'
+                else:
+                    availability = 'candidate'
         else:
             explicit_online = row.get('IS_ONLINE')
             if not isinstance(explicit_online, bool) or row['YYZT'] not in (

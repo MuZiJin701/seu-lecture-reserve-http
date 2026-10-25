@@ -4,7 +4,7 @@
 
 A browser-free lecture reservation client for Linux servers, with foreground support on Windows. It polls for lectures, reads CAPTCHAs, submits reservations and checks the results.
 
-The fixed goal is **8 attended series lectures, including at least one each in law, art and mental health**. Once reservations cover the goal, it waits for attendance; it exits when attendance meets the goal. Salons are excluded. The university makes the final assessment.
+The fixed goal is **8 attended series lectures or salons, including at least one each in law, art and mental health**. Once reservations cover the goal, it waits for attendance; it exits when attendance meets the goal. Test activities and ticket notices are not reserved or counted. The university makes the final assessment.
 
 ## 1. Install
 
@@ -126,6 +126,6 @@ uv run --locked main.py --status
 
 The stopped service may be collected and reported as not found; task state and logs remain. Running the startup commands again resumes the task without cancelling reservations. If SMS or an uncertain result requires input, background operation saves the task and exits. Confirm it has exited, handle the prompt in the foreground, then resume background operation.
 
-This version has passed offline checks. Real reservations, SMS recovery and at least 24 hours of operation still require separate acceptance testing; see [acceptance boundaries](docs/usage.md#验收记录). [Business rules](docs/requirements.md) and the [usage guide](docs/usage.md) contain the details (Chinese).
+This version has passed offline checks. A real submit-and-cancel flow was verified on a test activity on 2026-10-25. Target-lecture hit rate, SMS recovery and at least 24 hours of operation still require separate acceptance testing; see [acceptance boundaries](docs/usage.md#验收记录). [Business rules](docs/requirements.md) and the [usage guide](docs/usage.md) contain the details (Chinese).
 
 Maintainer: [MuZiJin701](https://github.com/MuZiJin701) · [Browser version](https://github.com/MuZiJin701/seu_lecture_reserve) · [Historical promotional assets](docs/promo/usage.md)

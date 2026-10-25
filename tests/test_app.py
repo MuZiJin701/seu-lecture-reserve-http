@@ -9,7 +9,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from seu_reserve.app import Settings, run
+from seu_reserve.app import Settings, run, scan_delay
 from seu_reserve.model import moment
 
 
@@ -22,6 +22,8 @@ class School:
         self.requests = []
         self.activities = []
         self.mine = []
+        self.hdrs = []
+        self.server_now = None
         self.submitted = []
         self.submit_timeout = False
         self.query_statuses = []
@@ -69,11 +71,14 @@ class School:
         elif path.endswith('queryActivityList.do'):
             if self.query_statuses:
                 response.status_code = self.query_statuses.pop(0)
-            payload = {'code': 0, 'datas': {'hdlbList': self.activities}}
+            datas = {'hdlbList': self.activities}
+            if self.hdrs:
+                datas['hdrsList'] = self.hdrs
+            if self.server_now is not None:
+                datas['xtdqsj'] = self.server_now
+            payload = {'code': 0, 'datas': datas}
         elif path.endswith('queryMyActivityList.do'):
             payload = {'code': 0, 'datas': {'wdhdList': self.mine}}
-        elif path.endswith('appiontCheck.do'):
-            payload = {'code': 0}
         elif path.endswith('vcode.do'):
             import io
             from PIL import Image
@@ -172,7 +177,8 @@ def test_one_confirmed_reservation_continues_goal_and_restart_does_not_duplicate
     events = []
     assert execute(school, tmp_path, notify=events.append) == 130
     assert school.submitted == ['one']
-    assert events == ['reservation_succeeded']
+    assert events == []
+    assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
     assert execute(school, tmp_path, notify=events.append) == 130
     assert school.submitted == ['one']
 
@@ -255,18 +261,36 @@ def test_pending_submission_is_confirmed_by_school_activity_id_after_restart(tmp
     assert school.submitted == ['one']
 
 
-def test_query_failure_notification_is_deduplicated_and_resets_after_recovery(tmp_path):
+def test_query_failure_alerts_once_after_five_minutes_and_recovery_clears_it(tmp_path):
     school = School()
-    school.query_statuses = [500, 500, 500, 500, 200, 500, 500, 500]
+    school.activities = [lecture(YYZT='未开放')]
+    school.query_statuses = [500] * 30
     events, delays = [], []
+    now = 1000.0
     def wait(seconds):
+        nonlocal now
         delays.append(seconds)
-        if len(delays) == 8:
+        now += seconds
+        if len(delays) == 6:
             raise KeyboardInterrupt
-    assert execute(school, tmp_path, notify=events.append, sleep=wait) == 130
-    assert events == ['query_failure', 'query_recovered']
-    assert delays[:3] == [20, 40, 80]
-    assert delays[4] == 10
+    assert execute(school, tmp_path, notify=events.append, sleep=wait, clock=lambda: now) == 130
+    assert events == ['query_failure']
+    assert delays[:4] == [20, 40, 80, 160]
+    assert sum(delays[:4]) == 300
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert saved['query_failure_since'] == 1000 and 'query_failure' in saved['alerts']
+    saved['retry_at'] = 0
+    (tmp_path / 'task.json').write_text(json.dumps(saved))
+    school.query_statuses = []
+    delays.clear()
+    def stop(seconds):
+        delays.append(seconds)
+        raise KeyboardInterrupt
+    assert execute(school, tmp_path, notify=events.append, sleep=stop, clock=lambda: now) == 130
+    assert events == ['query_failure']
+    assert 'event=query_recovered' in (tmp_path / 'events.log').read_text()
+    recovered = json.loads((tmp_path / 'task.json').read_text())
+    assert 'query_failure_since' not in recovered and 'query_failure' not in recovered.get('alerts', {})
 
 
 def test_four_explicit_captcha_rejections_cool_down_first_candidate_and_try_next(tmp_path):
@@ -287,7 +311,7 @@ def test_unsupported_activity_schema_alerts_instead_of_looking_like_empty_list(t
         if len(waits) == 3:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, notify=events.append, sleep=stop_after_three) == 130
-    assert events == ['query_failure']
+    assert events == []
     assert school.submitted == []
 
 
@@ -358,7 +382,13 @@ def test_default_email_contains_only_event_and_mail_failure_does_not_repeat_book
             messages.append(message)
             raise OSError('SECRET mail password')
     monkeypatch.setattr('smtplib.SMTP_SSL', SMTP)
-    school = School()
+    class FailedAfterBooking(School):
+        fail_activities = True
+        def request(self, method, url, **kwargs):
+            if self.fail_activities and self.submitted and url.endswith('queryActivityList.do'):
+                raise OSError('SECRET disk or network failure')
+            return super().request(method, url, **kwargs)
+    school = FailedAfterBooking()
     school.activities = [lecture(HDMC='PRIVATE TITLE')]
     env = {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password',
            'SMTP_HOST': 'smtp.example.org', 'SMTP_PORT': '2465',
@@ -366,15 +396,16 @@ def test_default_email_contains_only_event_and_mail_failure_does_not_repeat_book
     if username:
         env.update(SMTP_USERNAME=username, SMTP_PASSWORD='private-mail-password')
     assert run(Settings(state_dir=tmp_path), session=school, environ=env,
-               recognize=lambda _: '1234', sleep=interrupted, clock=lambda: 1000) == 130
+               recognize=lambda _: '1234', sleep=interrupted, clock=lambda: 1000) == 1
     assert len(messages) == 1
     assert logins == ([(username, 'private-mail-password')] if username else [])
     assert messages[0]['From'] == 'sender@example.org'
     assert messages[0]['To'] == 'receiver@example.org'
-    assert 'reservation_succeeded' in messages[0].get_content()
+    assert 'task_failed' in messages[0].get_content()
     assert 'PRIVATE TITLE' not in messages[0].get_content()
     assert 'SECRET' not in capsys.readouterr().out
     assert 'event=notification_failed' in (tmp_path / 'events.log').read_text()
+    school.fail_activities = False
     assert execute(school, tmp_path) == 130
     assert school.submitted == ['one']
 
@@ -498,7 +529,8 @@ def test_sms_is_only_sent_on_user_command_and_challenge_email_is_not_repeated(tm
     events = []
     assert execute(school, tmp_path, prompt=lambda _: next(answers), notify=events.append) == 130
     assert school.sms_sends == 1
-    assert events == ['authentication_required', 'reservation_succeeded']
+    assert events == ['authentication_required']
+    assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
 
 
 def test_unknown_authentication_challenge_waits_without_business_requests(tmp_path):
@@ -607,7 +639,7 @@ def test_server_retry_after_is_respected(tmp_path):
     def stop(seconds):
         delays.append(seconds)
         raise KeyboardInterrupt
-    assert execute(LimitedSchool(), tmp_path, sleep=stop) == 130
+    assert execute(LimitedSchool(), tmp_path, sleep=stop, notify=None) == 130
     assert delays == [600]
 
 
@@ -616,7 +648,8 @@ def test_explicit_bad_credentials_stop_without_repeated_login(tmp_path):
     school.login_reply = {'code': 500, 'info': '用户名或密码错误'}
     events = []
     assert execute(school, tmp_path, notify=events.append) == 1
-    assert events == ['authentication_rejected']
+    assert events == []
+    assert 'event=authentication_rejected' in (tmp_path / 'events.log').read_text()
     assert len([url for method, url, _ in school.requests if method == 'POST' and url.endswith('casLogin')]) == 1
 
 
@@ -696,14 +729,14 @@ def test_large_recoverable_state_does_not_block_restart(tmp_path):
     assert school.submitted == ['one']
 
 
-def test_persistent_preflight_failure_backs_off_and_notifies(tmp_path):
-    class FailedPreflight(School):
+def test_persistent_activity_query_failure_backs_off_and_notifies(tmp_path):
+    class FailedActivities(School):
         def request(self, method, url, **kwargs):
             response = super().request(method, url, **kwargs)
-            if url.endswith('appiontCheck.do'):
+            if url.endswith('queryActivityList.do'):
                 response.status_code = 500
             return response
-    school = FailedPreflight()
+    school = FailedActivities()
     school.activities = [lecture()]
     delays, events = [], []
     def stop(seconds):
@@ -712,4 +745,41 @@ def test_persistent_preflight_failure_backs_off_and_notifies(tmp_path):
             raise KeyboardInterrupt
     assert execute(school, tmp_path, sleep=stop, notify=events.append) == 130
     assert delays == [20, 40, 80]
-    assert events == ['query_failure']
+    assert events == []
+
+
+def test_scan_delay_uses_quarter_second_window_and_next_opening_boundary():
+    start = moment('2030-01-01 10:00:00').timestamp()
+    details = [dict(title='讲座', reason='reservation_not_started',
+                    reservation_start='2030-01-01T10:00:00+08:00',
+                    reservation_end='2030-01-01T12:00:00+08:00')]
+    assert scan_delay(details, start - 100, 0, 10) == (10, False)
+    assert scan_delay(details, start - 31, 0.2, 10) == (1, False)
+    assert scan_delay(details, start - 30, 0, 10) == (0.25, True)
+    assert scan_delay(details, start + 10, 0.4, 10) == (0, True)
+    assert scan_delay(details, start + 599, 2, 10) == (0, True)
+    assert scan_delay(details, start + 601, 0, 10) == (10, False)
+    assert scan_delay([], start, 0, 10) == (10, False)
+
+
+def test_pending_miss_twice_releases_and_rescans(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == ['one']
+    school.submit_timeout = False
+    waits, events = [], []
+    later = moment('2026-10-18 12:05:00').timestamp()
+    def wait(seconds):
+        waits.append(seconds)
+        if len(waits) == 2:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, sleep=wait, notify=events.append, clock=lambda: later) == 130
+    assert waits == [1, 10]
+    assert school.submitted == ['one', 'one']
+    assert events == []
+    events_log = (tmp_path / 'events.log').read_text()
+    assert all(event in events_log for event in (
+        'event=reservation_unconfirmed', 'event=reservation_unconfirmed_released',
+        'event=reservation_succeeded'))

@@ -3,6 +3,7 @@
 import hashlib
 import errno
 import json
+import math
 import os
 import stat
 import sys
@@ -88,10 +89,14 @@ class Task:
                     raise ValueError('state_invalid')
                 alerts = data.get('alerts', {})
                 if (not isinstance(alerts, dict)
-                        or any(key not in ('query_failure', 'authentication_required', 'reservation_unconfirmed')
-                               for key in alerts)
-                        or any(type(value) not in (int, float) or not 0 <= value <= 253402214400 for value in (
-                                   data.get('last_report_at', 0), data.get('last_query_alert_at', 0), *alerts.values()))):
+                        or any(key not in ('query_failure', 'authentication_required', 'task_failed',
+                                           'reservation_unconfirmed') for key in alerts)
+                        or any(type(value) not in (int, float) or not math.isfinite(value)
+                               or not 0 <= value <= 253402214400 for value in alerts.values())):
+                    raise ValueError('state_invalid')
+                since = data.get('query_failure_since')
+                if since is not None and (type(since) not in (int, float) or not math.isfinite(since)
+                                          or not 0 <= since <= 253402214400):
                     raise ValueError('state_invalid')
                 if username and account != data['account']:
                     raise ValueError('state_account_mismatch')

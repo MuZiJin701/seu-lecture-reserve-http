@@ -40,6 +40,7 @@ def show_status(directory: Path) -> None:
     running = task_running(directory)
     print('process_running=' + str(running).lower())
     snapshot = saved.get('health')
+    # 'preflight' stays accepted for state files written before the pre-check was removed.
     phases = {'starting', 'authentication', 'my_activities', 'activities', 'preflight', 'captcha',
               'submitting', 'confirming', 'waiting', 'waiting_for_attendance', 'manual_required',
               'backoff', 'done', 'stopped', 'failed'}
@@ -74,6 +75,7 @@ def show_status(directory: Path) -> None:
         print(key + '=' + (str(history[key]) if history[key] is not None else 'unknown'))
     selection = saved.get('selection')
     if selection is None:
+        print('selection_updated_at=unknown')
         return
     if (not isinstance(selection, dict) or type(selection.get('updated_at')) not in (int, float)
             or not 0 <= selection['updated_at'] <= 253402214400
@@ -84,6 +86,7 @@ def show_status(directory: Path) -> None:
                           or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+08:00', item[key]))
                           for key in ('reservation_start', 'reservation_end'))
                    for item in selection['activities'])):
+        print('selection_updated_at=unknown')
         print('activity_details=unknown')
         return
     print('selection_updated_at=' + datetime.fromtimestamp(selection['updated_at'], SHANGHAI).isoformat(timespec='seconds'))

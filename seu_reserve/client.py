@@ -93,6 +93,7 @@ class Client:
         self.environ = environ
         self.prompt = prompt
         self.notify = notify
+        self.timeout = 10.0
         address = environ.get('SEU_VPN_IP', '').strip()
         self.gateway_adapter = GatewayIPAdapter(address) if address else None
         self.initial_authentication = True
@@ -109,7 +110,7 @@ class Client:
         # CAS rejects the default python-requests user agent with HTTP 403.
         headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64)', **kwargs.pop('headers', {})}
         try:
-            response = self.session.request(method, url, timeout=25, allow_redirects=False,
+            response = self.session.request(method, url, timeout=self.timeout, allow_redirects=False,
                                             verify=True, headers=headers, **kwargs)
         except requests.exceptions.SSLError as exc:
             failure = RemoteError('tls_failure')
@@ -312,8 +313,7 @@ class Client:
             raise AuthenticationExpired('business_authentication_expired', http_status=response.status_code)
         return self.payload(response)
 
-    def rows(self, endpoint: str, field: str, data: dict[str, str]) -> list[dict[str, Any]]:
-        payload = self.business(endpoint, data=data)
+    def dataset(self, payload: dict[str, Any], field: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         datas = payload.get('datas')
         if not has_code(payload, 0) or not isinstance(datas, dict) or not isinstance(datas.get(field), list):
             raise RemoteError('business_response_invalid')
@@ -324,22 +324,40 @@ class Client:
             for key in ('total', 'totalSize', 'totalCount'):
                 if key in source and (type(source[key]) is not int or source[key] != len(rows)):
                     raise RemoteError('business_rows_incomplete')
+        return datas, rows
+
+    def rows(self, endpoint: str, field: str, data: dict[str, str]) -> list[dict[str, Any]]:
+        payload = self.business(endpoint, data=data)
+        _, rows = self.dataset(payload, field)
         return rows
 
     def activities(self) -> list[dict[str, Any]]:
-        return self.rows('queryActivityList.do', 'hdlbList', {})
+        payload = self.business('queryActivityList.do', data={})
+        datas, rows = self.dataset(payload, 'hdlbList')
+        # The school UI joins these per-activity reservation counts into the activity list.
+        counts: dict[str, Any] = {}
+        hdrs = datas.get('hdrsList')
+        if isinstance(hdrs, list):
+            for item in hdrs:
+                if isinstance(item, dict) and isinstance(item.get('HD_WID'), str):
+                    counts[item['HD_WID']] = item.get('YYRS')
+        server_now = datas.get('xtdqsj')
+        merged: list[dict[str, Any]] = []
+        for row in rows:
+            activity = dict(row, _SERVER_NOW=server_now)
+            for key in ('HD_WID', 'WID'):
+                identifier = activity.get(key)
+                if isinstance(identifier, str) and identifier in counts:
+                    activity['YYRS'] = counts[identifier]
+                    break
+            merged.append(activity)
+        return merged
 
     def mine(self) -> list[dict[str, Any]]:
         return self.rows('queryMyActivityList.do', 'wdhdList', {'param': '{}'})
 
-    def preflight(self, wid: str) -> bool:
-        reply = self.business('appiontCheck.do', method='GET', params={'wid': wid})
-        if has_code(reply, 0):
-            return True
-        if type(reply.get('code')) is int and reply.get('msg') in (
-                '已满', '名额已满', '不可预约', '预约已结束', '预约未开始', '已预约'):
-            return False
-        raise RemoteError('preflight_response_unknown')
+    def cancel(self, wid: str) -> dict[str, Any]:
+        return self.business('deleteReservation.do', data={'wid': wid})
 
     def captcha(self) -> bytes:
         from io import BytesIO

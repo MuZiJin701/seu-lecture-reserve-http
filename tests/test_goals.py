@@ -1,9 +1,11 @@
 import hashlib
 import json
+from collections import Counter
 
 import pytest
 
-from seu_reserve.model import SERIES_CATEGORIES, progress
+from seu_reserve.model import (COFFEE_CATEGORY, GOAL_CATEGORIES, SERIES_CATEGORIES, Progress,
+                               category_name, progress, test_notice as is_test_notice)
 from test_app import School, execute, lecture
 
 
@@ -22,15 +24,16 @@ def test_only_eight_attended_with_all_required_categories_complete_goal(tmp_path
     school.mine = attended()
     events = []
     assert execute(school, tmp_path, notify=events.append) == 0
-    assert events == ['goal_completed']
+    assert events == []
     saved = json.loads((tmp_path / 'task.json').read_text())
     assert saved['version'] == 2 and saved['status'] == 'done'
     assert not saved['activity']
+    assert 'event=goal_completed' in (tmp_path / 'events.log').read_text()
     requests_before_restart = len(school.requests)
     assert execute(school, tmp_path, notify=events.append) == 0
     assert len(school.requests) > requests_before_restart
     assert execute(school, tmp_path, new_task=True, notify=events.append) == 0
-    assert events == ['goal_completed']
+    assert events == []
     assert not school.submitted
 
 
@@ -97,15 +100,40 @@ def test_eight_attended_without_art_still_books_art(tmp_path):
     assert school.submitted == ['needed-art']
 
 
-def test_coffee_is_excluded_even_with_legacy_explicit_configuration(tmp_path):
+def test_salon_counts_toward_goal_and_both_quote_variants_match(tmp_path):
     from seu_reserve.app import Settings
-    coffee = '“SEU咖啡间"系列沙龙活动'
+    coffee_ascii = '“SEU咖啡间"系列沙龙活动'
+    assert category_name(coffee_ascii) == COFFEE_CATEGORY
+    assert category_name(COFFEE_CATEGORY) == COFFEE_CATEGORY
+    assert COFFEE_CATEGORY in GOAL_CATEGORIES
     school = School()
-    school.activities = [lecture(HDLX_DISPLAY=coffee)]
-    assert execute(school, tmp_path, settings=Settings(state_dir=tmp_path, categories=(coffee,))) == 130
+    school.activities = [lecture(HDLX_DISPLAY=coffee_ascii)]
+    assert execute(school, tmp_path, settings=Settings(state_dir=tmp_path, categories=GOAL_CATEGORIES)) == 130
+    assert school.submitted == ['one']
+    school.mine = attended(7) + [lecture('coffee-history', YYZT='已预约', SFDK='1',
+                                        HDLX_DISPLAY=coffee_ascii)]
+    assert progress(school.mine, 0).done
+
+
+def test_salon_uses_goal_gap_but_never_displaces_missing_required_category():
+    covered = Counter({PSYCHOLOGY: 3, LAW: 2, ART: 1, OTHER: 1})
+    assert sum(covered.values()) == 7 and Progress(covered, Counter()).needs(COFFEE_CATEGORY)
+    missing_art = Counter({PSYCHOLOGY: 3, LAW: 2, OTHER: 2})
+    assert not Progress(missing_art, Counter()).needs(COFFEE_CATEGORY)
+    assert Progress(missing_art, Counter()).needs(ART)
+
+
+@pytest.mark.parametrize('title', ['系统测试讲座', '请勿预约', '购票公告'])
+def test_notice_titles_are_excluded_from_progress_and_selection(tmp_path, title):
+    row = lecture('notice', YYZT='已预约', SFDK='1', HDLX_DISPLAY=COFFEE_CATEGORY, HDMC=title)
+    assert is_test_notice(row)
+    assert not progress(attended(7) + [row], 0).done
+    school = School()
+    school.activities = [lecture('notice-activity', HDLX_DISPLAY=COFFEE_CATEGORY, HDMC=title)]
+    assert execute(school, tmp_path) == 130
     assert not school.submitted
-    school.mine = attended(7) + [lecture('coffee-history', YYZT='已预约', SFDK='1', HDLX_DISPLAY=coffee)]
-    assert not progress(school.mine, 0).done
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert saved['selection']['activities'][0]['reason'] == 'notice_test_only'
 
 
 def test_real_school_fields_are_counted_and_duplicates_are_not():

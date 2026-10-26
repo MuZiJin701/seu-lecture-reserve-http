@@ -72,7 +72,7 @@ uv run --locked main.py --test-mail
 
 ### 通知规则
 
-只提醒重大问题：需要人工认证、连续五分钟无法完成查询、任务异常退出。不发预约成功、目标完成、待确认、恢复通知和日报。同一未解决告警跨重启只尝试一次，失败不自动补发，恢复只记录不发送；关闭程序后不再发信。具体时机见[邮件与告警](requirements.md#邮件与告警)。邮件只有中文说明、安全汇总与数据时间，没有讲座详情或凭据。
+只提醒重大问题：需要人工认证、连续五分钟无法完成查询、任务异常退出。不发预约成功、目标完成、待确认、恢复通知和日报。开抢窗口内出现的持续查询失败告警延后到窗口结束再发送，期间恢复则不再发送。同一未解决告警跨重启只尝试一次，失败不自动补发，恢复只记录不发送；关闭程序后不再发信。具体时机见[邮件与告警](requirements.md#邮件与告警)。邮件只有中文说明、安全汇总与数据时间，没有讲座详情或凭据。
 
 发信使用同步 SMTP，每次网络操作超时为二十秒，并非整封邮件总时限。通知失败不改变预约结果；可用状态中的发送耗时判断是否影响查询。SMTP 接受与真实送达分别验收。
 
@@ -174,7 +174,7 @@ tail -n 20 state/events.log
 
 日志每行带 Unix 时间戳，旧错误仍保留；未记录过事件时文件可能不存在。启动署名不代表登录成功。后台启动、`--check` 和 `--test-mail` 展示一次维护者及项目链接，`--status` 和 `--help` 保持简洁。
 
-私有诊断另写在 `state/diagnostics.jsonl`：扫描节奏、筛选变化、验证码、提交与核对结果；字段仅含活动 ID、标题、固定原因、计数与耗时。诊断不进入终端、邮件或事件日志；`--check` 不写诊断，按需在本地排查时读取。
+私有诊断另写在 `state/diagnostics.jsonl`：扫描节奏、筛选变化、候选复核、验证码、提交与核对结果；字段仅含活动 ID、标题、固定原因、计数与耗时。诊断不进入终端、邮件或事件日志；`--check` 不写诊断，按需在本地排查时读取。
 
 ### 筛选原因
 
@@ -208,8 +208,9 @@ tail -n 20 state/events.log
 | `activity_schema_unknown` / `business_response_invalid` | 目标数据或活动列表响应格式变化，暂停提交并核实接口，不能当作零候选 |
 | `invalid_activity_data` / `attendance_category_unknown` / `attendance_status_unknown` / `attendance_record_conflict` | 已有记录不可靠，不删除状态或绕过校验 |
 | `attendance_result_pending` | 已结束记录尚无打卡或违约结论，等学校更新 |
-| `reservation_unconfirmed` | 持续多次核对原活动；约十秒仍未确认时刷新我的活动、重查冲突后自动释放并继续其他场次（不发邮件） |
+| `reservation_unconfirmed` | 持续多次核对原活动；约八秒仍未确认时刷新我的活动、重查冲突后自动释放并继续其他场次（不发邮件） |
 | `query_failure` / `query_recovered` | 持续故障／完整查询恢复；恢复不等于预约成功 |
+| `notification_deferred` / `notification_skipped_recovered` | 开抢窗口内查询失败告警延后；窗口结束前恢复则跳过，不重复发送 |
 | `reservation_succeeded` / `goal_completed` | 已按 ID 确认一场／实际选听目标达标 |
 | `task_failed` / `unexpected_failure` | 可捕获异常退出，检查本地错误和服务日志后恢复 |
 | `mail_configuration_invalid` / `notification_failed` | 核对邮件字段或下表错误分类，业务结果不受发信失败影响 |

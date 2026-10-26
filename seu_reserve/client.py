@@ -122,9 +122,24 @@ class Client:
             raise RemoteError('unexpected_origin')
         # CAS rejects the default python-requests user agent with HTTP 403.
         headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64)', **kwargs.pop('headers', {})}
+        deadline = time.monotonic() + float(self.timeout)
         try:
             response = self.session.request(method, url, timeout=self.timeout, allow_redirects=False,
-                                            verify=True, headers=headers, **kwargs)
+                                            verify=True, headers=headers, stream=True, **kwargs)
+            if getattr(response, 'raw', None) is not None:
+                # A single Requests/urllib3 timeout is reset between reads; stream the body and
+                # enforce a real wall-clock deadline so a slow-drip response cannot block the
+                # synchronous scan indefinitely.
+                chunks: list[bytes] = []
+                for chunk in response.iter_content(chunk_size=1):
+                    if time.monotonic() > deadline:
+                        response.close()
+                        raise RemoteError('network_timeout')
+                    if chunk:
+                        chunks.append(chunk)
+                response._content = b''.join(chunks)
+                response._content_consumed = True
+                response.close()
         except requests.exceptions.SSLError as exc:
             failure = RemoteError('tls_failure')
             failure.host = parsed.hostname

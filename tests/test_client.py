@@ -3,6 +3,7 @@ import json
 import socket
 import ssl
 import threading
+import time
 from http.client import RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -172,6 +173,27 @@ def test_initial_gateway_connection_failure_switches_only_gateway_once(monkeypat
         with pytest.raises(RemoteError):
             client.authenticate()
         assert adapters == [original, adapters[1], adapters[1]]
+
+
+def test_total_deadline_interrupts_a_slow_drip_response():
+    class SlowResponse:
+        raw = object()
+        closed = False
+        def iter_content(self, chunk_size):
+            for _ in range(100):
+                time.sleep(0.02)
+                yield b'x'
+        def close(self):
+            self.closed = True
+    class SlowSession:
+        response = SlowResponse()
+        def request(self, method, url, **kwargs):
+            return self.response
+    client = Client(SlowSession(), {}, input, lambda _: None)
+    client.timeout = 0.05
+    with pytest.raises(RemoteError, match='network_timeout'):
+        client.request('GET', 'https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do')
+    assert SlowSession.response.closed
 
 
 @pytest.mark.parametrize('failure', [

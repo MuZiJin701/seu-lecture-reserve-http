@@ -70,7 +70,8 @@ class Settings:
 
 def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: Progress,
                       mine: list[dict[str, Any]], cooldowns: Mapping[str, float],
-                      now: float) -> tuple[list[Lecture], list[dict[str, Any]]]:
+                      now: float, *, cooldown_clock_known: bool = True
+                      ) -> tuple[list[Lecture], list[dict[str, Any]]]:
     booked = {activity_id(row) for row in mine if reserved(row)}
     conflicts = [interval(row) for row in mine if reserved(row)]
     candidates: list[Lecture] = []
@@ -129,7 +130,7 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
             reason = 'campus_not_selected'
         elif any(lecture.start <= end and lecture.end >= start for start, end in conflicts):
             reason = 'time_conflict'
-        elif cooldowns.get(lecture.wid, 0) > now:
+        elif lecture.wid in cooldowns and (not cooldown_clock_known or cooldowns[lecture.wid] > now):
             reason = 'cooldown'
         else:
             reason = 'candidate'
@@ -563,7 +564,8 @@ def run(settings: Settings, *, session: Any = None,
                     pause(10)
                     continue
                 candidates, details = select_candidates(rows, settings, current, history,
-                                                        task.data['cooldowns'], clock() + server_offset)
+                    task.data['cooldowns'], clock() + server_offset,
+                    cooldown_clock_known=offset_known)
                 query_recovered()
                 opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL)[1]
                 mail_blocked = opening_scan
@@ -603,10 +605,13 @@ def run(settings: Settings, *, session: Any = None,
                             # The list-to-captcha path was slow; spent seats may already be gone, so
                             # re-check the candidate before spending a submission on it.
                             rechecked_rows = client.activities()
-                            server_offset = school_clock_offset(rechecked_rows, clock())
+                            if school_clock_known(rechecked_rows, clock()):
+                                server_offset = school_clock_offset(rechecked_rows, clock())
+                                offset_known = True
                             rechecked, _ = select_candidates(
                                 rechecked_rows, settings, current, history,
-                                task.data['cooldowns'], clock() + server_offset)
+                                task.data['cooldowns'], clock() + server_offset,
+                                cooldown_clock_known=offset_known)
                             if not any(item.wid == lecture.wid for item in rechecked):
                                 diagnostic('candidate_revalidated', wid=lecture.wid, outcome='unavailable')
                                 stale_candidate = True

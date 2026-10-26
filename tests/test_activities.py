@@ -344,3 +344,63 @@ def test_cooldown_survives_restart_before_clock_calibration(tmp_path):
     waits.clear()
     assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop, recognize=lambda _: '') == 130
     assert sum(url.endswith('vcode.do') for _, url, _ in school.requests) == 0
+
+
+def test_cooldown_waits_for_clock_after_restart_then_expires(tmp_path):
+    school = ActivitySchool()
+    school.activities = [activity()]
+    school.server_now = '2029-12-31 19:00:00'
+    now = [OPEN + 600]
+    options = dict(clock=lambda: now[0], sleep=interrupted, recognize=lambda _: '')
+    assert execute(school, tmp_path, **options) == 130
+    deadline = json.loads((tmp_path / 'task.json').read_text())['cooldowns']['native']
+    assert deadline == OPEN + 300
+
+    school.requests.clear()
+    school.server_now = None
+    assert execute(school, tmp_path, **options) == 130
+    assert not any(url.endswith('vcode.do') for _, url, _ in school.requests)
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert saved['cooldowns']['native'] == deadline
+    assert saved['selection']['activities'][0]['reason'] == 'cooldown'
+
+    school.server_now = '2029-12-31 19:05:01'
+    now[0] += 301
+    assert execute(school, tmp_path, **options) == 130
+    assert sum(url.endswith('vcode.do') for _, url, _ in school.requests) == 4
+
+
+@pytest.mark.parametrize('slow_path', [False, True])
+def test_missing_clock_keeps_calibration_for_candidate_and_cooldown(tmp_path, slow_path):
+    class MissingClockSchool(ActivitySchool):
+        lists = 0
+        def request(self, method, url, **kwargs):
+            if url.endswith('queryActivityList.do'):
+                self.lists += 1
+                if self.lists > 1:
+                    self.server_now = None
+            return super().request(method, url, **kwargs)
+
+    school = MissingClockSchool()
+    school.activities = [activity(YYJSSJ='2029-12-31 19:05:00')]
+    school.server_now = '2029-12-31 19:00:00'
+    now = [OPEN + 600]
+    def recognize(_):
+        if slow_path:
+            now[0] += CANDIDATE_REVALIDATE_SECONDS + 1
+            return '1234'
+        return ''
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 2:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=lambda: now[0], sleep=stop,
+                   recognize=recognize) == 130
+    if slow_path:
+        assert school.submitted == ['native']
+        assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
+    else:
+        assert sum(url.endswith('vcode.do') for _, url, _ in school.requests) == 4
+        saved = json.loads((tmp_path / 'task.json').read_text())
+        assert saved['selection']['activities'][0]['reason'] == 'cooldown'

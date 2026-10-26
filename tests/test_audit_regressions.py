@@ -53,7 +53,7 @@ def test_unavailable_message_variants_do_not_stay_pending(tmp_path, message):
     assert saved['status'] == 'scanning' and not saved['activity']
 
 
-def test_pending_timeout_waits_for_history_before_claiming_success(tmp_path):
+def test_pending_timeout_never_resubmits_without_confirmation(tmp_path):
     class RecoveringSchool(School):
         fail_history = True
         def request(self, method, url, **kwargs):
@@ -83,10 +83,11 @@ def test_pending_timeout_waits_for_history_before_claiming_success(tmp_path):
     assert execute(school, tmp_path, notify=events.append, sleep=stop, clock=lambda: 5000) == 130
     assert events == []
     log = (tmp_path / 'events.log').read_text()
-    assert all(event in log for event in (
-        'event=reservation_unconfirmed', 'event=reservation_unconfirmed_released',
-        'event=reservation_succeeded'))
-    assert school.submitted == ['one', 'one']
+    assert 'event=reservation_unconfirmed' in log
+    assert 'event=reservation_unconfirmed_released' not in log
+    assert 'event=reservation_succeeded' not in log
+    assert school.submitted == ['one']
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'pending'
 
 
 @pytest.mark.parametrize('field, value', [('retry_at', -1), ('retry_at', 1e20),

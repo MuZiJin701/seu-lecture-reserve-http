@@ -32,11 +32,12 @@ SELECTION_REASONS = {'candidate', 'reservation_not_started', 'reservation_ended'
     'not_reservable', 'already_reserved', 'category_not_allowed', 'category_not_needed',
     'title_not_selected', 'online_disabled', 'offline_disabled', 'campus_not_selected',
     'time_conflict', 'cooldown', 'invalid_activity_time', 'notice_test_only'}
-# A pending submission is released only after several spaced checks that all miss it; duplicate
-# or conflicting bookings are worse than missing one opening because they can create attendance
-# breaches at the school. Slow confirmation must not release the record before it is re-read.
+# A pending submission is never cleared just because the school list has not shown it yet:
+# absence is not proof that the original non-idempotent request was not applied. After the first
+# fast checks the program keeps polling my-activities and leaves the task pending for human review.
 PENDING_MISS_LIMIT = 5
 PENDING_MISS_PAUSE = 2
+PENDING_CHECK_PAUSE = 10
 # After the candidate appears, a slow successful submission must not be aborted by the fast list
 # timeout; captcha and submit keep a longer budget while the list stays fast.
 SUBMIT_TIMEOUT = 8
@@ -46,6 +47,9 @@ OPENING_QUERY_TIMEOUT = 6
 # If the list-to-submit path took long enough for seats to change, re-check the candidate before
 # spending a submission; this only adds one list query on the slow path.
 CANDIDATE_REVALIDATE_SECONDS = 3.0
+# 502/503/504 mean the server is overloaded, not that a rate limit is in force; recover in seconds
+# during an opening instead of the 20-40-80 s limiter backoff. Explicit Retry-After still wins.
+OVERLOAD_RETRY_CAP = 5.0
 
 
 def terminal_prompt(label: str) -> str:
@@ -397,7 +401,8 @@ def run(settings: Settings, *, session: Any = None,
                 opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL)[1]
                 client.timeout = OPENING_QUERY_TIMEOUT if opening_scan else 10
                 mail_blocked = opening_scan
-                fresh = {wid: until for wid, until in task.data['cooldowns'].items() if until > clock()}
+                school_now = clock() + server_offset
+                fresh = {wid: until for wid, until in task.data['cooldowns'].items() if until > school_now}
                 if len(fresh) != len(task.data['cooldowns']):
                     task.data['cooldowns'] = fresh
                     task.save()
@@ -428,21 +433,12 @@ def run(settings: Settings, *, session: Any = None,
                         query_recovered()
                         unconfirmed_checks += 1
                         diagnostic('reservation_checked', wid=pending_wid, checks=unconfirmed_checks)
-                        if unconfirmed_checks < PENDING_MISS_LIMIT:
+                        if unconfirmed_checks == 1:
                             emit('reservation_unconfirmed')
-                            health(phase='confirming', next_check_at=clock() + PENDING_MISS_PAUSE)
-                            pause(PENDING_MISS_PAUSE)
-                            continue
-                        # Repeated misses do not prove failure; release only after spaced checks, then
-                        # force a fresh history so conflicts and booked IDs are re-read before resubmitting.
-                        diagnostic('reservation_unconfirmed_released', wid=pending_wid)
-                        record('reservation_unconfirmed_released')
-                        task.data.update(status='scanning', activity='')
-                        task.save()
-                        clear_alert('reservation_unconfirmed')
-                        unconfirmed_checks = 0
-                        history = None
-                        mine_at = 0.0
+                        pause_value = (PENDING_MISS_PAUSE if unconfirmed_checks < PENDING_MISS_LIMIT
+                                       else PENDING_CHECK_PAUSE)
+                        health(phase='confirming', next_check_at=clock() + pause_value)
+                        pause(pause_value)
                         continue
                     if confirmed:
                         diagnostic('reservation_confirmed', wid=pending_wid)
@@ -528,7 +524,7 @@ def run(settings: Settings, *, session: Any = None,
                         if not code or not code.isascii() or not code.isalnum() or len(code) > 16:
                             diagnostic('ocr_invalid', wid=lecture.wid, attempt=attempt + 1)
                             if attempt == 3:
-                                task.data['cooldowns'][lecture.wid] = clock() + 300
+                                task.data['cooldowns'][lecture.wid] = clock() + server_offset + 300
                                 task.save()
                                 diagnostic('captcha_cooldown', wid=lecture.wid, seconds=300)
                             continue
@@ -582,7 +578,7 @@ def run(settings: Settings, *, session: Any = None,
                             break
                         task.data.update(status='scanning', activity='')
                         if captcha_wrong and attempt == 3:
-                            task.data['cooldowns'][lecture.wid] = clock() + 300
+                            task.data['cooldowns'][lecture.wid] = clock() + server_offset + 300
                             diagnostic('captcha_cooldown', wid=lecture.wid, seconds=300)
                         task.save()
                         if unavailable:
@@ -620,7 +616,9 @@ def run(settings: Settings, *, session: Any = None,
                 health(last_error='authentication_expired', last_error_at=clock(), failure_count=failures)
                 defer(min(300, 10 * 2 ** min(failures, 5)))
             except (RemoteError, ValueError) as exc:
-                history = None
+                if isinstance(exc, ValueError):
+                    # A structurally invalid history is not a cache we can keep using.
+                    history = None
                 unconfirmed_checks = 0
                 reason = str(exc)
                 safe_reason = reason if isinstance(exc, RemoteError) or reason in (
@@ -642,15 +640,24 @@ def run(settings: Settings, *, session: Any = None,
                 opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL)[1]
                 quick = (opening_scan and authenticated and isinstance(exc, RemoteError)
                          and reason in FAST_RETRY_REASONS and not exc.retry_after)
-                if quick:
+                retry = exc.retry_after if isinstance(exc, RemoteError) else 0
+                if reason == 'service_unavailable':
+                    # Temporary overload/gateway failure: recover within seconds, not the limiter
+                    # 20-40-80 s schedule. An explicit Retry-After still takes precedence.
+                    failures += 1
+                    health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
+                    if retry > 0:
+                        delay = retry
+                    else:
+                        delay = min(OVERLOAD_RETRY_CAP, 2.0 ** min(failures - 1, 3))
+                elif quick:
                     # Opening seconds are scarce: retry transient request failures at the fast cadence.
                     health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
                     delay = FAST_INTERVAL
                 else:
                     failures += 1
                     health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
-                    retry = exc.retry_after if isinstance(exc, RemoteError) else 0
-                    delay = max(retry, min(300, 10 * 2 ** min(failures, 5)))
+                    delay = retry if retry > 0 else min(300, 10 * 2 ** min(failures, 5))
                 defer(delay)
     except (KeyboardInterrupt, EOFError):
         return 130

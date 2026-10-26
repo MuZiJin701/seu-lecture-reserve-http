@@ -237,3 +237,93 @@ def test_opening_scan_reuses_history_until_cache_expires(tmp_path):
     assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop) == 130
     assert sum(url.endswith('queryMyActivityList.do') for _, url, _ in school.requests) == 1
     assert waits == [0.25, 0.25, 0.25]
+
+
+def test_overload_503_uses_short_bounded_backoff_in_opening(tmp_path):
+    class Overloaded(ActivitySchool):
+        overloaded = False
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if self.overloaded and url.endswith('queryActivityList.do'):
+                response.status_code = 503
+                response.headers.pop('Retry-After', None)
+                response._content = b''
+            return response
+    school = Overloaded()
+    school.activities = [activity()]
+    assert execute(school, tmp_path, clock=lambda: OPEN - 31) == 130
+    school.overloaded = True
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 5:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop) == 130
+    assert waits == [1, 2, 4, 5, 5]
+
+
+def test_overload_503_with_retry_after_is_honored(tmp_path):
+    class Overloaded(ActivitySchool):
+        overloaded = False
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if self.overloaded and url.endswith('queryActivityList.do'):
+                response.status_code = 503
+                response.headers['Retry-After'] = '2'
+                response._content = b''
+            return response
+    school = Overloaded()
+    school.activities = [activity()]
+    assert execute(school, tmp_path, clock=lambda: OPEN - 31) == 130
+    school.overloaded = True
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop) == 130
+    assert waits == [2]
+
+
+def test_recent_history_cache_survives_list_failure_and_enables_submission(tmp_path):
+    open_text = moment('2029-12-31 19:00:00').strftime('%Y-%m-%d %H:%M:%S')
+    pre_open_text = moment('2029-12-31 18:59:50').strftime('%Y-%m-%d %H:%M:%S')
+    class CacheSchool(ActivitySchool):
+        list_calls = 0
+        mine_calls = 0
+        def request(self, method, url, **kwargs):
+            if url.endswith('queryActivityList.do'):
+                self.list_calls += 1
+                if self.list_calls == 2:
+                    raise requests.Timeout('SECRET list timeout')
+                if self.list_calls >= 3:
+                    self.server_now = open_text
+            if url.endswith('queryMyActivityList.do'):
+                self.mine_calls += 1
+                if self.mine_calls >= 2:
+                    raise requests.Timeout('SECRET history timeout')
+            return super().request(method, url, **kwargs)
+    school = CacheSchool()
+    school.activities = [activity()]
+    school.server_now = pre_open_text
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 5:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop) == 130
+    assert school.submitted == ['native']
+    assert school.list_calls == 3
+
+
+def test_captcha_cooldown_uses_school_clock_basis(tmp_path):
+    school = ActivitySchool()
+    school.activities = [activity()]
+    school.server_now = moment('2029-12-31 19:10:00').strftime('%Y-%m-%d %H:%M:%S')
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 2:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop, recognize=lambda _: '') == 130
+    captchas = [url for _, url, _ in school.requests if url.endswith('vcode.do')]
+    assert len(captchas) == 4

@@ -439,7 +439,7 @@ def test_read_only_http_failure_reports_stage_and_status_without_response_data(
     directory = tmp_path / 'unused-state'
     assert execute(school, directory, check_only=True) == 1
     assert capsys.readouterr().out.splitlines()[-1] == (
-        f'event=task_failed stage={stage} reason=http_failure http_status=502')
+        f'event=task_failed stage={stage} reason=service_unavailable http_status=502')
     assert not directory.exists()
     assert not school.submitted
 
@@ -729,6 +729,22 @@ def test_large_recoverable_state_does_not_block_restart(tmp_path):
     assert school.submitted == ['one']
 
 
+def test_short_rate_limit_retry_after_is_not_inflated_to_twenty_seconds(tmp_path):
+    class LimitedSchool(School):
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if url.endswith('queryActivityList.do'):
+                response.status_code = 429
+                response.headers['Retry-After'] = '1'
+            return response
+    delays = []
+    def stop(seconds):
+        delays.append(seconds)
+        raise KeyboardInterrupt
+    assert execute(LimitedSchool(), tmp_path, sleep=stop) == 130
+    assert delays == [1]
+
+
 def test_persistent_activity_query_failure_backs_off_and_notifies(tmp_path):
     class FailedActivities(School):
         def request(self, method, url, **kwargs):
@@ -771,7 +787,7 @@ def test_school_clock_offset_calibrates_opening_window():
     assert school_clock_offset([{'_SERVER_NOW': 'invalid'}], now) == 0
 
 
-def test_pending_misses_release_after_extended_checks_and_rescan(tmp_path):
+def test_pending_misses_keep_task_pending_without_resubmitting(tmp_path):
     school = School()
     school.activities = [lecture()]
     school.submit_timeout = True
@@ -786,9 +802,10 @@ def test_pending_misses_release_after_extended_checks_and_rescan(tmp_path):
             raise KeyboardInterrupt
     assert execute(school, tmp_path, sleep=wait, notify=events.append, clock=lambda: later) == 130
     assert waits == [2, 2, 2, 2, 10]
-    assert school.submitted == ['one', 'one']
+    assert school.submitted == ['one']
     assert events == []
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'pending'
     events_log = (tmp_path / 'events.log').read_text()
-    assert all(event in events_log for event in (
-        'event=reservation_unconfirmed', 'event=reservation_unconfirmed_released',
-        'event=reservation_succeeded'))
+    assert 'event=reservation_unconfirmed' in events_log
+    assert 'event=reservation_unconfirmed_released' not in events_log
+    assert 'event=reservation_succeeded' not in events_log

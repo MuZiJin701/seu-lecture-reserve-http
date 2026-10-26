@@ -208,14 +208,15 @@ tail -n 20 state/events.log
 | `activity_schema_unknown` / `business_response_invalid` | 目标数据或活动列表响应格式变化，暂停提交并核实接口，不能当作零候选 |
 | `invalid_activity_data` / `attendance_category_unknown` / `attendance_status_unknown` / `attendance_record_conflict` | 已有记录不可靠，不删除状态或绕过校验 |
 | `attendance_result_pending` | 已结束记录尚无打卡或违约结论，等学校更新 |
-| `reservation_unconfirmed` | 持续多次核对原活动；约八秒仍未确认时刷新我的活动、重查冲突后自动释放并继续其他场次（不发邮件） |
+| `reservation_unconfirmed` | 保持待确认，只核对原活动；查不到不构成失败证据，不自动重试或提交其他场次，需人工核对学校记录后处理（不发邮件） |
 | `query_failure` / `query_recovered` | 持续故障／完整查询恢复；恢复不等于预约成功 |
 | `notification_deferred` / `notification_skipped_recovered` | 开抢窗口内查询失败告警延后；窗口结束前恢复则跳过，不重复发送 |
+| `server_backoff` / `service_unavailable` | 429 按 `Retry-After` 等待；502/503/504 为临时过载，按短退避恢复，持续失败再升级 |
 | `reservation_succeeded` / `goal_completed` | 已按 ID 确认一场／实际选听目标达标 |
 | `task_failed` / `unexpected_failure` | 可捕获异常退出，检查本地错误和服务日志后恢复 |
 | `mail_configuration_invalid` / `notification_failed` | 核对邮件字段或下表错误分类，业务结果不受发信失败影响 |
 
-只读检查会输出 `stage` 和安全原因。网络原因包括 `dns_failure`、`tls_failure`、`proxy_failure`、`network_timeout`、`connection_failure`、`network_failure`、`http_failure` 和 `server_backoff`；HTTP 错误附状态码。TLS 诊断只显示白名单域名、固定 `tls_reason` 及可确定时的 `proxy_used`，不打印异常原文或代理地址。证书失败不能通过关闭校验解决。
+只读检查会输出 `stage` 和安全原因。网络原因包括 `dns_failure`、`tls_failure`、`proxy_failure`、`network_timeout`、`connection_failure`、`network_failure`、`http_failure`、`server_backoff` 和 `service_unavailable`；HTTP 错误附状态码。`server_backoff` 表示 429 限流，按 `Retry-After` 等待；`service_unavailable` 表示 502/503/504 临时过载，按短退避恢复。TLS 诊断只显示白名单域名、固定 `tls_reason` 及可确定时的 `proxy_used`，不打印异常原文或代理地址。证书失败不能通过关闭校验解决。
 
 邮件失败分类为 `dns_failed`、`tls_failed`、`timeout`、`authentication_failed`、`sender_refused`、`recipient_refused`、`message_rejected`、`connection_failed`、`smtp_failed`、`network_failed` 或 `unknown`。分别检查网络、授权码、服务器和发件／收件设置；不自动重发，SMTP 接受后仍需确认收件箱。
 
@@ -260,7 +261,7 @@ Python 3.12、uv 和锁文件是开发入口；OCR 使用 ddddocr 自带模型�
 | 2026-10-25 真实预约链路 | 用 HTTP 版对购票公告（非目标、测试活动）真实提交成功（`addReservation.do` 返回 `code=0`，按 `HD_WID` 在“我的活动”确认），验证码 OCR 单次识别成功；随后 `deleteReservation.do` 取消并在“我的活动”复核消失。本机与服务器均完成该验证；另实测连续 5 次/秒、10 次/秒的活动列表只读查询未触发 429。目标系列讲座的真实预约与命中率仍待验证 |
 | 2026-10-25 第二批改造 | 诊断文件、A 版重大告警策略（无日报/无冷却）、健康快照、沙龙计入目标及测试/购票公告排除完成；离线测试 353 项通过、3 项平台限制跳过，mypy 通过；已提交（`89e9558`），并于当日 22:34 在服务器启动系统级后台服务 |
 | 2026-10-26 服务器运行观察 | 后台服务自 2026-10-25 22:34 起连续运行约 16 小时 37 分（截至 15:11）：`--status` 为 scanning／waiting，最近查询无错误、失败计数 0、候选 0（6 条记录中 5 场未开放、1 场测试公告），journal 无错误；不足二十四小时，长期运行、重启恢复与目标讲座真实预约仍待验收 |
-| 2026-10-26 本地修复 | 待确认核对延长为五次、约八秒，并在释放前强制刷新我的活动与冲突检查；开抢瞬时失败改为 0.25 秒快速重试；开抢期先查活动列表，历史查询失败不再阻塞列表；活动列表超时 6 秒、提交/验证码超时 8 秒；慢路径提交前复核候选；开抢期查询失败邮件延后到快窗口结束，恢复后不发；按学校服务器时间校准调度；启动时预热 OCR；修复 `scan_timing` 周期诊断；离线测试 359 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
+| 2026-10-26 复查修复 | 待确认不再因查不到而自动释放或重试，保持 pending 并只核对原场；429 按 `Retry-After` 等待，502/503/504 改走 1/2/4/5 秒短退避；活动列表失败保留有效历史缓存，历史失败才暂停提交；验证码冷却统一使用学校校准时间；离线测试 364 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
 | 既有离线基线 | 2026-10-18 的 `d3e2b7b` 记录完整 307 项测试及类型检查通过，覆盖提交确认、状态损坏、恢复通知与异常退避 |
 | 学校只读接入 | 历史版本已验证认证、活动和我的活动查询、验证码图片；2026-10-18 核对六条非空列表的真实字段与开放时间解析，没有据此确认预约成功 |
 | 邮件送达 | 2026-10-16 一封真实测试邮件被 SMTP 接受，用户确认收到；新增服务商和真实业务通知仍需各自验收 |

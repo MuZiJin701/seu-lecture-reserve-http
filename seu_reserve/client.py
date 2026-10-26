@@ -48,6 +48,19 @@ def has_code(payload: dict[str, Any], expected: int) -> bool:
     return type(payload.get('code')) is int and payload['code'] == expected
 
 
+def retry_after_seconds(response: Any) -> float:
+    """Return the server's Retry-After in seconds, or 0 when unusable/missing."""
+    from email.utils import parsedate_to_datetime
+    retry = response.headers.get('Retry-After', '')
+    try:
+        seconds = float(retry) if retry.isdigit() else parsedate_to_datetime(retry).timestamp() - time.time()
+    except (ValueError, TypeError, OverflowError, OSError):
+        seconds = 0
+    if not math.isfinite(seconds) or seconds > 253402214400 - time.time():
+        seconds = 0
+    return max(0, seconds)
+
+
 def gateway_connection_failure(error: BaseException) -> bool:
     pending = [error]
     seen: set[int] = set()
@@ -140,16 +153,14 @@ class Client:
             raise failure from None
         except requests.RequestException:
             raise RemoteError('network_failure') from None
-        if response.status_code in (429, 503):
-            from email.utils import parsedate_to_datetime
-            retry = response.headers.get('Retry-After', '')
-            try:
-                seconds = float(retry) if retry.isdigit() else parsedate_to_datetime(retry).timestamp() - time.time()
-            except (ValueError, TypeError, OverflowError, OSError):
-                seconds = 0
-            if not math.isfinite(seconds) or seconds > 253402214400 - time.time():
-                seconds = 0
-            raise RemoteError('server_backoff', max(0, seconds), http_status=response.status_code)
+        if response.status_code == 429:
+            # Explicit rate limiting: wait for the server's own window when it provides one.
+            raise RemoteError('server_backoff', retry_after_seconds(response), http_status=429)
+        if response.status_code in (502, 503, 504):
+            # Temporary overload/gateway failure, not a rate-limit decision; the app applies a
+            # short bounded recovery instead of the exponential 20-40-80 s limiter backoff.
+            raise RemoteError('service_unavailable', retry_after_seconds(response),
+                              http_status=response.status_code)
         return response
 
     def get(self, url: str) -> Any:

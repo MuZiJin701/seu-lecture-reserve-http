@@ -34,12 +34,16 @@ FAST_RETRY_REASONS = {'network_timeout', 'connect_timeout', 'network_failure', '
 SELECTION_REASONS = {'candidate', 'reservation_not_started', 'reservation_ended', 'capacity_full',
     'not_reservable', 'already_reserved', 'category_not_allowed', 'category_not_needed',
     'title_not_selected', 'online_disabled', 'offline_disabled', 'campus_not_selected',
-    'time_conflict', 'cooldown', 'invalid_activity_time', 'notice_test_only'}
+    'time_conflict', 'cooldown', 'invalid_activity_time', 'notice_test_only', 'retry_limit'}
 # A pending submission is verified repeatedly by activity ID before any automatic release: the
 # submission is non-idempotent, so absence only becomes actionable after a short series of valid
 # checks. Automatic release keeps unattended operation possible; the local log keeps the evidence.
 PENDING_MISS_PAUSE = 2
 PENDING_AUTO_RELEASE_CHECKS = 3
+# After the first release, keep the original activity's time interval as a local hold so a
+# different lecture at the same time cannot be booked while the first submission is unresolved.
+PENDING_HOLD_SECONDS = 600
+PENDING_RETRY_LIMIT = 2
 # After the candidate appears, a slow successful submission must not be aborted by the fast list
 # timeout; captcha and submit keep a longer budget while the list stays fast.
 SUBMIT_TIMEOUT = 8
@@ -73,7 +77,8 @@ class Settings:
 
 def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: Progress,
                       mine: list[dict[str, Any]], cooldowns: Mapping[str, float],
-                      now: float, *, cooldown_clock_known: bool = True
+                      now: float, *, cooldown_clock_known: bool = True,
+                      hold: Mapping[str, Any] | None = None
                       ) -> tuple[list[Lecture], list[dict[str, Any]]]:
     booked = {activity_id(row) for row in mine if reserved(row)}
     conflicts = [interval(row) for row in mine if reserved(row)]
@@ -133,6 +138,12 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
             reason = 'campus_not_selected'
         elif any(lecture.start <= end and lecture.end >= start for start, end in conflicts):
             reason = 'time_conflict'
+        elif (hold is not None and lecture.wid != hold['activity']
+              and lecture.start <= hold['end'] and lecture.end >= hold['start']):
+            reason = 'time_conflict'
+        elif (hold is not None and lecture.wid == hold['activity']
+              and int(hold['attempts']) >= PENDING_RETRY_LIMIT):
+            reason = 'retry_limit'
         elif lecture.wid in cooldowns and (not cooldown_clock_known or cooldowns[lecture.wid] > now):
             reason = 'cooldown'
         else:
@@ -238,8 +249,9 @@ def resolve_pending(settings: Settings, *, session: Any = None,
             return 1
         if pending_wid in booked:
             task.data.update(status='scanning', activity='')
-            task.data.pop('pending_checks', None)
-            task.data.pop('pending_since', None)
+            for field in ('pending_checks', 'pending_since', 'pending_start', 'pending_end'):
+                task.data.pop(field, None)
+            task.data.pop('hold', None)
             task.save()
             _state_event(settings, 'pending_confirmed')
             return 0
@@ -250,8 +262,9 @@ def resolve_pending(settings: Settings, *, session: Any = None,
             _state_event(settings, 'pending_resolution_cancelled')
             return 1
         task.data.update(status='scanning', activity='')
-        task.data.pop('pending_checks', None)
-        task.data.pop('pending_since', None)
+        for field in ('pending_checks', 'pending_since', 'pending_start', 'pending_end'):
+            task.data.pop(field, None)
+        task.data.pop('hold', None)
         task.save()
         _state_event(settings, 'pending_released_by_operator')
         return 0
@@ -411,6 +424,37 @@ def run(settings: Settings, *, session: Any = None,
             clear_alert('reservation_step_failure')
             record('reservation_step_recovered')
 
+    def hold_confirmed(source: str) -> None:
+        if task is None:
+            return
+        hold = task.data.get('hold')
+        if not isinstance(hold, dict):
+            return
+        wid = hold.get('activity')
+        task.data.pop('hold', None)
+        task.save()
+        diagnostic('reservation_confirmed', wid=wid, source=source)
+        record('reservation_hold_confirmed')
+        step_recovered()
+        clear_alert('reservation_unconfirmed')
+        emit('reservation_succeeded')
+
+    def hold_wid() -> str:
+        hold = task.data.get('hold') if task is not None else None
+        return hold.get('activity', '') if isinstance(hold, dict) else ''
+
+    def hold_view() -> dict[str, Any] | None:
+        hold = task.data.get('hold') if task is not None else None
+        if not isinstance(hold, dict):
+            return None
+        try:
+            start = datetime.fromtimestamp(float(hold['start']), SHANGHAI)
+            end = datetime.fromtimestamp(float(hold['end']), SHANGHAI)
+        except (KeyError, TypeError, ValueError, OSError, OverflowError):
+            return None
+        return {'activity': hold.get('activity'), 'start': start, 'end': end,
+                'attempts': int(hold.get('attempts', 0))}
+
     def notification_details() -> str:
         counts = '已选听：未知\n待参加：未知\n必需类别缺口：未知'
         if latest_progress is not None:
@@ -530,6 +574,13 @@ def run(settings: Settings, *, session: Any = None,
                     authenticated = True
                     clear_alert('authentication_required')
                     record('authentication_succeeded')
+                if task.data['status'] != 'pending':
+                    current_hold = task.data.get('hold')
+                    if isinstance(current_hold, dict) and clock() >= float(current_hold.get('until', 0)):
+                        task.data.pop('hold', None)
+                        task.save()
+                        diagnostic('reservation_hold_expired', wid=current_hold.get('activity'))
+                        record('reservation_hold_expired')
                 confirmed = False
                 mine_seconds = 0.0
                 refresh_mine = False
@@ -558,17 +609,24 @@ def run(settings: Settings, *, session: Any = None,
                         if unconfirmed_checks == 1:
                             emit('reservation_unconfirmed')
                         if unconfirmed_checks >= PENDING_AUTO_RELEASE_CHECKS:
-                            # Unattended operation: after several valid checks the original
-                            # submission is treated as not applied and scanning resumes. The
-                            # school is expected to reject duplicate reservations for the same
-                            # activity; the evidence stays in the private diagnostic log.
                             task.data.update(status='scanning', activity='')
                             task.data.pop('pending_checks', None)
                             task.data.pop('pending_since', None)
+                            started = task.data.pop('pending_start', None)
+                            ended = task.data.pop('pending_end', None)
+                            if (task.data.get('hold') is None
+                                    and isinstance(started, (int, float))
+                                    and isinstance(ended, (int, float)) and ended > started):
+                                until = min(float(started), clock() + PENDING_HOLD_SECONDS)
+                                if until > clock():
+                                    task.data['hold'] = dict(activity=pending_wid,
+                                        start=float(started), end=float(ended), since=clock(),
+                                        until=until, attempts=0)
                             task.save()
                             clear_alert('reservation_unconfirmed')
                             diagnostic('reservation_unconfirmed_released', wid=pending_wid,
-                                       checks=unconfirmed_checks)
+                                       checks=unconfirmed_checks,
+                                       hold=bool(task.data.get('hold')))
                             record('reservation_unconfirmed_released')
                             unconfirmed_checks = 0
                             continue
@@ -579,8 +637,9 @@ def run(settings: Settings, *, session: Any = None,
                     if confirmed:
                         diagnostic('reservation_confirmed', wid=pending_wid)
                         task.data.update(status='scanning', activity='')
-                        task.data.pop('pending_checks', None)
-                        task.data.pop('pending_since', None)
+                        for field in ('pending_checks', 'pending_since', 'pending_start', 'pending_end'):
+                            task.data.pop(field, None)
+                        task.data.pop('hold', None)
                         task.save()
                         clear_alert('reservation_unconfirmed')
                         health(last_query_at=clock(), failure_count=0)
@@ -606,6 +665,22 @@ def run(settings: Settings, *, session: Any = None,
                     if len(fresh) != len(task.data['cooldowns']):
                         task.data['cooldowns'] = fresh
                         task.save()
+                pending_hold_wid = hold_wid()
+                if pending_hold_wid and task.data['status'] != 'pending':
+                    for row in rows:
+                        try:
+                            row_wid = activity_id(row)
+                        except ValueError:
+                            continue
+                        if row_wid != pending_hold_wid:
+                            continue
+                        try:
+                            judged = Lecture.read(row, now=clock() + server_offset)
+                        except ValueError:
+                            break
+                        if judged.availability == 'already_reserved':
+                            hold_confirmed('activity_list')
+                        break
                 if not refresh_mine and not (
                         history is not None and opening_scan and 0 <= clock() - mine_at < OPENING_HISTORY_TTL):
                     health(phase='my_activities', next_check_at=0,
@@ -616,6 +691,14 @@ def run(settings: Settings, *, session: Any = None,
                     mine_seconds = max(0, clock() - mine_started)
                     refresh_mine = True
                 assert history is not None
+                if hold_wid():
+                    for row in history:
+                        try:
+                            if reserved(row) and activity_id(row) == hold_wid():
+                                hold_confirmed('history')
+                                break
+                        except ValueError:
+                            continue
                 current = progress(history, clock() + server_offset)
                 latest_progress, progress_at = current, mine_at
                 if current.done:
@@ -645,7 +728,7 @@ def run(settings: Settings, *, session: Any = None,
                     continue
                 candidates, details = select_candidates(rows, settings, current, history,
                     task.data['cooldowns'], clock() + server_offset,
-                    cooldown_clock_known=offset_known)
+                    cooldown_clock_known=offset_known, hold=hold_view())
                 query_recovered()
                 if not candidates:
                     # No submission step can be attempted in this scan; do not keep an old
@@ -687,8 +770,14 @@ def run(settings: Settings, *, session: Any = None,
                                 diagnostic('captcha_cooldown', wid=lecture.wid, seconds=300)
                             continue
                         # Persist before sending: a crash must recover by querying, never resubmitting.
+                        retry_hold = task.data.get('hold')
+                        if isinstance(retry_hold, dict) and retry_hold.get('activity') == lecture.wid:
+                            retry_hold['attempts'] = min(PENDING_RETRY_LIMIT + 1,
+                                                         int(retry_hold.get('attempts', 0)) + 1)
                         task.data.update(status='pending', activity=lecture.wid,
-                                         pending_checks=0, pending_since=clock())
+                                         pending_checks=0, pending_since=clock(),
+                                         pending_start=lecture.start.timestamp(),
+                                         pending_end=lecture.end.timestamp())
                         task.save()
                         unconfirmed_checks = 0
                         health(phase='submitting')
@@ -707,6 +796,8 @@ def run(settings: Settings, *, session: Any = None,
                                 task.data.update(status='scanning', activity='')
                                 task.data.pop('pending_checks', None)
                                 task.data.pop('pending_since', None)
+                                task.data.pop('pending_start', None)
+                                task.data.pop('pending_end', None)
                                 task.save()
                                 diagnostic('submission_connect_failed', wid=lecture.wid)
                                 break
@@ -723,12 +814,28 @@ def run(settings: Settings, *, session: Any = None,
                                                          '预约已结束', '预约未开始'))
                         outcome = ('reported_success' if has_code(reply, 0) else 'captcha_wrong' if captcha_wrong
                                    else 'unavailable' if unavailable else 'unconfirmed')
+                        already_reserved = isinstance(message, str) and any(
+                            word in message for word in ('您已预约', '你已预约', '已预约该',
+                                                         '已有预约', '已经预约', '重复预约', '已预约过'))
                         diagnostic('submission_reply', wid=lecture.wid, outcome=outcome,
                                    feedback=reply.get('feedback') if reply.get('feedback') in (
                                        'unrecognized_message', 'no_message') else None,
                                    http_status=reply.get('http_status') if type(reply.get('http_status')) is int
                                        and 100 <= reply['http_status'] <= 599 else None,
                                    duration_seconds=max(0, clock() - submission_started))
+                        if already_reserved and not has_code(reply, 0):
+                            # Explicit evidence that the earlier submission is already registered.
+                            task.data.update(status='scanning', activity='')
+                            for field in ('pending_checks', 'pending_since', 'pending_start', 'pending_end'):
+                                task.data.pop(field, None)
+                            task.data.pop('hold', None)
+                            task.save()
+                            diagnostic('reservation_confirmed', wid=lecture.wid, source='submit_reply')
+                            record('reservation_hold_confirmed')
+                            step_recovered()
+                            clear_alert('reservation_unconfirmed')
+                            emit('reservation_succeeded')
+                            break
                         if (has_code(reply, 0) or type(reply.get('code')) is not int
                                 or not (captcha_wrong or unavailable)):
                             break

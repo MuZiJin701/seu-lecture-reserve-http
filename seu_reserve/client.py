@@ -152,7 +152,7 @@ def _current_request_deadline() -> float | None:
 
 
 def install_deadline_pools(session: Any) -> None:
-    """Make new connections under an existing requests session deadline-aware."""
+    """Make new connections (direct and proxy) under a session deadline-aware."""
     adapters = getattr(session, 'adapters', None)
     if not isinstance(adapters, dict):
         return
@@ -160,6 +160,17 @@ def install_deadline_pools(session: Any) -> None:
         manager = getattr(adapter, 'poolmanager', None)
         if manager is not None:
             manager.pool_classes_by_scheme = dict(DEADLINE_POOLS)
+        for proxy_manager in getattr(adapter, 'proxy_manager', {}).values():
+            proxy_manager.pool_classes_by_scheme = dict(DEADLINE_POOLS)
+        if isinstance(adapter, DeadlineAdapter) or getattr(adapter, '_deadline_proxy', False):
+            continue
+        original = adapter.proxy_manager_for
+        def proxy_manager_for(proxy: str, _original: Any = original, **kwargs: Any) -> Any:
+            proxy_manager = _original(proxy, **kwargs)
+            proxy_manager.pool_classes_by_scheme = dict(DEADLINE_POOLS)
+            return proxy_manager
+        adapter.proxy_manager_for = proxy_manager_for  # type: ignore[method-assign]
+        adapter._deadline_proxy = True
 
 
 class DeadlineAdapter(requests.adapters.HTTPAdapter):

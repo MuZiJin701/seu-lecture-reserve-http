@@ -95,7 +95,8 @@ class Task:
                         or any(type(value) not in (int, float) or not math.isfinite(value)
                                or not 0 <= value <= 253402214400 for value in alerts.values())):
                     raise ValueError('state_invalid')
-                for field in ('query_failure_since', 'pending_since', 'step_failure_since'):
+                for field in ('query_failure_since', 'pending_since', 'step_failure_since',
+                              'pending_start', 'pending_end'):
                     since = data.get(field)
                     if since is not None and (type(since) not in (int, float) or not math.isfinite(since)
                                               or not 0 <= since <= 253402214400):
@@ -103,6 +104,17 @@ class Task:
                 checks = data.get('pending_checks')
                 if checks is not None and (type(checks) is not int or not 0 <= checks <= 1_000_000):
                     raise ValueError('state_invalid')
+                hold = data.get('hold')
+                if hold is not None:
+                    if (not isinstance(hold, dict)
+                            or not isinstance(hold.get('activity'), str) or not hold['activity']
+                            or any(type(hold.get(key)) not in (int, float)
+                                   or not math.isfinite(hold[key]) or not 0 <= hold[key] <= 253402214400
+                                   for key in ('start', 'end', 'since', 'until'))
+                            or not hold['end'] > hold['start']
+                            or type(hold.get('attempts')) is not int
+                            or not 0 <= hold['attempts'] <= 100):
+                        raise ValueError('state_invalid')
                 if username and account != data['account']:
                     raise ValueError('state_account_mismatch')
                 if not username and (data['status'] != 'done' or data['version'] == 1):

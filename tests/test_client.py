@@ -18,7 +18,8 @@ from cryptography.x509.oid import NameOID
 from urllib3.util import connection
 from urllib3.exceptions import ProtocolError
 
-from seu_reserve.client import Client, GATEWAY, GatewayIPAdapter, RemoteError
+from seu_reserve.client import (Client, DEADLINE_POOLS, GATEWAY, GatewayIPAdapter, RemoteError,
+                                install_deadline_pools)
 
 
 @pytest.fixture
@@ -593,3 +594,53 @@ def test_total_budget_interrupts_slow_response_headers(gateway_server, monkeypat
         elapsed = time.monotonic() - started
     assert str(error.value) == 'network_timeout'
     assert elapsed < 0.8
+
+
+def test_install_deadline_pools_covers_proxy_managers():
+    with requests.Session() as session:
+        install_deadline_pools(session)
+        adapter = session.get_adapter('https://ehall.seu.edu.cn/')
+        manager = adapter.proxy_manager_for('http://127.0.0.1:9')
+        assert manager.pool_classes_by_scheme == DEADLINE_POOLS
+
+
+@pytest.fixture
+def slow_header_proxy():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                self.wfile.write(b'HTTP/1.1 200 OK\r\n')
+                self.wfile.flush()
+                for index in range(10):
+                    time.sleep(0.1)
+                    self.wfile.write(f'X-Slow-{index}: value\r\n'.encode())
+                    self.wfile.flush()
+                self.wfile.write(b'Content-Length: 2\r\n\r\nok')
+                self.wfile.flush()
+            except OSError:
+                pass
+            self.close_connection = True
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield 'http://127.0.0.1:%d' % server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_proxy_header_deadline_is_enforced(slow_header_proxy):
+    with requests.Session() as session:
+        session.trust_env = False
+        install_deadline_pools(session)
+        started = time.monotonic()
+        with pytest.raises(requests.RequestException):
+            session.get('http://example.invalid/slow', proxies={'http': slow_header_proxy},
+                        timeout=0.2)
+        assert time.monotonic() - started < 0.8

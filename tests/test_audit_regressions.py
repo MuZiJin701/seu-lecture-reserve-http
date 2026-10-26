@@ -91,7 +91,12 @@ def test_pending_timeout_is_released_automatically_before_rescanning(tmp_path):
 @pytest.mark.parametrize('field, value', [('retry_at', -1), ('retry_at', 1e20),
                                        ('cooldowns', {'one': -1}), ('cooldowns', {'one': 1e20}),
                                        ('pending_checks', -1), ('pending_checks', '1'),
-                                       ('pending_since', -1), ('step_failure_since', 1e20)])
+                                       ('pending_since', -1), ('step_failure_since', 1e20),
+                                       ('pending_start', -1),
+                                       ('hold', {'activity': 'one', 'start': 2.0, 'end': 1.0,
+                                                 'since': 1.0, 'until': 2.0, 'attempts': 0}),
+                                       ('hold', {'activity': 'one', 'start': 1.0, 'end': 2.0,
+                                                 'since': 1.0, 'until': 2.0, 'attempts': 'x'})])
 def test_invalid_recovery_deadlines_are_not_used_or_overwritten(tmp_path, field, value):
     school = School()
     assert execute(school, tmp_path) == 130

@@ -23,6 +23,8 @@ MESSAGES = {
     'reservation_unconfirmed': ('预约结果待确认', '提交结果尚未确认。程序只查询原活动，暂停其他提交；请勿删除状态文件或另开实例。'),
     'query_failure': ('持续查询失败', '连续五分钟未完成有效查询，程序仍在重试。请检查网络和本地运行状态；同一未恢复问题只通知一次。'),
     'query_recovered': ('查询已恢复', '此前连续失败的查询或处理已恢复，程序会继续核对目标和预约状态。'),
+    'reservation_step_failure': ('预约关键步骤持续失败', '连续五分钟无法完成验证码或提交请求，列表查询可能仍正常。请检查网络、学校接口和本地运行状态；同一未恢复问题只通知一次。'),
+    'reservation_step_recovered': ('预约关键步骤已恢复', '此前连续失败的验证码或提交请求已恢复，程序会继续尝试预约。'),
     'task_failed': ('任务异常退出', '程序已停止。请查看本地状态和日志，处理问题后用原命令重启。'),
     'unexpected_failure': ('程序异常退出', '程序遇到未预期错误并停止。请查看本地状态和日志。'),
     # Legacy subject kept so mail history saved by older versions still validates.

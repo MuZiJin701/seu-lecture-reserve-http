@@ -1,6 +1,7 @@
 import base64
 import json
 import socket
+import threading
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import requests
@@ -181,6 +182,20 @@ def test_one_confirmed_reservation_continues_goal_and_restart_does_not_duplicate
     assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
     assert execute(school, tmp_path, notify=events.append) == 130
     assert school.submitted == ['one']
+
+
+def test_success_mail_is_sent_asynchronously_when_enabled(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    events = []
+    sent = threading.Event()
+    def notify(event):
+        events.append(event)
+        sent.set()
+    assert execute(school, tmp_path, settings=Settings(state_dir=tmp_path, mail_success=True),
+                   notify=notify) == 130
+    assert sent.wait(2)
+    assert events == ['reservation_succeeded']
 
 
 def test_windows_state_and_event_log_without_unix_file_apis(tmp_path, monkeypatch):

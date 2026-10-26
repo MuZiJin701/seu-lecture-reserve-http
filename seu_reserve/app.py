@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -46,7 +47,7 @@ SUBMIT_TIMEOUT = 8
 OPENING_QUERY_TIMEOUT = 6
 # During the opening window, reuse the history fetched immediately before it instead of
 # synchronously refreshing at the opening instant; the trade-off is bounded stale conflict data.
-OPENING_HISTORY_TTL = 30.0
+OPENING_HISTORY_TTL = 60.0
 # 502/503/504 mean the server is overloaded, not that a rate limit is in force; recover in seconds
 # during an opening instead of the 20-40-80 s limiter backoff. Explicit Retry-After still wins.
 OVERLOAD_RETRY_CAP = 5.0
@@ -67,6 +68,7 @@ class Settings:
     campuses: tuple[str, ...] = ()
     online: bool = True
     offline: bool = True
+    mail_success: bool = False
 
 def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: Progress,
                       mine: list[dict[str, Any]], cooldowns: Mapping[str, float],
@@ -321,9 +323,29 @@ def run(settings: Settings, *, session: Any = None,
                 continue
             send_mail(event)
 
+    def send_success_mail(event: str) -> None:
+        """Send success mail off the scanning thread so SMTP latency cannot delay reservations."""
+        if notify is None:
+            return
+        notify_success = notify
+        def worker() -> None:
+            try:
+                notify_success(event)
+            except Exception as exc:
+                print('event=notification_failed reason=' + mail_failure_reason(exc), flush=True)
+        threading.Thread(target=worker, name='success-mail', daemon=True).start()
+
     def emit(event: str) -> None:
         record(event)
-        if check_only or event not in MAJOR_MAIL_EVENTS:
+        if check_only:
+            return
+        if event == 'reservation_succeeded':
+            # Success is not a deduplicated major alert: each confirmed reservation may notify.
+            # It is sent from a worker thread; scanning must not wait for SMTP.
+            if settings.mail_success and notify is not None:
+                send_success_mail(event)
+            return
+        if event not in MAJOR_MAIL_EVENTS:
             return
         alert = 'task_failed' if event == 'unexpected_failure' else event
         if alert in announced:

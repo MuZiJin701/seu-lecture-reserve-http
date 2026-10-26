@@ -223,7 +223,7 @@ def test_slow_captcha_path_submits_without_an_extra_list_query(tmp_path):
     assert not any(line['event'] == 'candidate_revalidated' for line in lines)
 
 
-def test_opening_history_cache_survives_ten_seconds_without_refresh(tmp_path):
+def test_opening_history_cache_survives_forty_seconds_without_refresh(tmp_path):
     school = ActivitySchool()
     school.activities = [activity()]
     school.server_now = '2029-12-31 18:59:50'
@@ -231,7 +231,7 @@ def test_opening_history_cache_survives_ten_seconds_without_refresh(tmp_path):
     waits = []
     def wait(seconds):
         waits.append(seconds)
-        now[0] += 10
+        now[0] += 20
         if len(waits) == 3:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, clock=lambda: now[0], sleep=wait) == 130

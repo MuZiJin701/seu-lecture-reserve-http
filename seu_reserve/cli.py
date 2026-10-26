@@ -106,7 +106,7 @@ def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[S
                   for key, value in dotenv_values(stream=StringIO(text), interpolate=False).items()}
     allowed = {'SEU_CARD_NUMBER', 'SEU_USERNAME', 'SEU_PASSWORD', 'SEU_PREFERRED_LECTURES',
                'SEU_REQUIRED_CATEGORIES', 'SEU_PREFERRED_CAMPUS', 'SEU_ENABLE_ONLINE',
-               'SEU_ENABLE_OFFLINE', 'SEU_STATE_DIR', 'SMTP_HOST', 'SMTP_PORT',
+               'SEU_ENABLE_OFFLINE', 'SEU_STATE_DIR', 'SEU_MAIL_SUCCESS', 'SMTP_HOST', 'SMTP_PORT',
                'SMTP_USERNAME', 'SMTP_PASSWORD', 'MAIL_FROM', 'MAIL_TO', 'SEU_VPN_IP'}
     if set(values) - allowed:
         raise ValueError('unknown_configuration_key')
@@ -128,7 +128,8 @@ def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[S
         data[key] = tuple(value)
     if not data['categories'] or len(set(data['categories'])) != len(data['categories']):
         raise ValueError('invalid_categories')
-    for key, name in (('online', 'SEU_ENABLE_ONLINE'), ('offline', 'SEU_ENABLE_OFFLINE')):
+    for key, name in (('online', 'SEU_ENABLE_ONLINE'), ('offline', 'SEU_ENABLE_OFFLINE'),
+                      ('mail_success', 'SEU_MAIL_SUCCESS')):
         raw = environ.get(name, str(getattr(defaults, key))).strip().lower()
         if raw not in ('true', 'false'):
             raise ValueError('invalid_switch')

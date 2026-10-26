@@ -1,12 +1,14 @@
 """Validated HTTPS boundary for CAS, the gateway and lecture APIs."""
 
 import base64
+import io
 import json
 import math
 import re
 import select
 import socket
 import ssl
+import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -18,6 +20,10 @@ from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 import requests
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.serialization import load_der_public_key
+from urllib3.connection import HTTPConnection as Urllib3HTTPConnection
+from urllib3.connection import HTTPSConnection as Urllib3HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool as Urllib3HTTPConnectionPool
+from urllib3.connectionpool import HTTPSConnectionPool as Urllib3HTTPSConnectionPool
 from urllib3.exceptions import ReadTimeoutError
 
 BASE = 'https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu'
@@ -67,8 +73,107 @@ class _DeadlineSocket:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._sock, name)
 
+    def makefile(self, mode: str = 'rb', buffering: int = -1) -> Any:
+        # Used while http.client reads the status line and response headers; the reader then
+        # stops blocking once the request deadline is reached. Mirror socket.makefile()'s
+        # reference counting so http.client closing the connection does not close the fd early.
+        self._sock._io_refs += 1
+        return io.BufferedReader(socket.SocketIO(self, mode))  # type: ignore[arg-type]
 
-class GatewayIPAdapter(requests.adapters.HTTPAdapter):
+    def _decref_socketios(self) -> None:
+        # socket.SocketIO.close() calls this on its owner; keep the real socket's refcounts.
+        self._sock._decref_socketios()
+
+
+class _DeadlineHTTPConnection(Urllib3HTTPConnection):
+    _response_deadline: float | None = None
+
+    def request(self, *args: Any, **kwargs: Any) -> None:
+        timeout = self.timeout
+        fallback = (time.monotonic() + float(timeout)) if timeout is not None else None
+        self._response_deadline = _current_request_deadline() or fallback
+        Urllib3HTTPConnection.request(self, *args, **kwargs)
+
+    def getresponse(self) -> Any:
+        deadline = self._response_deadline
+        if deadline is None or self.sock is None:
+            return Urllib3HTTPConnection.getresponse(self)
+        sock = self.sock
+        wrapped = _DeadlineSocket(sock, deadline)
+        setattr(self, 'sock', wrapped)
+        try:
+            response = Urllib3HTTPConnection.getresponse(self)
+        finally:
+            if getattr(self, 'sock', None) is wrapped:
+                setattr(self, 'sock', sock)
+        return response
+
+
+class _DeadlineHTTPSConnection(Urllib3HTTPSConnection):
+    _response_deadline: float | None = None
+
+    def request(self, *args: Any, **kwargs: Any) -> None:
+        timeout = self.timeout
+        fallback = (time.monotonic() + float(timeout)) if timeout is not None else None
+        self._response_deadline = _current_request_deadline() or fallback
+        Urllib3HTTPSConnection.request(self, *args, **kwargs)
+
+    def getresponse(self) -> Any:
+        deadline = self._response_deadline
+        if deadline is None or self.sock is None:
+            return Urllib3HTTPSConnection.getresponse(self)
+        sock = self.sock
+        wrapped = _DeadlineSocket(sock, deadline)
+        setattr(self, 'sock', wrapped)
+        try:
+            response = Urllib3HTTPSConnection.getresponse(self)
+        finally:
+            if getattr(self, 'sock', None) is wrapped:
+                setattr(self, 'sock', sock)
+        return response
+
+
+class _DeadlineHTTPConnectionPool(Urllib3HTTPConnectionPool):
+    ConnectionCls = _DeadlineHTTPConnection
+
+
+class _DeadlineHTTPSConnectionPool(Urllib3HTTPSConnectionPool):
+    ConnectionCls = _DeadlineHTTPSConnection
+
+
+DEADLINE_POOLS = {'http': _DeadlineHTTPConnectionPool, 'https': _DeadlineHTTPSConnectionPool}
+# Set by Client.request for the duration of session.request(); the deadline-aware connection
+# classes read it so connect + headers + body share one wall-clock budget.
+REQUEST_DEADLINE = threading.local()
+
+
+def _current_request_deadline() -> float | None:
+    return getattr(REQUEST_DEADLINE, 'value', None)
+
+
+def install_deadline_pools(session: Any) -> None:
+    """Make new connections under an existing requests session deadline-aware."""
+    adapters = getattr(session, 'adapters', None)
+    if not isinstance(adapters, dict):
+        return
+    for adapter in adapters.values():
+        manager = getattr(adapter, 'poolmanager', None)
+        if manager is not None:
+            manager.pool_classes_by_scheme = dict(DEADLINE_POOLS)
+
+
+class DeadlineAdapter(requests.adapters.HTTPAdapter):
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        super().init_poolmanager(*args, **kwargs)
+        self.poolmanager.pool_classes_by_scheme = dict(DEADLINE_POOLS)
+
+    def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:
+        manager: Any = super().proxy_manager_for(proxy, **proxy_kwargs)
+        manager.pool_classes_by_scheme = dict(DEADLINE_POOLS)
+        return manager
+
+
+class GatewayIPAdapter(DeadlineAdapter):
     def __init__(self, address: str):
         # shortcut: a configured gateway IP can change; update it when the university moves the gateway.
         self.address = str(ip_address(address))
@@ -145,6 +250,7 @@ class Client:
     def __init__(self, session: Any, environ: Mapping[str, str],
                  prompt: Callable[[str], str], notify: Callable[[str], None]):
         self.session = session
+        install_deadline_pools(session)
         self.environ = environ
         self.prompt = prompt
         self.notify = notify
@@ -166,8 +272,14 @@ class Client:
         headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64)', **kwargs.pop('headers', {})}
         deadline = time.monotonic() + float(self.timeout)
         try:
-            response = self.session.request(method, url, timeout=self.timeout, allow_redirects=False,
-                                            verify=True, headers=headers, stream=True, **kwargs)
+            previous_deadline = getattr(REQUEST_DEADLINE, 'value', None)
+            REQUEST_DEADLINE.value = deadline
+            try:
+                response = self.session.request(method, url, timeout=self.timeout,
+                                                allow_redirects=False, verify=True, headers=headers,
+                                                stream=True, **kwargs)
+            finally:
+                REQUEST_DEADLINE.value = previous_deadline
             if response.status_code in (429, 502, 503, 504):
                 # Decide from the status line and headers first: a slow or malformed error body
                 # must not turn an explicit rate-limit/overload answer into a generic network
@@ -190,6 +302,9 @@ class Client:
                 response._content = self._read_body(response, deadline)
                 response._content_consumed = True
                 response.close()
+        except ReadTimeoutError:
+            # Header/status read hit the total response budget.
+            raise RemoteError('network_timeout') from None
         except requests.exceptions.SSLError as exc:
             failure = RemoteError('tls_failure')
             failure.host = parsed.hostname
@@ -249,6 +364,14 @@ class Client:
         if read1 is None:
             return self._read_body_chunks(response, deadline)
         sock = self._response_socket(raw)
+        holder = self._socket_holder(raw)
+        header_socket = getattr(holder, '_sock', None) if holder is not None else None
+        if holder is not None and isinstance(header_socket, _DeadlineSocket):
+            # Headers were read through a temporary deadline wrapper; hand the body reader the
+            # real socket so normal keep-alive and close semantics stay intact.
+            real = header_socket._sock
+            holder._sock = real
+            sock = real
         original_timeout = None
         if sock is not None:
             try:
@@ -257,7 +380,6 @@ class Client:
                 sock = None
         # One read1() call may loop over many recvs (gzip decoding, chunked framing); route each
         # recv through a select() bounded by the deadline so those loops cannot outlive it.
-        holder = self._socket_holder(raw)
         wrapped = None
         if sock is not None and holder is not None and getattr(holder, '_sock', None) is sock:
             wrapped = _DeadlineSocket(sock, deadline)

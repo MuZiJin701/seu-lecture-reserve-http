@@ -61,6 +61,19 @@ def gateway_server(tmp_path, monkeypatch, request):
                 except OSError:
                     pass
                 return
+            if self.path.endswith('/slow-headers'):
+                try:
+                    self.wfile.write(b'HTTP/1.1 200 OK\r\n')
+                    self.wfile.flush()
+                    for index in range(10):
+                        time.sleep(0.1)
+                        self.wfile.write(f'X-Slow-{index}: value\r\n'.encode())
+                        self.wfile.flush()
+                    self.wfile.write(b'Content-Length: 2\r\n\r\nok')
+                    self.wfile.flush()
+                except OSError:
+                    pass
+                return
             self.send_response(200)
             self.send_header('Set-Cookie', 'gateway=test; Secure; Path=/')
             self.end_headers()
@@ -563,3 +576,20 @@ def test_total_budget_interrupts_a_slow_gzip_body_over_tls(gateway_server, monke
         elapsed = time.monotonic() - started
     assert str(error.value) == 'network_timeout'
     assert elapsed < 1.0
+
+
+@pytest.mark.parametrize('gateway_server', ['vpn.seu.edu.cn'], indirect=True)
+def test_total_budget_interrupts_slow_response_headers(gateway_server, monkeypatch):
+    with requests.Session() as session:
+        client = Client(session, {'SEU_VPN_IP': '127.0.0.1'}, input, lambda _: None)
+        assert client.gateway_adapter is not None
+        session.mount(GATEWAY + '/', client.gateway_adapter)
+        monkeypatch.setattr(client, '_authenticate', lambda: client.get(GATEWAY + '/public'))
+        client.authenticate()
+        client.timeout = 0.2
+        started = time.monotonic()
+        with pytest.raises(RemoteError) as error:
+            client.request('GET', GATEWAY + '/slow-headers')
+        elapsed = time.monotonic() - started
+    assert str(error.value) == 'network_timeout'
+    assert elapsed < 0.8

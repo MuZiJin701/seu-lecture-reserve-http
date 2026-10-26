@@ -43,6 +43,16 @@ def test_invalid_mail_history_is_rejected_without_overwriting_pending_task(tmp_p
     assert not school.requests and not task_running(tmp_path)
 
 
+@pytest.mark.parametrize('message', ['人数已满', '该活动不可预约'])
+def test_unavailable_message_variants_do_not_stay_pending(tmp_path, message):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_replies = [{'code': -1, 'msg': message}]
+    assert execute(school, tmp_path) == 130
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert saved['status'] == 'scanning' and not saved['activity']
+
+
 def test_pending_timeout_waits_for_history_before_claiming_success(tmp_path):
     class RecoveringSchool(School):
         fail_history = True
@@ -68,7 +78,7 @@ def test_pending_timeout_waits_for_history_before_claiming_success(tmp_path):
     waits.clear()
     def stop(seconds):
         waits.append(seconds)
-        if len(waits) == 2:
+        if len(waits) == 5:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, notify=events.append, sleep=stop, clock=lambda: 5000) == 130
     assert events == []

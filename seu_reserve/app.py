@@ -32,6 +32,20 @@ SELECTION_REASONS = {'candidate', 'reservation_not_started', 'reservation_ended'
     'not_reservable', 'already_reserved', 'category_not_allowed', 'category_not_needed',
     'title_not_selected', 'online_disabled', 'offline_disabled', 'campus_not_selected',
     'time_conflict', 'cooldown', 'invalid_activity_time', 'notice_test_only'}
+# A pending submission is released only after several spaced checks that all miss it; duplicate
+# or conflicting bookings are worse than missing one opening because they can create attendance
+# breaches at the school. Slow confirmation must not release the record before it is re-read.
+PENDING_MISS_LIMIT = 5
+PENDING_MISS_PAUSE = 2
+# After the candidate appears, a slow successful submission must not be aborted by the fast list
+# timeout; captcha and submit keep a longer budget while the list stays fast.
+SUBMIT_TIMEOUT = 8
+# A list query during the opening window must survive a briefly overloaded server instead of
+# aborting at 3 s; the timeout still bounds a dead connection and the fast retry re-joins quickly.
+OPENING_QUERY_TIMEOUT = 6
+# If the list-to-submit path took long enough for seats to change, re-check the candidate before
+# spending a submission; this only adds one list query on the slow path.
+CANDIDATE_REVALIDATE_SECONDS = 3.0
 
 
 def terminal_prompt(label: str) -> str:
@@ -146,6 +160,20 @@ def scan_delay(details: list[dict[str, Any]], now: float, elapsed: float,
     return min([delay, *boundaries]), fast
 
 
+def school_clock_offset(rows: list[dict[str, Any]], now: float) -> float:
+    """Estimate the school clock offset so opening windows use the school's time, not the host's."""
+    server_now = next((row.get('_SERVER_NOW') for row in rows
+                       if isinstance(row.get('_SERVER_NOW'), str)), None)
+    if not server_now:
+        return 0.0
+    try:
+        offset = moment(server_now).timestamp() - now
+    except ValueError:
+        return 0.0
+    # A day-scale offset means a broken clock or a test fixture, not useful scheduling input.
+    return offset if abs(offset) <= 3600 else 0.0
+
+
 def run(settings: Settings, *, session: Any = None,
         environ: Mapping[str, str] | None = None, prompt: Callable[[str], str] = terminal_prompt,
         notify: Callable[[str], None] | None = None, sleep: Callable[[float], None] = time.sleep,
@@ -155,6 +183,8 @@ def run(settings: Settings, *, session: Any = None,
     environ = os.environ if environ is None else environ
     announced: set[str] = set()
     alerts: dict[str, float] = {}
+    deferred_mail: list[str] = []
+    mail_blocked = False
     latest_progress: Progress | None = None
     progress_at = 0.0
     task: Task | None = None
@@ -196,6 +226,34 @@ def run(settings: Settings, *, session: Any = None,
                                         ensure_ascii=False, allow_nan=False) + '\n')
         except (OSError, ValueError):
             record('diagnostic_write_failed')
+    def send_mail(event: str) -> None:
+        if notify is None:
+            return
+        health(mail_status='sending', last_mail_status='sending', last_mail_error='none',
+               last_mail_at=clock(), last_mail_event=event, last_mail_duration_seconds=None)
+        # shortcut: SMTP blocks scanning; add a worker if measured send times cause missed scans.
+        started = time.monotonic()
+        try:
+            notify(event)
+            health(mail_status='accepted', last_mail_status='accepted', last_mail_at=clock())
+        except Exception as exc:
+            reason = mail_failure_reason(exc)
+            record('notification_failed reason=' + reason)
+            health(mail_status='failed', last_mail_status='failed', last_mail_error=reason, last_mail_at=clock())
+        finally:
+            duration = round(max(0, time.monotonic() - started), 3)
+            health(last_mail_duration_seconds=duration)
+            record(f'notification_finished mail_event={event} duration_seconds={duration}')
+
+    def flush_mail() -> None:
+        """Send alerts held back during an opening window; recovered failures never go out."""
+        while deferred_mail:
+            event = deferred_mail.pop(0)
+            if event == 'query_failure' and 'query_failure' not in announced:
+                record('notification_skipped_recovered')
+                continue
+            send_mail(event)
+
     def emit(event: str) -> None:
         record(event)
         if check_only or event not in MAJOR_MAIL_EVENTS:
@@ -208,21 +266,13 @@ def run(settings: Settings, *, session: Any = None,
             alerts[alert] = clock()
             task.save()
         if notify:
-            health(mail_status='sending', last_mail_status='sending', last_mail_error='none',
-                   last_mail_at=clock(), last_mail_event=event, last_mail_duration_seconds=None)
-            # shortcut: SMTP blocks scanning; add a worker if measured send times cause missed scans.
-            started = time.monotonic()
-            try:
-                notify(event)
-                health(mail_status='accepted', last_mail_status='accepted', last_mail_at=clock())
-            except Exception as exc:
-                reason = mail_failure_reason(exc)
-                record('notification_failed reason=' + reason)
-                health(mail_status='failed', last_mail_status='failed', last_mail_error=reason, last_mail_at=clock())
-            finally:
-                duration = round(max(0, time.monotonic() - started), 3)
-                health(last_mail_duration_seconds=duration)
-                record(f'notification_finished mail_event={event} duration_seconds={duration}')
+            if mail_blocked and event == 'query_failure':
+                # A 20 s SMTP send during the opening window can cost the seats that caused the
+                # failures; hold the alert until the fast window ends and skip it if recovered.
+                deferred_mail.append(event)
+                record('notification_deferred')
+                return
+            send_mail(event)
 
     def clear_alert(event: str) -> None:
         announced.discard(event)
@@ -334,16 +384,19 @@ def run(settings: Settings, *, session: Any = None,
         failures = 0
         unconfirmed_checks = 0
         last_timing_at = 0.0
+        server_offset = 0.0
         history: list[dict[str, Any]] | None = None
         mine_at = 0.0
+        progress_probe_attempted = False
         previous_selection = task.data.get('selection')
         details: list[dict[str, Any]] = (previous_selection.get('activities', [])
                                          if isinstance(previous_selection, dict) else [])
         while True:
             try:
                 scan_started = clock()
-                opening_scan = scan_delay(details, clock(), 0, SCAN_INTERVAL)[1]
-                client.timeout = 3 if opening_scan else 10
+                opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL)[1]
+                client.timeout = OPENING_QUERY_TIMEOUT if opening_scan else 10
+                mail_blocked = opening_scan
                 fresh = {wid: until for wid, until in task.data['cooldowns'].items() if until > clock()}
                 if len(fresh) != len(task.data['cooldowns']):
                     task.data['cooldowns'] = fresh
@@ -354,19 +407,18 @@ def run(settings: Settings, *, session: Any = None,
                     authenticated = True
                     clear_alert('authentication_required')
                     record('authentication_succeeded')
-                refresh_mine = (history is None or task.data['status'] == 'pending' or not opening_scan
-                                or not 0 <= clock() - mine_at < 10)
-                health(phase='my_activities' if refresh_mine else 'activities', next_check_at=0,
-                       activity_count=None, candidate_count=None)
-                mine_started = clock()
-                if refresh_mine:
+                confirmed = False
+                mine_seconds = 0.0
+                refresh_mine = False
+                if task.data['status'] == 'pending':
+                    # While a submission is unconfirmed, query only my activities and never submit.
+                    health(phase='my_activities', next_check_at=0)
+                    mine_started = clock()
                     history = client.mine()
                     mine_at = clock()
-                mine_seconds = max(0, clock() - mine_started)
-                assert history is not None
-                booked = {activity_id(row) for row in history if reserved(row)}
-                confirmed = False
-                if task.data['status'] == 'pending':
+                    mine_seconds = max(0, clock() - mine_started)
+                    refresh_mine = True
+                    booked = {activity_id(row) for row in history if reserved(row)}
                     pending_wid = task.data['activity']
                     if pending_wid in booked:
                         confirmed = True
@@ -376,28 +428,49 @@ def run(settings: Settings, *, session: Any = None,
                         query_recovered()
                         unconfirmed_checks += 1
                         diagnostic('reservation_checked', wid=pending_wid, checks=unconfirmed_checks)
-                        if unconfirmed_checks < 2:
+                        if unconfirmed_checks < PENDING_MISS_LIMIT:
                             emit('reservation_unconfirmed')
-                            health(phase='confirming', next_check_at=clock() + 1)
-                            pause(1)
+                            health(phase='confirming', next_check_at=clock() + PENDING_MISS_PAUSE)
+                            pause(PENDING_MISS_PAUSE)
                             continue
-                        # Two misses trade duplicate risk for another booking chance; they do not prove failure.
+                        # Repeated misses do not prove failure; release only after spaced checks, then
+                        # force a fresh history so conflicts and booked IDs are re-read before resubmitting.
                         diagnostic('reservation_unconfirmed_released', wid=pending_wid)
                         record('reservation_unconfirmed_released')
                         task.data.update(status='scanning', activity='')
                         task.save()
                         clear_alert('reservation_unconfirmed')
                         unconfirmed_checks = 0
-                current = progress(history, clock())
+                        history = None
+                        mine_at = 0.0
+                        continue
+                    if confirmed:
+                        diagnostic('reservation_confirmed', wid=pending_wid)
+                        task.data.update(status='scanning', activity='')
+                        task.save()
+                        clear_alert('reservation_unconfirmed')
+                        health(last_query_at=clock(), failure_count=0)
+                        emit('reservation_succeeded')
+                        unconfirmed_checks = 0
+                # Query the opening-critical list before the slower history refresh: a slow or
+                # failing my-activities endpoint must not hide the next reservation opening.
+                health(phase='activities')
+                activities_started = clock()
+                rows = client.activities()
+                activities_seconds = max(0, clock() - activities_started)
+                server_offset = school_clock_offset(rows, clock())
+                if not refresh_mine and not (
+                        history is not None and opening_scan and 0 <= clock() - mine_at < 10):
+                    health(phase='my_activities', next_check_at=0,
+                           activity_count=None, candidate_count=None)
+                    mine_started = clock()
+                    history = client.mine()
+                    mine_at = clock()
+                    mine_seconds = max(0, clock() - mine_started)
+                    refresh_mine = True
+                assert history is not None
+                current = progress(history, clock() + server_offset)
                 latest_progress, progress_at = current, mine_at
-                if confirmed:
-                    diagnostic('reservation_confirmed', wid=pending_wid)
-                    task.data.update(status='scanning', activity='')
-                    task.save()
-                    clear_alert('reservation_unconfirmed')
-                    health(last_query_at=clock(), failure_count=0)
-                    emit('reservation_succeeded')
-                    unconfirmed_checks = 0
                 if current.done:
                     newly_completed = task.data['status'] != 'done'
                     task.data.update(status='done', activity='')
@@ -414,6 +487,8 @@ def run(settings: Settings, *, session: Any = None,
                     task.save()
                 if not any(current.needs(category) for category in settings.categories):
                     opening_scan = False
+                    mail_blocked = False
+                    flush_mail()
                     failures = 0
                     health(phase='waiting_for_attendance', last_query_at=clock(), failure_count=0,
                            next_check_at=clock() + 10)
@@ -421,14 +496,12 @@ def run(settings: Settings, *, session: Any = None,
                     clear_alert('task_failed')
                     pause(10)
                     continue
-                health(phase='activities')
-                activities_started = clock()
-                rows = client.activities()
-                activities_seconds = max(0, clock() - activities_started)
-                candidates, details = select_candidates(rows, settings, current, history, task.data['cooldowns'], clock())
+                candidates, details = select_candidates(rows, settings, current, history,
+                                                        task.data['cooldowns'], clock() + server_offset)
                 query_recovered()
-                opening_scan = scan_delay(details, clock(), 0, SCAN_INTERVAL)[1]
-                client.timeout = 3 if opening_scan else 10
+                opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL)[1]
+                mail_blocked = opening_scan
+                client.timeout = SUBMIT_TIMEOUT if opening_scan else 10
                 previous_selection = task.data.get('selection')
                 if (not isinstance(previous_selection, dict)
                         or previous_selection.get('activities') != details):
@@ -437,6 +510,7 @@ def run(settings: Settings, *, session: Any = None,
                 health(last_query_at=clock(), failure_count=failures, activity_count=len(rows),
                        candidate_count=len(candidates), phase='captcha' if candidates else 'waiting')
                 for lecture in candidates:
+                    stale_candidate = False
                     for attempt in range(4):
                         health(phase='captcha')
                         try:
@@ -458,6 +532,20 @@ def run(settings: Settings, *, session: Any = None,
                                 task.save()
                                 diagnostic('captcha_cooldown', wid=lecture.wid, seconds=300)
                             continue
+                        if (opening_scan
+                                and clock() - activities_started > CANDIDATE_REVALIDATE_SECONDS):
+                            # The list-to-captcha path was slow; spent seats may already be gone, so
+                            # re-check the candidate before spending a submission on it.
+                            rechecked_rows = client.activities()
+                            server_offset = school_clock_offset(rechecked_rows, clock())
+                            rechecked, _ = select_candidates(
+                                rechecked_rows, settings, current, history,
+                                task.data['cooldowns'], clock() + server_offset)
+                            if not any(item.wid == lecture.wid for item in rechecked):
+                                diagnostic('candidate_revalidated', wid=lecture.wid, outcome='unavailable')
+                                stale_candidate = True
+                        if stale_candidate:
+                            break
                         # Persist before sending: a crash must recover by querying, never resubmitting.
                         task.data.update(status='pending', activity=lecture.wid)
                         task.save()
@@ -478,7 +566,9 @@ def run(settings: Settings, *, session: Any = None,
                         message = reply.get('msg', '')
                         captcha_wrong = (isinstance(message, str) and '验证码' in message
                                          and any(word in message for word in ('错误', '不正确', '失效', '过期')))
-                        unavailable = isinstance(message, str) and message in ('已满', '名额已满', '不可预约', '预约已结束', '预约未开始')
+                        unavailable = isinstance(message, str) and any(
+                            word in message for word in ('已满', '名额已满', '名额不足', '不可预约',
+                                                         '预约已结束', '预约未开始'))
                         outcome = ('reported_success' if has_code(reply, 0) else 'captcha_wrong' if captcha_wrong
                                    else 'unavailable' if unavailable else 'unconfirmed')
                         diagnostic('submission_reply', wid=lecture.wid, outcome=outcome,
@@ -497,21 +587,23 @@ def run(settings: Settings, *, session: Any = None,
                         task.save()
                         if unavailable:
                             break
-                    if task.data['status'] == 'pending':
+                    if stale_candidate or task.data['status'] == 'pending':
                         break
                 failures = 0
                 clear_alert('task_failed')
                 if task.data['status'] != 'pending':
                     elapsed = max(0, clock() - scan_started)
-                    delay, fast = scan_delay(details, clock(), elapsed, SCAN_INTERVAL)
+                    delay, fast = scan_delay(details, clock() + server_offset, elapsed, SCAN_INTERVAL)
                     if (fast != opening_scan or fast or not last_timing_at
                             or clock() - last_timing_at >= 300):
                         diagnostic('scan_timing', mode='opening' if fast else 'normal',
                                    duration_seconds=elapsed, wait_seconds=delay,
                                    history_reused=not refresh_mine,
                                    mine_seconds=mine_seconds, activities_seconds=activities_seconds)
-                    last_timing_at = clock()
+                        last_timing_at = clock()
                     opening_scan = fast
+                    if not fast:
+                        flush_mail()
                     health(phase='waiting', next_check_at=clock() + delay, failure_count=0)
                     query_recovered()
                     pause(delay)
@@ -536,13 +628,24 @@ def run(settings: Settings, *, session: Any = None,
                     'attendance_status_unknown', 'attendance_record_conflict') else 'invalid_activity_data'
                 record(safe_reason)
                 query_failed(scan_started)
-                opening_scan = scan_delay(details, clock(), 0, SCAN_INTERVAL)[1]
+                if authenticated and not progress_probe_attempted and latest_progress is None:
+                    # One best-effort history read so a sustained query-failure alert can still
+                    # report confirmed progress; never submit from this probe.
+                    progress_probe_attempted = True
+                    try:
+                        history = client.mine()
+                        mine_at = clock()
+                        latest_progress = progress(history, clock() + server_offset)
+                        progress_at = mine_at
+                    except (RemoteError, ValueError):
+                        history = None
+                opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL)[1]
                 quick = (opening_scan and authenticated and isinstance(exc, RemoteError)
                          and reason in FAST_RETRY_REASONS and not exc.retry_after)
                 if quick:
-                    # Opening seconds are scarce: retry transient request failures without counting them.
+                    # Opening seconds are scarce: retry transient request failures at the fast cadence.
                     health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
-                    delay = 1
+                    delay = FAST_INTERVAL
                 else:
                     failures += 1
                     health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
@@ -573,6 +676,9 @@ def run(settings: Settings, *, session: Any = None,
             record('task_failed')
         else:
             emit('task_failed')
+        if not check_only:
+            mail_blocked = False
+            flush_mail()
         return 1
     except Exception:
         final_phase = 'failed'
@@ -581,6 +687,8 @@ def run(settings: Settings, *, session: Any = None,
             print('event=unexpected_failure', flush=True)
         else:
             emit('unexpected_failure')
+            mail_blocked = False
+            flush_mail()
         return 1
     finally:
         if task:

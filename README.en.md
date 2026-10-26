@@ -43,10 +43,10 @@ Open `.env` in a text editor and enter your university credentials:
 ```dotenv
 SEU_CARD_NUMBER="your-card-number"
 SEU_PASSWORD='your-password'
-SEU_PREFERRED_CAMPUS='[]'
+SEU_PREFERRED_CAMPUS='["九龙湖校区","四牌楼校区","丁家桥校区","无锡校区","苏州校区"]'
 ```
 
-An empty campus list allows online lectures only. To allow offline lectures, enter campus names as shown by the university, for example `'["无锡校区"]'`; online lectures remain enabled. See [all settings](docs/usage.md#配置) (Chinese) for other filters.
+All university campuses are allowed for offline lectures by default. An empty campus list allows online lectures only; you can also keep just some campuses. Online lectures remain enabled. See [all settings](docs/usage.md#配置) (Chinese) for other filters.
 
 Email is optional: leave its fields empty to disable it. To enable it, enter your own mailbox and its SMTP authorization code:
 
@@ -124,7 +124,7 @@ sudo systemctl stop seu-lecture-reserve-http.service
 uv run --locked main.py --status
 ```
 
-The stopped service may be collected and reported as not found; task state and logs remain. Running the startup commands again resumes the task without cancelling reservations. If SMS or an uncertain result requires input, background operation saves the task and exits. Confirm it has exited, handle the prompt in the foreground, then resume background operation.
+The stopped service may be collected and reported as not found; task state and logs remain. Running the startup commands again resumes the task without cancelling reservations. If SMS authentication requires input, background operation saves the task and exits; confirm it has exited, handle the prompt in the foreground, then resume background operation. An uncertain reservation result is re-checked against the original activity; if it stays unconfirmed, the program refreshes the school record and continues without a manual restart.
 
 This version has passed offline checks. A real submit-and-cancel flow was verified on a test activity on 2026-10-25. Target-lecture hit rate, SMS recovery and at least 24 hours of operation still require separate acceptance testing; see [acceptance boundaries](docs/usage.md#验收记录). [Business rules](docs/requirements.md) and the [usage guide](docs/usage.md) contain the details (Chinese).
 

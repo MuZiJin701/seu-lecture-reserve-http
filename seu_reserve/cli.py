@@ -140,6 +140,12 @@ def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[S
     return Settings(**data), environ
 
 
+def load_recognizer() -> Any:
+    """Load OCR before any opening window; a first-candidate import would spend opening seconds."""
+    import ddddocr
+    return ddddocr.DdddOcr(show_ad=False).classification
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='SEU lecture goal: 8 attended, including law, art and mental health')
     parser.add_argument('--config', type=Path, help='dotenv file (default: .env in the current directory)')
@@ -182,7 +188,15 @@ def main(argv: list[str] | None = None) -> int:
         for key, label in (('SEU_USERNAME', '一卡通号：'), ('SEU_PASSWORD', '密码：')):
             if not environ.get(key):
                 environ[key] = getpass(label)
-        return run(settings, environ=environ, check_only=args.check, new_task=args.new_task)
+        recognize = None
+        if not args.check:
+            try:
+                recognize = load_recognizer()
+            except Exception:
+                print('event=ocr_unavailable', flush=True)
+                return 1
+        return run(settings, environ=environ, check_only=args.check, new_task=args.new_task,
+                   recognize=recognize)
     except (KeyboardInterrupt, EOFError):
         return 130
     except (ValueError, OSError, TypeError, AttributeError):

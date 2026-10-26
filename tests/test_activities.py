@@ -4,9 +4,9 @@ from urllib.parse import urlsplit
 import pytest
 import requests
 
-from seu_reserve.app import Settings
+from seu_reserve.app import CANDIDATE_REVALIDATE_SECONDS, Settings
 from seu_reserve.model import Lecture, SERIES_CATEGORIES, moment
-from test_app import School, execute, lecture
+from test_app import School, execute, interrupted, lecture
 
 
 OPEN = moment('2029-12-31 19:00:00').timestamp()
@@ -37,6 +37,8 @@ def test_native_open_activity_is_submitted_then_confirmed_by_activity_id(tmp_pat
     events = []
     assert execute(school, tmp_path, clock=lambda: OPEN, notify=events.append) == 130
     assert school.submitted == ['native']
+    submits = [kwargs for method, url, kwargs in school.requests if url.endswith('addReservation.do')]
+    assert submits and submits[0]['timeout'] == 8
     assert events == []
     assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
     saved = json.loads((tmp_path / 'task.json').read_text())
@@ -153,7 +155,7 @@ def test_capacity_full_activity_is_skipped_for_next_candidate(tmp_path):
     assert school.submitted == ['open']
 
 
-def test_opening_network_failure_retries_after_one_second_without_counting(tmp_path):
+def test_opening_network_failure_retries_at_fast_cadence_without_counting(tmp_path):
     school = ActivitySchool()
     school.activities = [activity()]
     assert execute(school, tmp_path, clock=lambda: OPEN - 31) == 130
@@ -170,15 +172,62 @@ def test_opening_network_failure_retries_after_one_second_without_counting(tmp_p
         waits.append(seconds)
         raise KeyboardInterrupt
     assert execute(flaky, tmp_path, clock=lambda: OPEN - 30, sleep=stop) == 130
-    assert waits == [1]
+    assert waits == [0.25]
     assert json.loads((tmp_path / 'task.json').read_text())['health']['failure_count'] == 0
+
+
+def test_opening_history_failure_does_not_hide_activity_polling(tmp_path):
+    class FlakyHistory(ActivitySchool):
+        fail_history = False
+        def request(self, method, url, **kwargs):
+            if self.fail_history and url.endswith('queryMyActivityList.do'):
+                raise requests.Timeout('SECRET history timeout')
+            return super().request(method, url, **kwargs)
+    school = FlakyHistory()
+    school.activities = [activity()]
+    # Prime a saved selection so the next run starts inside the fast window.
+    assert execute(school, tmp_path, clock=lambda: OPEN - 31) == 130
+    school.fail_history = True
+    school.requests.clear()
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 2:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=lambda: OPEN - 1, sleep=stop) == 130
+    lists = [url for _, url, _ in school.requests if url.endswith('queryActivityList.do')]
+    assert len(lists) >= 2
+    assert waits == [0.25, 0.25]
+
+
+def test_slow_candidate_is_revalidated_before_submit(tmp_path):
+    class StaleActivitySchool(ActivitySchool):
+        lists = 0
+        def request(self, method, url, **kwargs):
+            if url.endswith('queryActivityList.do'):
+                self.lists += 1
+                if self.lists == 2:
+                    self.activities = [activity(FBZT='-1')]
+            return super().request(method, url, **kwargs)
+    school = StaleActivitySchool()
+    school.activities = [activity()]
+    now = [OPEN]
+    def clock():
+        return now[0]
+    def recognize(_):
+        now[0] += CANDIDATE_REVALIDATE_SECONDS + 1
+        return '1234'
+    assert execute(school, tmp_path, clock=clock, recognize=recognize, sleep=interrupted) == 130
+    assert school.submitted == []
+    lines = [json.loads(line) for line in (tmp_path / 'diagnostics.jsonl').read_text().splitlines()]
+    assert any(line['event'] == 'candidate_revalidated' for line in lines)
 
 
 def test_opening_scan_reuses_history_until_cache_expires(tmp_path):
     school = ActivitySchool()
     school.activities = [activity()]
     assert execute(school, tmp_path, clock=lambda: OPEN - 31) == 130
-    school.server_now = '2029-12-31 18:00:00'
+    school.server_now = '2029-12-31 18:59:50'
     school.requests.clear()
     waits = []
     def stop(seconds):

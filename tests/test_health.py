@@ -179,7 +179,7 @@ def test_successful_pending_query_breaks_consecutive_failure_count(tmp_path):
         if len(waits) == 3:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, notify=events.append, sleep=wait) == 130
-    assert waits == [20, 40, 1]
+    assert waits == [20, 40, 2]
     assert events == []
     assert 'event=reservation_unconfirmed' in (tmp_path / 'events.log').read_text()
     assert snapshot(tmp_path)['failure_count'] == 0

@@ -9,7 +9,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from seu_reserve.app import Settings, run, scan_delay
+from seu_reserve.app import Settings, run, scan_delay, school_clock_offset
 from seu_reserve.model import moment
 
 
@@ -762,7 +762,16 @@ def test_scan_delay_uses_quarter_second_window_and_next_opening_boundary():
     assert scan_delay([], start, 0, 10) == (10, False)
 
 
-def test_pending_miss_twice_releases_and_rescans(tmp_path):
+def test_school_clock_offset_calibrates_opening_window():
+    now = moment('2026-10-18 12:00:00').timestamp()
+    assert school_clock_offset([], now) == 0
+    assert school_clock_offset([{'_SERVER_NOW': '2026-10-18 12:00:05'}], now) == 5
+    # Day-scale divergence is a fixture or a broken clock, never useful scheduling input.
+    assert school_clock_offset([{'_SERVER_NOW': '2026-10-19 12:00:00'}], now) == 0
+    assert school_clock_offset([{'_SERVER_NOW': 'invalid'}], now) == 0
+
+
+def test_pending_misses_release_after_extended_checks_and_rescan(tmp_path):
     school = School()
     school.activities = [lecture()]
     school.submit_timeout = True
@@ -773,10 +782,10 @@ def test_pending_miss_twice_releases_and_rescans(tmp_path):
     later = moment('2026-10-18 12:05:00').timestamp()
     def wait(seconds):
         waits.append(seconds)
-        if len(waits) == 2:
+        if len(waits) == 5:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, sleep=wait, notify=events.append, clock=lambda: later) == 130
-    assert waits == [1, 10]
+    assert waits == [2, 2, 2, 2, 10]
     assert school.submitted == ['one', 'one']
     assert events == []
     events_log = (tmp_path / 'events.log').read_text()

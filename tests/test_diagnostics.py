@@ -178,6 +178,22 @@ def diagnostics(tmp_path):
     return [json.loads(line) for line in (tmp_path / 'diagnostics.jsonl').read_text().splitlines()]
 
 
+def test_scan_timing_is_logged_periodically_after_the_first_scan(tmp_path):
+    school = School()
+    school.activities = [lecture(YYZT='未开放', HDMC='PRIVATE TITLE')]
+    now = [1000.0]
+    waits = []
+    def wait(seconds):
+        waits.append(seconds)
+        now[0] += 301
+        if len(waits) == 2:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=lambda: now[0], sleep=wait) == 130
+    timings = [line for line in diagnostics(tmp_path) if line['event'] == 'scan_timing']
+    assert len(timings) >= 2
+    assert all(line['mode'] == 'normal' for line in timings)
+
+
 def test_diagnostics_record_scan_timing_once_and_selection_only_on_change(tmp_path, capsys):
     school = School()
     school.activities = [lecture(YYZT='未开放', HDMC='PRIVATE TITLE')]
@@ -224,12 +240,12 @@ def test_pending_checks_release_and_submission_are_diagnosed(tmp_path):
     waits = []
     def wait(seconds):
         waits.append(seconds)
-        if len(waits) == 2:
+        if len(waits) == 5:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, sleep=wait, clock=lambda: 2000) == 130
     lines = diagnostics(tmp_path)
     checks = [line['checks'] for line in lines if line['event'] == 'reservation_checked']
-    assert checks == [1, 2]
+    assert checks == [1, 2, 3, 4, 5]
     assert any(line['event'] == 'reservation_unconfirmed_released' for line in lines)
     errors = [line for line in lines if line['event'] == 'submission_error']
     assert errors and errors[0]['wid'] == 'one' and errors[0]['reason'] == 'network_timeout'

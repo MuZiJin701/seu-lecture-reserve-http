@@ -4,6 +4,7 @@ import base64
 import json
 import math
 import re
+import select
 import socket
 import ssl
 import time
@@ -28,6 +29,43 @@ HOSTS = {'auth.seu.edu.cn', 'vpn.seu.edu.cn', 'ehall.seu.edu.cn'}
 # Read bodies in large chunks and bound each blocking read by the remaining request budget:
 # one-byte iteration made every response byte pass through Python code and timing checks.
 RESPONSE_CHUNK_SIZE = 65536
+
+
+class _DeadlineSocket:
+    """Make every socket read wait no longer than the total response budget.
+
+    A Requests/urllib3 read may loop internally (gzip decoding, chunked framing) and a socket
+    timeout only limits a single recv. Routing each recv through select() with the remaining
+    budget lets the deadline interrupt those loops; the timeout surfaces as a normal read
+    timeout and is reported as network_timeout.
+    """
+
+    def __init__(self, sock: Any, deadline: float):
+        self._sock = sock
+        self._deadline = deadline
+
+    def recv_into(self, buffer: Any, nbytes: int = 0, flags: int = 0) -> int:
+        if not self._wait_for_data():
+            raise socket.timeout('response deadline exceeded')
+        return self._sock.recv_into(buffer, nbytes, flags)
+
+    def recv(self, bufsize: int, flags: int = 0) -> bytes:
+        if not self._wait_for_data():
+            raise socket.timeout('response deadline exceeded')
+        return self._sock.recv(bufsize, flags)
+
+    def _wait_for_data(self) -> bool:
+        # TLS may already hold decrypted bytes that select() cannot see.
+        pending = getattr(self._sock, 'pending', None)
+        if pending is not None and pending():
+            return True
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        return bool(select.select([self._sock], [], [], remaining)[0])
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sock, name)
 
 
 class GatewayIPAdapter(requests.adapters.HTTPAdapter):
@@ -200,6 +238,11 @@ class Client:
         buffered = getattr(getattr(raw, '_fp', None), 'fp', None)
         return getattr(getattr(buffered, 'raw', None), '_sock', None)
 
+    @staticmethod
+    def _socket_holder(raw: Any) -> Any:
+        """The SocketIO wrapper whose ``_sock`` the transport reads from, if reachable."""
+        return getattr(getattr(getattr(raw, '_fp', None), 'fp', None), 'raw', None)
+
     def _read_body(self, response: Any, deadline: float) -> bytes:
         raw = response.raw
         read1 = getattr(raw, 'read1', None)
@@ -212,6 +255,13 @@ class Client:
                 original_timeout = sock.gettimeout()
             except OSError:
                 sock = None
+        # One read1() call may loop over many recvs (gzip decoding, chunked framing); route each
+        # recv through a select() bounded by the deadline so those loops cannot outlive it.
+        holder = self._socket_holder(raw)
+        wrapped = None
+        if sock is not None and holder is not None and getattr(holder, '_sock', None) is sock:
+            wrapped = _DeadlineSocket(sock, deadline)
+            holder._sock = wrapped
         body = bytearray()
         try:
             while True:
@@ -220,8 +270,8 @@ class Client:
                     raise RemoteError('network_timeout')
                 if sock is not None:
                     try:
-                        # Bound the next blocking read by the budget that is actually left
-                        # rather than by the whole request timeout.
+                        # Bound a single blocking recv as well; the wrapper enforces the total
+                        # budget across the transport's internal read loop.
                         sock.settimeout(max(remaining, 0.001))
                     except OSError:
                         sock = None
@@ -242,6 +292,8 @@ class Client:
             self._discard(response)
             raise
         finally:
+            if wrapped is not None:
+                holder._sock = wrapped._sock
             if sock is not None and original_timeout is not None:
                 try:
                     sock.settimeout(original_timeout)

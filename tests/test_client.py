@@ -1,11 +1,12 @@
 import datetime
+import gzip
 import json
 import socket
 import ssl
 import threading
 import time
 from http.client import RemoteDisconnected
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from types import SimpleNamespace
 
 import pytest
@@ -45,6 +46,21 @@ def gateway_server(tmp_path, monkeypatch, request):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             received.append((self.headers['Host'], self.headers.get('Cookie')))
+            if self.path.endswith('/slow-gzip'):
+                payload = gzip.compress(b'{"code": 0}')
+                self.send_response(200)
+                self.send_header('Content-Encoding', 'gzip')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                try:
+                    self.wfile.write(payload[:1])
+                    self.wfile.flush()
+                    time.sleep(0.3)
+                    self.wfile.write(payload[1:])
+                    self.wfile.flush()
+                except OSError:
+                    pass
+                return
             self.send_response(200)
             self.send_header('Set-Cookie', 'gateway=test; Secure; Path=/')
             self.end_headers()
@@ -451,3 +467,99 @@ def test_request_uses_configurable_timeout():
     client.request('GET', 'https://ehall.seu.edu.cn/modules/hdyy/vcode.do')
     assert [call[2]['timeout'] for call in session.calls] == [10.0, 3]
     assert all(call[2]['verify'] is True for call in session.calls)
+
+
+@pytest.fixture
+def body_server():
+    gzip_body = gzip.compress(b'{"code":0,"data":"' + b'a' * 200 + b'"}')
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                if self.path == '/gzip-slow':
+                    self.send_response(200)
+                    self.send_header('Content-Encoding', 'gzip')
+                    self.send_header('Content-Length', str(len(gzip_body)))
+                    self.end_headers()
+                    for byte in gzip_body:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.1)
+                elif self.path == '/chunked-slow':
+                    self.send_response(200)
+                    self.send_header('Transfer-Encoding', 'chunked')
+                    self.end_headers()
+                    for byte in b'10\r\n':
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.2)
+                    self.wfile.write(b'0123456789abcdef\r\n0\r\n\r\n')
+                    self.wfile.flush()
+                else:
+                    payload = b'{"code": 0}'
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+            except OSError:
+                pass
+            self.close_connection = True
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield 'http://127.0.0.1:%d' % server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def read_body_with_budget(base, path, budget):
+    with requests.Session() as session:
+        client = Client(session, {}, input, lambda _: None)
+        response = session.get(base + path, stream=True, timeout=5)
+        started = time.monotonic()
+        try:
+            body = client._read_body(response, time.monotonic() + budget)
+            return body, time.monotonic() - started, None
+        except RemoteError as exc:
+            return None, time.monotonic() - started, str(exc)
+
+
+@pytest.mark.parametrize('path', ['/gzip-slow', '/chunked-slow'])
+def test_total_budget_interrupts_internal_body_read_loops(body_server, path):
+    body, elapsed, reason = read_body_with_budget(body_server, path, 0.2)
+    assert reason == 'network_timeout'
+    assert elapsed < 0.6
+
+
+def test_fast_body_read_keeps_the_connection_reusable(body_server):
+    with requests.Session() as session:
+        client = Client(session, {}, input, lambda _: None)
+        for _ in range(2):
+            response = session.get(body_server + '/fast', stream=True, timeout=5)
+            body = client._read_body(response, time.monotonic() + 5)
+            assert body == b'{"code": 0}'
+            response._content = body
+            response._content_consumed = True
+            response.close()
+
+
+@pytest.mark.parametrize('gateway_server', ['vpn.seu.edu.cn'], indirect=True)
+def test_total_budget_interrupts_a_slow_gzip_body_over_tls(gateway_server, monkeypatch):
+    with requests.Session() as session:
+        client = Client(session, {'SEU_VPN_IP': '127.0.0.1'}, input, lambda _: None)
+        monkeypatch.setattr(client, '_authenticate', lambda: client.get(GATEWAY + '/public'))
+        client.authenticate()
+        client.timeout = 0.2
+        started = time.monotonic()
+        with pytest.raises(RemoteError) as error:
+            client.request('GET', GATEWAY + '/slow-gzip')
+        elapsed = time.monotonic() - started
+    assert str(error.value) == 'network_timeout'
+    assert elapsed < 1.0

@@ -4,7 +4,7 @@ from urllib.parse import urlsplit
 import pytest
 import requests
 
-from seu_reserve.app import CANDIDATE_REVALIDATE_SECONDS, Settings
+from seu_reserve.app import Settings
 from seu_reserve.model import Lecture, SERIES_CATEGORIES, moment
 from test_app import School, execute, interrupted, lecture
 
@@ -200,7 +200,7 @@ def test_opening_history_failure_does_not_hide_activity_polling(tmp_path):
     assert waits == [0.25, 0.25]
 
 
-def test_slow_candidate_is_revalidated_before_submit(tmp_path):
+def test_slow_captcha_path_submits_without_an_extra_list_query(tmp_path):
     class StaleActivitySchool(ActivitySchool):
         lists = 0
         def request(self, method, url, **kwargs):
@@ -215,12 +215,28 @@ def test_slow_candidate_is_revalidated_before_submit(tmp_path):
     def clock():
         return now[0]
     def recognize(_):
-        now[0] += CANDIDATE_REVALIDATE_SECONDS + 1
+        now[0] += 4
         return '1234'
     assert execute(school, tmp_path, clock=clock, recognize=recognize, sleep=interrupted) == 130
-    assert school.submitted == []
+    assert school.submitted == ['native']
     lines = [json.loads(line) for line in (tmp_path / 'diagnostics.jsonl').read_text().splitlines()]
-    assert any(line['event'] == 'candidate_revalidated' for line in lines)
+    assert not any(line['event'] == 'candidate_revalidated' for line in lines)
+
+
+def test_opening_history_cache_survives_ten_seconds_without_refresh(tmp_path):
+    school = ActivitySchool()
+    school.activities = [activity()]
+    school.server_now = '2029-12-31 18:59:50'
+    now = [OPEN]
+    waits = []
+    def wait(seconds):
+        waits.append(seconds)
+        now[0] += 10
+        if len(waits) == 3:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=lambda: now[0], sleep=wait) == 130
+    history_calls = [url for _, url, _ in school.requests if url.endswith('queryMyActivityList.do')]
+    assert len(history_calls) == 1
 
 
 def test_opening_scan_reuses_history_until_cache_expires(tmp_path):
@@ -387,7 +403,7 @@ def test_missing_clock_keeps_calibration_for_candidate_and_cooldown(tmp_path, sl
     now = [OPEN + 600]
     def recognize(_):
         if slow_path:
-            now[0] += CANDIDATE_REVALIDATE_SECONDS + 1
+            now[0] += 4
             return '1234'
         return ''
     waits = []

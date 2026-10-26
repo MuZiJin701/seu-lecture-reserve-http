@@ -25,9 +25,9 @@ QUERY_FAILURE_SECONDS = 5 * 60
 MAJOR_MAIL_EVENTS = {'authentication_required', 'query_failure', 'task_failed', 'unexpected_failure'}
 SCAN_INTERVAL = 10
 FAST_INTERVAL = 0.25
-FAST_RETRY_REASONS = {'network_timeout', 'network_failure', 'connection_failure', 'proxy_failure',
-                      'invalid_json', 'invalid_response', 'http_failure', 'business_response_invalid',
-                      'business_rows_invalid', 'business_rows_incomplete'}
+FAST_RETRY_REASONS = {'network_timeout', 'connect_timeout', 'network_failure', 'connection_failure',
+                      'proxy_failure', 'invalid_json', 'invalid_response', 'http_failure',
+                      'business_response_invalid', 'business_rows_invalid', 'business_rows_incomplete'}
 SELECTION_REASONS = {'candidate', 'reservation_not_started', 'reservation_ended', 'capacity_full',
     'not_reservable', 'already_reserved', 'category_not_allowed', 'category_not_needed',
     'title_not_selected', 'online_disabled', 'offline_disabled', 'campus_not_selected',
@@ -44,9 +44,9 @@ SUBMIT_TIMEOUT = 8
 # A list query during the opening window must survive a briefly overloaded server instead of
 # aborting at 3 s; the timeout still bounds a dead connection and the fast retry re-joins quickly.
 OPENING_QUERY_TIMEOUT = 6
-# If the list-to-submit path took long enough for seats to change, re-check the candidate before
-# spending a submission; this only adds one list query on the slow path.
-CANDIDATE_REVALIDATE_SECONDS = 3.0
+# During the opening window, reuse the history fetched immediately before it instead of
+# synchronously refreshing at the opening instant; the trade-off is bounded stale conflict data.
+OPENING_HISTORY_TTL = 30.0
 # 502/503/504 mean the server is overloaded, not that a rate limit is in force; recover in seconds
 # during an opening instead of the 20-40-80 s limiter backoff. Explicit Retry-After still wins.
 OVERLOAD_RETRY_CAP = 5.0
@@ -527,7 +527,7 @@ def run(settings: Settings, *, session: Any = None,
                         task.data['cooldowns'] = fresh
                         task.save()
                 if not refresh_mine and not (
-                        history is not None and opening_scan and 0 <= clock() - mine_at < 10):
+                        history is not None and opening_scan and 0 <= clock() - mine_at < OPENING_HISTORY_TTL):
                     health(phase='my_activities', next_check_at=0,
                            activity_count=None, candidate_count=None)
                     mine_started = clock()
@@ -578,7 +578,6 @@ def run(settings: Settings, *, session: Any = None,
                 health(last_query_at=clock(), failure_count=failures, activity_count=len(rows),
                        candidate_count=len(candidates), phase='captcha' if candidates else 'waiting')
                 for lecture in candidates:
-                    stale_candidate = False
                     for attempt in range(4):
                         health(phase='captcha')
                         try:
@@ -600,23 +599,6 @@ def run(settings: Settings, *, session: Any = None,
                                 task.save()
                                 diagnostic('captcha_cooldown', wid=lecture.wid, seconds=300)
                             continue
-                        if (opening_scan
-                                and clock() - activities_started > CANDIDATE_REVALIDATE_SECONDS):
-                            # The list-to-captcha path was slow; spent seats may already be gone, so
-                            # re-check the candidate before spending a submission on it.
-                            rechecked_rows = client.activities()
-                            if school_clock_known(rechecked_rows, clock()):
-                                server_offset = school_clock_offset(rechecked_rows, clock())
-                                offset_known = True
-                            rechecked, _ = select_candidates(
-                                rechecked_rows, settings, current, history,
-                                task.data['cooldowns'], clock() + server_offset,
-                                cooldown_clock_known=offset_known)
-                            if not any(item.wid == lecture.wid for item in rechecked):
-                                diagnostic('candidate_revalidated', wid=lecture.wid, outcome='unavailable')
-                                stale_candidate = True
-                        if stale_candidate:
-                            break
                         # Persist before sending: a crash must recover by querying, never resubmitting.
                         task.data.update(status='pending', activity=lecture.wid)
                         task.save()
@@ -630,6 +612,13 @@ def run(settings: Settings, *, session: Any = None,
                             diagnostic('submission_error', wid=lecture.wid, reason=str(exc),
                                        duration_seconds=max(0, clock() - submission_started))
                             health(last_error=str(exc), last_error_at=clock())
+                            if str(exc) == 'connect_timeout':
+                                # The connection never formed, so this submission was not sent;
+                                # revert pending and retry rather than blocking the whole task.
+                                task.data.update(status='scanning', activity='')
+                                task.save()
+                                diagnostic('submission_connect_failed', wid=lecture.wid)
+                                break
                             if isinstance(exc, AuthenticationExpired):
                                 authenticated = False
                             defer(max(1, exc.retry_after) if opening_scan else max(20, exc.retry_after))
@@ -658,7 +647,7 @@ def run(settings: Settings, *, session: Any = None,
                         task.save()
                         if unavailable:
                             break
-                    if stale_candidate or task.data['status'] == 'pending':
+                    if task.data['status'] == 'pending':
                         break
                 failures = 0
                 clear_alert('task_failed')

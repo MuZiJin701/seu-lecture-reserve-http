@@ -144,6 +144,10 @@ class Client:
             raise failure from None
         except requests.exceptions.ProxyError:
             raise RemoteError('proxy_failure') from None
+        except requests.exceptions.ConnectTimeout:
+            # The TCP connection was never established, so the request was not sent; this is
+            # safe to retry and must not be treated as an unknown submission outcome.
+            raise RemoteError('connect_timeout') from None
         except requests.Timeout:
             raise RemoteError('network_timeout') from None
         except requests.ConnectionError as exc:

@@ -787,6 +787,23 @@ def test_school_clock_offset_calibrates_opening_window():
     assert school_clock_offset([{'_SERVER_NOW': 'invalid'}], now) == 0
 
 
+def test_connect_timeout_does_not_leave_the_task_pending(tmp_path):
+    class ConnectTimeoutSchool(School):
+        attempts = 0
+        def request(self, method, url, **kwargs):
+            if url.endswith('addReservation.do'):
+                self.attempts += 1
+                raise requests.exceptions.ConnectTimeout('SECRET connect timeout')
+            return super().request(method, url, **kwargs)
+    school = ConnectTimeoutSchool()
+    school.activities = [lecture()]
+    assert execute(school, tmp_path, sleep=interrupted) == 130
+    assert school.attempts == 1
+    assert school.submitted == []
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert saved['status'] == 'scanning' and not saved['activity']
+
+
 def test_resolve_pending_confirms_when_school_history_shows_it(tmp_path):
     school = School()
     school.activities = [lecture()]

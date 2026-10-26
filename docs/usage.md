@@ -177,7 +177,7 @@ tail -n 20 state/events.log
 
 日志每行带 Unix 时间戳，旧错误仍保留；未记录过事件时文件可能不存在。启动署名不代表登录成功。后台启动、`--check` 和 `--test-mail` 展示一次维护者及项目链接，`--status` 和 `--help` 保持简洁。
 
-私有诊断另写在 `state/diagnostics.jsonl`：扫描节奏、筛选变化、候选复核、验证码、提交与核对结果；字段仅含活动 ID、标题、固定原因、计数与耗时。诊断不进入终端、邮件或事件日志；`--check` 不写诊断，按需在本地排查时读取。
+私有诊断另写在 `state/diagnostics.jsonl`：扫描节奏、筛选变化、验证码、提交与核对结果；字段仅含活动 ID、标题、固定原因、计数与耗时。诊断不进入终端、邮件或事件日志；`--check` 不写诊断，按需在本地排查时读取。
 
 ### 筛选原因
 
@@ -214,13 +214,14 @@ tail -n 20 state/events.log
 | `reservation_unconfirmed` | 保持待确认，只核对原活动；查不到不构成失败证据，不自动重试或提交其他场次，需人工核对学校记录后处理（不发邮件） |
 | `query_failure` / `query_recovered` | 持续故障／完整查询恢复；恢复不等于预约成功 |
 | `notification_deferred` / `notification_skipped_recovered` | 开抢窗口内查询失败告警延后；窗口结束前恢复则跳过，不重复发送 |
+| `connect_timeout` | 连接阶段超时、请求未发出；程序恢复扫描并重试，不进入待确认 |
 | `server_backoff` / `service_unavailable` | 429 按 `Retry-After` 等待；502/503/504 为临时过载，按短退避恢复，持续失败再升级 |
 | `pending_confirmed` / `pending_released_by_operator` / `pending_resolution_cancelled` | `--resolve-pending` 的人工核对结果；取消不改变任务 |
 | `reservation_succeeded` / `goal_completed` | 已按 ID 确认一场／实际选听目标达标 |
 | `task_failed` / `unexpected_failure` | 可捕获异常退出，检查本地错误和服务日志后恢复 |
 | `mail_configuration_invalid` / `notification_failed` | 核对邮件字段或下表错误分类，业务结果不受发信失败影响 |
 
-只读检查会输出 `stage` 和安全原因。网络原因包括 `dns_failure`、`tls_failure`、`proxy_failure`、`network_timeout`、`connection_failure`、`network_failure`、`http_failure`、`server_backoff` 和 `service_unavailable`；HTTP 错误附状态码。`server_backoff` 表示 429 限流，按 `Retry-After` 等待；`service_unavailable` 表示 502/503/504 临时过载，按短退避恢复。TLS 诊断只显示白名单域名、固定 `tls_reason` 及可确定时的 `proxy_used`，不打印异常原文或代理地址。证书失败不能通过关闭校验解决。
+只读检查会输出 `stage` 和安全原因。网络原因包括 `dns_failure`、`tls_failure`、`proxy_failure`、`network_timeout`、`connect_timeout`、`connection_failure`、`network_failure`、`http_failure`、`server_backoff` 和 `service_unavailable`；HTTP 错误附状态码。`connect_timeout` 表示连接未建立、请求未发出，可安全重试；`network_timeout` 表示已发送但结果未知或读取超时，提交按待确认处理。`server_backoff` 表示 429 限流，按 `Retry-After` 等待；`service_unavailable` 表示 502/503/504 临时过载，按短退避恢复。TLS 诊断只显示白名单域名、固定 `tls_reason` 及可确定时的 `proxy_used`，不打印异常原文或代理地址。证书失败不能通过关闭校验解决。
 
 邮件失败分类为 `dns_failed`、`tls_failed`、`timeout`、`authentication_failed`、`sender_refused`、`recipient_refused`、`message_rejected`、`connection_failed`、`smtp_failed`、`network_failed` 或 `unknown`。分别检查网络、授权码、服务器和发件／收件设置；不自动重发，SMTP 接受后仍需确认收件箱。
 
@@ -268,6 +269,7 @@ Python 3.12、uv 和锁文件是开发入口；OCR 使用 ddddocr 自带模型�
 | 2026-10-25 第二批改造 | 诊断文件、A 版重大告警策略（无日报/无冷却）、健康快照、沙龙计入目标及测试/购票公告排除完成；离线测试 353 项通过、3 项平台限制跳过，mypy 通过；已提交（`89e9558`），并于当日 22:34 在服务器启动系统级后台服务 |
 | 2026-10-26 服务器运行观察 | 后台服务自 2026-10-25 22:34 起连续运行约 16 小时 37 分（截至 15:11）：`--status` 为 scanning／waiting，最近查询无错误、失败计数 0、候选 0（6 条记录中 5 场未开放、1 场测试公告），journal 无错误；不足二十四小时，长期运行、重启恢复与目标讲座真实预约仍待验收 |
 | 2026-10-26 复查修复 | 待确认不再因查不到而自动释放或重试，保持 pending 并只核对原场；新增 `--resolve-pending` 人工核对与显式确认恢复；冷却清理延后到学校时钟校准完成后，重启不再误删有效冷却；429 按 `Retry-After` 等待，502/503/504 改走 1/2/4/5 秒短退避；活动列表失败保留有效历史缓存；验证码冷却统一使用学校校准时间；离线测试 369 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
+| 2026-10-26 开抢前修复 | 连接阶段超时不再进入 pending，可按“请求未发送”安全恢复；开抢窗口沿用开抢前 30 秒内的历史缓存，避免开放瞬间同步刷新阻塞；移除提交前额外列表复核；离线测试 374 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
 | 既有离线基线 | 2026-10-18 的 `d3e2b7b` 记录完整 307 项测试及类型检查通过，覆盖提交确认、状态损坏、恢复通知与异常退避 |
 | 学校只读接入 | 历史版本已验证认证、活动和我的活动查询、验证码图片；2026-10-18 核对六条非空列表的真实字段与开放时间解析，没有据此确认预约成功 |
 | 邮件送达 | 2026-10-16 一封真实测试邮件被 SMTP 接受，用户确认收到；新增服务商和真实业务通知仍需各自验收 |

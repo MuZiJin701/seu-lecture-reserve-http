@@ -228,7 +228,7 @@ def test_unselected_ended_overlap_does_not_pause_confirmed_attendance():
     assert not current.planned
 
 
-@pytest.mark.parametrize('changes', [{'SFDK': None}, {'HDLX_DISPLAY': '未知'}, {'KSSJ': 'invalid'}])
+@pytest.mark.parametrize('changes', [{'SFDK': 'unknown'}, {'HDLX_DISPLAY': '未知'}, {'KSSJ': 'invalid'}])
 def test_unknown_overlapping_record_still_requires_validation(changes):
     rows = [lecture('checked', YYZT='已预约', SFDK='1'),
             lecture('unknown', YYZT='已预约', **changes)]
@@ -267,10 +267,35 @@ def test_recheck_completed_task_does_not_count_eight_overlapping_attendances(tmp
 
 def test_read_only_check_validates_attendance_schema_without_creating_state(tmp_path):
     school = School()
-    school.mine = [lecture('unknown', YYZT='已预约', SFDK=None)]
+    school.mine = [lecture('unknown', YYZT='已预约', SFDK='unknown')]
     directory = tmp_path / 'unused'
     assert execute(school, directory, check_only=True) == 1
     assert not directory.exists() and not school.submitted
+
+
+def test_future_reservation_with_missing_attendance_fields_counts_as_planned():
+    row = {'WID': 'booking', 'HD_WID': 'future-art', 'FBZT': '1', 'SFDK': '0',
+           'JZXL_DISPLAY': ART, 'JZSJ': '2026-10-27 18:30:00', 'HDJSSJ': '2026-10-27 20:30:00'}
+    current = progress([row], 1793000000)
+    assert current.planned == {ART: 1}
+    assert not current.completed
+
+
+def test_ended_reservation_with_missing_attendance_status_still_blocks():
+    row = {'WID': 'booking', 'HD_WID': 'past-art', 'FBZT': '1', 'SFDK': None,
+           'JZXL_DISPLAY': ART, 'JZSJ': '2020-01-01 10:00:00', 'HDJSSJ': '2020-01-01 11:00:00'}
+    with pytest.raises(ValueError):
+        progress([row], 1793000000)
+
+
+def test_future_reservation_missing_breach_field_does_not_block_next_submission(tmp_path):
+    school = School()
+    school.mine = [{'WID': 'booking', 'HD_WID': 'future-art', 'FBZT': '1', 'SFDK': '0',
+                    'JZXL_DISPLAY': ART, 'JZSJ': '2030-01-01 10:00:00', 'HDJSSJ': '2030-01-01 11:00:00'}]
+    school.activities = [lecture('next-law', HDLX_DISPLAY=LAW,
+                                 KSSJ='2030-01-01 12:00:00', JSSJ='2030-01-01 13:00:00')]
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == ['next-law']
 
 
 def test_legacy_one_success_reopens_and_preserves_wait_and_pending(tmp_path):

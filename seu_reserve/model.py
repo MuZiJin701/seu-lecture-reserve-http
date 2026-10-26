@@ -67,10 +67,20 @@ def progress(rows: list[dict[str, Any]], now: float) -> Progress:
             raise ValueError('attendance_category_unknown')
         if category not in GOAL_CATEGORIES:
             raise ValueError('attendance_category_unknown')
+        start, end = interval(row)
         checked, breached = row.get('SFDK'), row.get('SFWY')
         if checked not in ('0', '1') or breached not in ('0', '1'):
-            raise ValueError('attendance_status_unknown')
-        start, end = interval(row)
+            # A freshly created reservation can arrive without attendance/breach fields (the
+            # school fills them after the event). For a record that has not ended yet, a missing
+            # field means "not attended/violated yet", so it counts as planned rather than
+            # blocking every later booking on an impossible future attendance result.
+            if end.timestamp() > now:
+                if checked is None or checked == '':
+                    checked = '0'
+                if breached is None or breached == '':
+                    breached = '0'
+            if checked not in ('0', '1') or breached not in ('0', '1'):
+                raise ValueError('attendance_status_unknown')
         if breached == '1':
             continue
         records.append((checked, category, start, end, wid))

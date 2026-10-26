@@ -209,7 +209,7 @@ tail -n 20 state/events.log
 | `credentials_require_terminal` / `authentication_rejected` | 补齐凭据或核对账号状态，避免反复登录 |
 | `authentication_required` / `interactive_terminal_required` | 确认后台退出后前台处理短信或其他挑战 |
 | `activity_schema_unknown` / `business_response_invalid` | 目标数据或活动列表响应格式变化，暂停提交并核实接口，不能当作零候选 |
-| `invalid_activity_data` / `attendance_category_unknown` / `attendance_status_unknown` / `attendance_record_conflict` | 已有记录不可靠，不删除状态或绕过校验 |
+| `invalid_activity_data` / `attendance_category_unknown` / `attendance_status_unknown` / `attendance_record_conflict` | 已有记录不可靠，不删除状态或绕过校验；尚未结束的新预约缺少打卡/违约字段时按未参加处理，结束后仍未知才暂停 |
 | `attendance_result_pending` | 已结束记录尚无打卡或违约结论，等学校更新 |
 | `reservation_unconfirmed` | 保持待确认，只核对原活动；查不到不构成失败证据，不自动重试或提交其他场次，需人工核对学校记录后处理（不发邮件） |
 | `query_failure` / `query_recovered` | 持续故障／完整查询恢复；恢复不等于预约成功 |
@@ -270,6 +270,7 @@ Python 3.12、uv 和锁文件是开发入口；OCR 使用 ddddocr 自带模型�
 | 2026-10-26 服务器运行观察 | 后台服务自 2026-10-25 22:34 起连续运行约 16 小时 37 分（截至 15:11）：`--status` 为 scanning／waiting，最近查询无错误、失败计数 0、候选 0（6 条记录中 5 场未开放、1 场测试公告），journal 无错误；不足二十四小时，长期运行、重启恢复与目标讲座真实预约仍待验收 |
 | 2026-10-26 复查修复 | 待确认不再因查不到而自动释放或重试，保持 pending 并只核对原场；新增 `--resolve-pending` 人工核对与显式确认恢复；冷却清理延后到学校时钟校准完成后，重启不再误删有效冷却；429 按 `Retry-After` 等待，502/503/504 改走 1/2/4/5 秒短退避；活动列表失败保留有效历史缓存；验证码冷却统一使用学校校准时间；离线测试 369 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
 | 2026-10-26 开抢前修复 | 连接阶段超时不再进入 pending，可按“请求未发送”安全恢复；开抢窗口沿用开抢前 30 秒内的历史缓存，避免开放瞬间同步刷新阻塞；移除提交前额外列表复核；离线测试 374 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
+| 2026-10-26 预约后修复 | 新预约尚未结束且缺少 `SFDK`/`SFWY` 时按“未参加、未违约”计入待参加，不再误报 `attendance_status_unknown` 阻塞后续；已结束记录仍缺字段时才暂停；离线测试 377 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
 | 既有离线基线 | 2026-10-18 的 `d3e2b7b` 记录完整 307 项测试及类型检查通过，覆盖提交确认、状态损坏、恢复通知与异常退避 |
 | 学校只读接入 | 历史版本已验证认证、活动和我的活动查询、验证码图片；2026-10-18 核对六条非空列表的真实字段与开放时间解析，没有据此确认预约成功 |
 | 邮件送达 | 2026-10-16 一封真实测试邮件被 SMTP 接受，用户确认收到；新增服务商和真实业务通知仍需各自验收 |

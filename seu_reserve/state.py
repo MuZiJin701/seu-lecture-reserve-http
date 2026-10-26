@@ -90,13 +90,18 @@ class Task:
                 alerts = data.get('alerts', {})
                 if (not isinstance(alerts, dict)
                         or any(key not in ('query_failure', 'authentication_required', 'task_failed',
-                                           'reservation_unconfirmed') for key in alerts)
+                                           'reservation_unconfirmed', 'reservation_step_failure')
+                               for key in alerts)
                         or any(type(value) not in (int, float) or not math.isfinite(value)
                                or not 0 <= value <= 253402214400 for value in alerts.values())):
                     raise ValueError('state_invalid')
-                since = data.get('query_failure_since')
-                if since is not None and (type(since) not in (int, float) or not math.isfinite(since)
-                                          or not 0 <= since <= 253402214400):
+                for field in ('query_failure_since', 'pending_since', 'step_failure_since'):
+                    since = data.get(field)
+                    if since is not None and (type(since) not in (int, float) or not math.isfinite(since)
+                                              or not 0 <= since <= 253402214400):
+                        raise ValueError('state_invalid')
+                checks = data.get('pending_checks')
+                if checks is not None and (type(checks) is not int or not 0 <= checks <= 1_000_000):
                     raise ValueError('state_invalid')
                 if username and account != data['account']:
                     raise ValueError('state_account_mismatch')

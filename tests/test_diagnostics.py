@@ -228,7 +228,7 @@ def test_selection_change_is_not_duplicated_across_restart(tmp_path):
     assert sum(line['event'] == 'selection_changed' for line in lines) == 1
 
 
-def test_pending_checks_keep_task_pending_and_are_diagnosed(tmp_path):
+def test_pending_checks_are_diagnosed_and_release_automatically(tmp_path):
     school = School()
     school.activities = [lecture()]
     school.submit_timeout = True
@@ -240,16 +240,16 @@ def test_pending_checks_keep_task_pending_and_are_diagnosed(tmp_path):
     waits = []
     def wait(seconds):
         waits.append(seconds)
-        if len(waits) == 5:
+        if len(waits) == 3:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, sleep=wait, clock=lambda: 2000) == 130
     lines = diagnostics(tmp_path)
     checks = [line['checks'] for line in lines if line['event'] == 'reservation_checked']
-    assert checks == [1, 2, 3, 4, 5]
-    assert not any(line['event'] == 'reservation_unconfirmed_released' for line in lines)
+    assert checks == [1, 2, 3]
+    assert any(line['event'] == 'reservation_unconfirmed_released' for line in lines)
     errors = [line for line in lines if line['event'] == 'submission_error']
     assert errors and errors[0]['wid'] == 'one' and errors[0]['reason'] == 'network_timeout'
-    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'pending'
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
 
 
 def test_ocr_failures_cooldown_and_submission_reply_are_diagnosed(tmp_path):

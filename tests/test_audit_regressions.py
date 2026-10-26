@@ -53,7 +53,7 @@ def test_unavailable_message_variants_do_not_stay_pending(tmp_path, message):
     assert saved['status'] == 'scanning' and not saved['activity']
 
 
-def test_pending_timeout_never_resubmits_without_confirmation(tmp_path):
+def test_pending_timeout_is_released_automatically_before_rescanning(tmp_path):
     class RecoveringSchool(School):
         fail_history = True
         def request(self, method, url, **kwargs):
@@ -81,17 +81,17 @@ def test_pending_timeout_never_resubmits_without_confirmation(tmp_path):
         if len(waits) == 5:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, notify=events.append, sleep=stop, clock=lambda: 5000) == 130
-    assert events == []
     log = (tmp_path / 'events.log').read_text()
     assert 'event=reservation_unconfirmed' in log
-    assert 'event=reservation_unconfirmed_released' not in log
-    assert 'event=reservation_succeeded' not in log
-    assert school.submitted == ['one']
-    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'pending'
+    assert 'event=reservation_unconfirmed_released' in log
+    assert school.submitted == ['one', 'one']
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
 
 
 @pytest.mark.parametrize('field, value', [('retry_at', -1), ('retry_at', 1e20),
-                                       ('cooldowns', {'one': -1}), ('cooldowns', {'one': 1e20})])
+                                       ('cooldowns', {'one': -1}), ('cooldowns', {'one': 1e20}),
+                                       ('pending_checks', -1), ('pending_checks', '1'),
+                                       ('pending_since', -1), ('step_failure_since', 1e20)])
 def test_invalid_recovery_deadlines_are_not_used_or_overwritten(tmp_path, field, value):
     school = School()
     assert execute(school, tmp_path) == 130

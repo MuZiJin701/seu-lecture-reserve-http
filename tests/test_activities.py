@@ -200,6 +200,31 @@ def test_opening_history_failure_does_not_hide_activity_polling(tmp_path):
     assert waits == [0.25, 0.25]
 
 
+def test_known_opening_survives_a_valid_empty_list(tmp_path):
+    school = ActivitySchool()
+    school.activities = [activity()]
+    assert execute(school, tmp_path, clock=lambda: OPEN - 31) == 130
+
+    class EmptyAfterFirst(ActivitySchool):
+        served = False
+        def request(self, method, url, **kwargs):
+            if url.endswith('queryActivityList.do'):
+                if self.served:
+                    self.activities = []
+                self.served = True
+            return super().request(method, url, **kwargs)
+    empty = EmptyAfterFirst()
+    empty.activities = [activity()]
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 2:
+            raise KeyboardInterrupt
+    assert execute(empty, tmp_path, clock=lambda: OPEN - 1, sleep=stop) == 130
+    # The retained window keeps the opening cadence even though the latest list was empty.
+    assert waits == [0.25, 0.25]
+
+
 def test_slow_captcha_path_submits_without_an_extra_list_query(tmp_path):
     class StaleActivitySchool(ActivitySchool):
         lists = 0

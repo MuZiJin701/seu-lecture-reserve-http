@@ -723,12 +723,16 @@ def test_rate_limited_submission_waits_before_any_confirmation_query(tmp_path):
             return response
     school = LimitedSubmission()
     school.activities = [lecture()]
-    delays = []
+    delays, events = [], []
+    now = [moment('2026-10-18 12:00:00').timestamp()]
     def stop(seconds):
         delays.append(seconds)
-        raise KeyboardInterrupt
-    execute(school, tmp_path, sleep=stop)
-    assert delays == [600]
+        now[0] += seconds
+        if len(delays) == 2:
+            raise KeyboardInterrupt
+    execute(school, tmp_path, sleep=stop, notify=events.append, clock=lambda: now[0])
+    assert delays == [300, 300]
+    assert events == ['reservation_step_failure']
     assert school.queries_after_limit == 0
 
 
@@ -791,6 +795,9 @@ def test_scan_delay_uses_quarter_second_window_and_next_opening_boundary():
     assert scan_delay(details, start + 599, 2, 10) == (0, True)
     assert scan_delay(details, start + 601, 0, 10) == (10, False)
     assert scan_delay([], start, 0, 10) == (10, False)
+    known = [(start, start + 600)]
+    assert scan_delay([], start - 30, 0, 10, known) == (0.25, True)
+    assert scan_delay([], start + 601, 0, 10, known) == (10, False)
 
 
 def test_school_clock_offset_calibrates_opening_window():
@@ -863,7 +870,7 @@ def test_resolve_pending_rejects_a_non_pending_task(tmp_path):
     assert 'event=pending_not_found' in (tmp_path / 'events.log').read_text()
 
 
-def test_pending_misses_keep_task_pending_without_resubmitting(tmp_path):
+def test_pending_misses_auto_release_and_resume_scanning(tmp_path):
     school = School()
     school.activities = [lecture()]
     school.submit_timeout = True
@@ -874,14 +881,61 @@ def test_pending_misses_keep_task_pending_without_resubmitting(tmp_path):
     later = moment('2026-10-18 12:05:00').timestamp()
     def wait(seconds):
         waits.append(seconds)
-        if len(waits) == 5:
+        if len(waits) == 3:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, sleep=wait, notify=events.append, clock=lambda: later) == 130
-    assert waits == [2, 2, 2, 2, 10]
-    assert school.submitted == ['one']
-    assert events == []
-    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'pending'
+    assert waits == [2, 2, 10]
+    assert school.submitted == ['one', 'one']
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert saved['status'] == 'scanning' and not saved['activity']
+    assert 'pending_checks' not in saved and 'pending_since' not in saved
     events_log = (tmp_path / 'events.log').read_text()
     assert 'event=reservation_unconfirmed' in events_log
-    assert 'event=reservation_unconfirmed_released' not in events_log
-    assert 'event=reservation_succeeded' not in events_log
+    assert 'event=reservation_unconfirmed_released' in events_log
+    assert 'event=reservation_succeeded' in events_log
+
+
+def test_first_rate_limited_query_waits_without_a_probe(tmp_path):
+    class MineLimited(School):
+        mine_calls = 0
+        def request(self, method, url, **kwargs):
+            if url.endswith('queryMyActivityList.do'):
+                self.mine_calls += 1
+                if self.mine_calls == 1:
+                    response = requests.Response()
+                    response.url = url
+                    response.status_code = 429
+                    response.headers['Retry-After'] = '120'
+                    response._content = b'{}'
+                    self.requests.append((method, url, kwargs))
+                    return response
+            return super().request(method, url, **kwargs)
+    school = MineLimited()
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        raise KeyboardInterrupt
+    assert execute(school, tmp_path, sleep=stop) == 130
+    assert waits == [120]
+    assert school.mine_calls == 1
+
+
+def test_sustained_captcha_failure_raises_a_step_alert(tmp_path):
+    class CaptchaTimeout(School):
+        def request(self, method, url, **kwargs):
+            if url.endswith('vcode.do'):
+                raise requests.Timeout('PRIVATE captcha timeout')
+            return super().request(method, url, **kwargs)
+    school = CaptchaTimeout()
+    school.activities = [lecture()]
+    events, waits = [], []
+    now = [moment('2026-10-18 12:00:00').timestamp()]
+    def wait(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+        if events:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, sleep=wait, clock=lambda: now[0],
+                   notify=events.append) == 130
+    assert events == ['reservation_step_failure']
+    assert waits == [20, 40, 80, 160, 300]

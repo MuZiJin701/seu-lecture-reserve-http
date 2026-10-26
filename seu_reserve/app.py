@@ -23,7 +23,9 @@ from .state import Task, open_nofollow
 
 DEFAULT_CATEGORIES = GOAL_CATEGORIES
 QUERY_FAILURE_SECONDS = 5 * 60
-MAJOR_MAIL_EVENTS = {'authentication_required', 'query_failure', 'task_failed', 'unexpected_failure'}
+STEP_FAILURE_SECONDS = 5 * 60
+MAJOR_MAIL_EVENTS = {'authentication_required', 'query_failure', 'task_failed', 'unexpected_failure',
+                     'reservation_step_failure'}
 SCAN_INTERVAL = 10
 FAST_INTERVAL = 0.25
 FAST_RETRY_REASONS = {'network_timeout', 'connect_timeout', 'network_failure', 'connection_failure',
@@ -33,12 +35,11 @@ SELECTION_REASONS = {'candidate', 'reservation_not_started', 'reservation_ended'
     'not_reservable', 'already_reserved', 'category_not_allowed', 'category_not_needed',
     'title_not_selected', 'online_disabled', 'offline_disabled', 'campus_not_selected',
     'time_conflict', 'cooldown', 'invalid_activity_time', 'notice_test_only'}
-# A pending submission is never cleared just because the school list has not shown it yet:
-# absence is not proof that the original non-idempotent request was not applied. After the first
-# fast checks the program keeps polling my-activities and leaves the task pending for human review.
-PENDING_MISS_LIMIT = 5
+# A pending submission is verified repeatedly by activity ID before any automatic release: the
+# submission is non-idempotent, so absence only becomes actionable after a short series of valid
+# checks. Automatic release keeps unattended operation possible; the local log keeps the evidence.
 PENDING_MISS_PAUSE = 2
-PENDING_CHECK_PAUSE = 10
+PENDING_AUTO_RELEASE_CHECKS = 3
 # After the candidate appears, a slow successful submission must not be aborted by the fast list
 # timeout; captcha and submit keep a longer budget while the list stays fast.
 SUBMIT_TIMEOUT = 8
@@ -145,8 +146,7 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
     return candidates, details
 
 
-def scan_delay(details: list[dict[str, Any]], now: float, elapsed: float,
-               interval: float) -> tuple[float, bool]:
+def opening_windows(details: list[dict[str, Any]]) -> list[tuple[float, float]]:
     openings: list[tuple[float, float]] = []
     for item in details if isinstance(details, list) else []:
         if not isinstance(item, dict) or item.get('reason') not in (
@@ -161,6 +161,20 @@ def scan_delay(details: list[dict[str, Any]], now: float, elapsed: float,
             openings.append((start.timestamp(), min(end.timestamp(), start.timestamp() + 600)))
         except (KeyError, TypeError, ValueError, OverflowError):
             continue
+    return openings
+
+
+def merge_openings(known: list[tuple[float, float]], details: list[dict[str, Any]],
+                   now: float) -> list[tuple[float, float]]:
+    """Keep known, unexpired windows even when the latest valid list happens to be empty."""
+    merged = {window for window in known if window[1] >= now - 1}
+    merged.update(opening_windows(details))
+    return sorted(merged)[:128]
+
+
+def scan_delay(details: list[dict[str, Any]], now: float, elapsed: float,
+               interval: float, known: list[tuple[float, float]] | None = None) -> tuple[float, bool]:
+    openings = opening_windows(details) if known is None else known
     fast = any(start - 30 <= now <= end for start, end in openings)
     delay = max(0, min(interval, FAST_INTERVAL) - elapsed) if fast else interval
     boundaries = [start - 30 - now for start, _ in openings if start - 30 > now]
@@ -224,6 +238,8 @@ def resolve_pending(settings: Settings, *, session: Any = None,
             return 1
         if pending_wid in booked:
             task.data.update(status='scanning', activity='')
+            task.data.pop('pending_checks', None)
+            task.data.pop('pending_since', None)
             task.save()
             _state_event(settings, 'pending_confirmed')
             return 0
@@ -234,6 +250,8 @@ def resolve_pending(settings: Settings, *, session: Any = None,
             _state_event(settings, 'pending_resolution_cancelled')
             return 1
         task.data.update(status='scanning', activity='')
+        task.data.pop('pending_checks', None)
+        task.data.pop('pending_since', None)
         task.save()
         _state_event(settings, 'pending_released_by_operator')
         return 0
@@ -318,7 +336,7 @@ def run(settings: Settings, *, session: Any = None,
         """Send alerts held back during an opening window; recovered failures never go out."""
         while deferred_mail:
             event = deferred_mail.pop(0)
-            if event == 'query_failure' and 'query_failure' not in announced:
+            if event in ('query_failure', 'reservation_step_failure') and event not in announced:
                 record('notification_skipped_recovered')
                 continue
             send_mail(event)
@@ -355,7 +373,7 @@ def run(settings: Settings, *, session: Any = None,
             alerts[alert] = clock()
             task.save()
         if notify:
-            if mail_blocked and event == 'query_failure':
+            if mail_blocked and event in ('query_failure', 'reservation_step_failure'):
                 # A 20 s SMTP send during the opening window can cost the seats that caused the
                 # failures; hold the alert until the fast window ends and skip it if recovered.
                 deferred_mail.append(event)
@@ -381,6 +399,18 @@ def run(settings: Settings, *, session: Any = None,
             clear_alert('query_failure')
             emit('query_recovered')
 
+    def step_failed(started: float) -> None:
+        if task is not None and task.data.get('step_failure_since') is None:
+            task.data['step_failure_since'] = started
+            task.save()
+
+    def step_recovered() -> None:
+        if task is not None and task.data.pop('step_failure_since', None) is not None:
+            task.save()
+        if 'reservation_step_failure' in announced or 'reservation_step_failure' in alerts:
+            clear_alert('reservation_step_failure')
+            record('reservation_step_recovered')
+
     def notification_details() -> str:
         counts = '已选听：未知\n待参加：未知\n必需类别缺口：未知'
         if latest_progress is not None:
@@ -403,13 +433,17 @@ def run(settings: Settings, *, session: Any = None,
     def pause(seconds: float) -> None:
         while True:
             duration = seconds
-            since = task.data.get('query_failure_since') if task is not None else None
-            if notify is not None and since is not None and 'query_failure' not in announced:
-                remaining = since + QUERY_FAILURE_SECONDS - clock()
-                if remaining <= 0:
-                    emit('query_failure')
-                else:
-                    duration = min(duration, remaining)
+            for event, since, limit in (
+                    ('query_failure', task.data.get('query_failure_since') if task else None,
+                     QUERY_FAILURE_SECONDS),
+                    ('reservation_step_failure', task.data.get('step_failure_since') if task else None,
+                     STEP_FAILURE_SECONDS)):
+                if notify is not None and since is not None and event not in announced:
+                    remaining = since + limit - clock()
+                    if remaining <= 0:
+                        emit(event)
+                    else:
+                        duration = min(duration, remaining)
             if seconds <= 0:
                 return
             sleep(duration)
@@ -481,10 +515,13 @@ def run(settings: Settings, *, session: Any = None,
         previous_selection = task.data.get('selection')
         details: list[dict[str, Any]] = (previous_selection.get('activities', [])
                                          if isinstance(previous_selection, dict) else [])
+        known_openings: list[tuple[float, float]] = opening_windows(details)
         while True:
             try:
                 scan_started = clock()
-                opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL)[1]
+                school_now = clock() + server_offset
+                known_openings = [window for window in known_openings if window[1] >= school_now - 1]
+                opening_scan = scan_delay(details, school_now, 0, SCAN_INTERVAL, known_openings)[1]
                 client.timeout = OPENING_QUERY_TIMEOUT if opening_scan else 10
                 mail_blocked = opening_scan
                 if not authenticated:
@@ -497,7 +534,7 @@ def run(settings: Settings, *, session: Any = None,
                 mine_seconds = 0.0
                 refresh_mine = False
                 if task.data['status'] == 'pending':
-                    # While a submission is unconfirmed, query only my activities and never submit.
+                    # While a submission is unconfirmed, verify by activity ID and never submit.
                     health(phase='my_activities', next_check_at=0)
                     mine_started = clock()
                     history = client.mine()
@@ -512,21 +549,42 @@ def run(settings: Settings, *, session: Any = None,
                         failures = 0
                         health(last_query_at=clock(), failure_count=0)
                         query_recovered()
-                        unconfirmed_checks += 1
+                        if task.data.get('pending_since') is None:
+                            task.data['pending_since'] = clock()
+                        unconfirmed_checks = int(task.data.get('pending_checks', 0)) + 1
+                        task.data['pending_checks'] = unconfirmed_checks
+                        task.save()
                         diagnostic('reservation_checked', wid=pending_wid, checks=unconfirmed_checks)
                         if unconfirmed_checks == 1:
                             emit('reservation_unconfirmed')
-                        pause_value = (PENDING_MISS_PAUSE if unconfirmed_checks < PENDING_MISS_LIMIT
-                                       else PENDING_CHECK_PAUSE)
+                        if unconfirmed_checks >= PENDING_AUTO_RELEASE_CHECKS:
+                            # Unattended operation: after several valid checks the original
+                            # submission is treated as not applied and scanning resumes. The
+                            # school is expected to reject duplicate reservations for the same
+                            # activity; the evidence stays in the private diagnostic log.
+                            task.data.update(status='scanning', activity='')
+                            task.data.pop('pending_checks', None)
+                            task.data.pop('pending_since', None)
+                            task.save()
+                            clear_alert('reservation_unconfirmed')
+                            diagnostic('reservation_unconfirmed_released', wid=pending_wid,
+                                       checks=unconfirmed_checks)
+                            record('reservation_unconfirmed_released')
+                            unconfirmed_checks = 0
+                            continue
+                        pause_value = PENDING_MISS_PAUSE
                         health(phase='confirming', next_check_at=clock() + pause_value)
                         pause(pause_value)
                         continue
                     if confirmed:
                         diagnostic('reservation_confirmed', wid=pending_wid)
                         task.data.update(status='scanning', activity='')
+                        task.data.pop('pending_checks', None)
+                        task.data.pop('pending_since', None)
                         task.save()
                         clear_alert('reservation_unconfirmed')
                         health(last_query_at=clock(), failure_count=0)
+                        step_recovered()
                         emit('reservation_succeeded')
                         unconfirmed_checks = 0
                 # Query the opening-critical list before the slower history refresh: a slow or
@@ -589,7 +647,13 @@ def run(settings: Settings, *, session: Any = None,
                     task.data['cooldowns'], clock() + server_offset,
                     cooldown_clock_known=offset_known)
                 query_recovered()
-                opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL)[1]
+                if not candidates:
+                    # No submission step can be attempted in this scan; do not keep an old
+                    # captcha/submit failure timer alive while only list queries run.
+                    step_recovered()
+                known_openings = merge_openings(known_openings, details, clock() + server_offset)
+                opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL,
+                                          known_openings)[1]
                 mail_blocked = opening_scan
                 client.timeout = SUBMIT_TIMEOUT if opening_scan else 10
                 previous_selection = task.data.get('selection')
@@ -605,6 +669,7 @@ def run(settings: Settings, *, session: Any = None,
                         try:
                             binary = client.captcha()
                         except RemoteError as exc:
+                            step_failed(clock())
                             diagnostic('captcha_error', wid=lecture.wid, reason=str(exc),
                                        attempt=attempt + 1)
                             raise
@@ -622,7 +687,8 @@ def run(settings: Settings, *, session: Any = None,
                                 diagnostic('captcha_cooldown', wid=lecture.wid, seconds=300)
                             continue
                         # Persist before sending: a crash must recover by querying, never resubmitting.
-                        task.data.update(status='pending', activity=lecture.wid)
+                        task.data.update(status='pending', activity=lecture.wid,
+                                         pending_checks=0, pending_since=clock())
                         task.save()
                         unconfirmed_checks = 0
                         health(phase='submitting')
@@ -631,6 +697,7 @@ def run(settings: Settings, *, session: Any = None,
                         try:
                             reply = client.submit(lecture.wid, code)
                         except RemoteError as exc:
+                            step_failed(clock())
                             diagnostic('submission_error', wid=lecture.wid, reason=str(exc),
                                        duration_seconds=max(0, clock() - submission_started))
                             health(last_error=str(exc), last_error_at=clock())
@@ -638,6 +705,8 @@ def run(settings: Settings, *, session: Any = None,
                                 # The connection never formed, so this submission was not sent;
                                 # revert pending and retry rather than blocking the whole task.
                                 task.data.update(status='scanning', activity='')
+                                task.data.pop('pending_checks', None)
+                                task.data.pop('pending_since', None)
                                 task.save()
                                 diagnostic('submission_connect_failed', wid=lecture.wid)
                                 break
@@ -645,6 +714,7 @@ def run(settings: Settings, *, session: Any = None,
                                 authenticated = False
                             defer(max(1, exc.retry_after) if opening_scan else max(20, exc.retry_after))
                             break
+                        step_recovered()
                         message = reply.get('msg', '')
                         captcha_wrong = (isinstance(message, str) and '验证码' in message
                                          and any(word in message for word in ('错误', '不正确', '失效', '过期')))
@@ -675,7 +745,8 @@ def run(settings: Settings, *, session: Any = None,
                 clear_alert('task_failed')
                 if task.data['status'] != 'pending':
                     elapsed = max(0, clock() - scan_started)
-                    delay, fast = scan_delay(details, clock() + server_offset, elapsed, SCAN_INTERVAL)
+                    delay, fast = scan_delay(details, clock() + server_offset, elapsed, SCAN_INTERVAL,
+                                             known_openings)
                     if (fast != opening_scan or fast or not last_timing_at
                             or clock() - last_timing_at >= 300):
                         diagnostic('scan_timing', mode='opening' if fast else 'normal',
@@ -712,7 +783,12 @@ def run(settings: Settings, *, session: Any = None,
                     'attendance_status_unknown', 'attendance_record_conflict') else 'invalid_activity_data'
                 record(safe_reason)
                 query_failed(scan_started)
-                if authenticated and not progress_probe_attempted and latest_progress is None:
+                # Never issue another request before a rate-limit wait: the probe exists only to
+                # fill progress for a later alert, not to bypass the server's Retry-After.
+                server_directed_wait = (isinstance(exc, RemoteError)
+                                        and (exc.retry_after > 0 or str(exc) == 'server_backoff'))
+                if (authenticated and not progress_probe_attempted and latest_progress is None
+                        and not server_directed_wait):
                     # One best-effort history read so a sustained query-failure alert can still
                     # report confirmed progress; never submit from this probe.
                     progress_probe_attempted = True
@@ -723,7 +799,8 @@ def run(settings: Settings, *, session: Any = None,
                         progress_at = mine_at
                     except (RemoteError, ValueError):
                         history = None
-                opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL)[1]
+                opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL,
+                                          known_openings)[1]
                 quick = (opening_scan and authenticated and isinstance(exc, RemoteError)
                          and reason in FAST_RETRY_REASONS and not exc.retry_after)
                 retry = exc.retry_after if isinstance(exc, RemoteError) else 0

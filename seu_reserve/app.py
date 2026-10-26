@@ -164,18 +164,80 @@ def scan_delay(details: list[dict[str, Any]], now: float, elapsed: float,
     return min([delay, *boundaries]), fast
 
 
-def school_clock_offset(rows: list[dict[str, Any]], now: float) -> float:
-    """Estimate the school clock offset so opening windows use the school's time, not the host's."""
+def _school_offset(rows: list[dict[str, Any]], now: float) -> float | None:
     server_now = next((row.get('_SERVER_NOW') for row in rows
                        if isinstance(row.get('_SERVER_NOW'), str)), None)
     if not server_now:
-        return 0.0
+        return None
     try:
         offset = moment(server_now).timestamp() - now
     except ValueError:
-        return 0.0
+        return None
     # A day-scale offset means a broken clock or a test fixture, not useful scheduling input.
-    return offset if abs(offset) <= 3600 else 0.0
+    return offset if abs(offset) <= 3600 else None
+
+
+def school_clock_offset(rows: list[dict[str, Any]], now: float) -> float:
+    """Estimate the school clock offset so opening windows use the school's time, not the host's."""
+    offset = _school_offset(rows, now)
+    return 0.0 if offset is None else offset
+
+
+def school_clock_known(rows: list[dict[str, Any]], now: float) -> bool:
+    """Whether this response carries a usable school clock for time-basis decisions."""
+    return _school_offset(rows, now) is not None
+
+
+def _state_event(settings: Settings, event: str) -> None:
+    print('event=' + event, flush=True)
+    try:
+        fd = open_nofollow(settings.state_dir / 'events.log', os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        with os.fdopen(fd, 'a') as target:
+            target.write(f'{time.time():.0f} event={event}\n')
+    except OSError:
+        pass
+
+
+def resolve_pending(settings: Settings, *, session: Any = None,
+                    environ: Mapping[str, str] | None = None,
+                    prompt: Callable[[str], str] = terminal_prompt) -> int:
+    """Explicit operator resolution of an uncertain submission; never submits anything."""
+    environ = os.environ if environ is None else environ
+    created_session = session is None
+    task = Task(settings.state_dir, environ.get('SEU_USERNAME', ''))
+    client: Client | None = None
+    try:
+        client = Client(session or requests.Session(), environ, prompt, lambda _: None)
+        if task.data['status'] != 'pending':
+            _state_event(settings, 'pending_not_found')
+            return 1
+        pending_wid = task.data['activity']
+        try:
+            client.authenticate()
+            history = client.mine()
+            booked = {activity_id(row) for row in history if reserved(row)}
+        except (RemoteError, ValueError):
+            _state_event(settings, 'pending_check_failed')
+            return 1
+        if pending_wid in booked:
+            task.data.update(status='scanning', activity='')
+            task.save()
+            _state_event(settings, 'pending_confirmed')
+            return 0
+        _state_event(settings, 'pending_not_in_history')
+        answer = prompt('学校记录仍未显示该预约。请先人工核对“我的活动”；确认原提交未生效并接受可能'
+                        '重复预约的风险后，输入 confirm 清除待确认状态（其他输入取消）：')
+        if answer.strip() != 'confirm':
+            _state_event(settings, 'pending_resolution_cancelled')
+            return 1
+        task.data.update(status='scanning', activity='')
+        task.save()
+        _state_event(settings, 'pending_released_by_operator')
+        return 0
+    finally:
+        task.close()
+        if created_session and client is not None:
+            client.session.close()
 
 
 def run(settings: Settings, *, session: Any = None,
@@ -389,6 +451,7 @@ def run(settings: Settings, *, session: Any = None,
         unconfirmed_checks = 0
         last_timing_at = 0.0
         server_offset = 0.0
+        offset_known = False
         history: list[dict[str, Any]] | None = None
         mine_at = 0.0
         progress_probe_attempted = False
@@ -401,11 +464,6 @@ def run(settings: Settings, *, session: Any = None,
                 opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL)[1]
                 client.timeout = OPENING_QUERY_TIMEOUT if opening_scan else 10
                 mail_blocked = opening_scan
-                school_now = clock() + server_offset
-                fresh = {wid: until for wid, until in task.data['cooldowns'].items() if until > school_now}
-                if len(fresh) != len(task.data['cooldowns']):
-                    task.data['cooldowns'] = fresh
-                    task.save()
                 if not authenticated:
                     health(phase='authentication', next_check_at=0)
                     client.authenticate()
@@ -454,7 +512,19 @@ def run(settings: Settings, *, session: Any = None,
                 activities_started = clock()
                 rows = client.activities()
                 activities_seconds = max(0, clock() - activities_started)
-                server_offset = school_clock_offset(rows, clock())
+                if school_clock_known(rows, clock()):
+                    server_offset = school_clock_offset(rows, clock())
+                    offset_known = True
+                # Prune cooldowns only after the school clock is known: on restart the stored
+                # deadlines are in school time, and pruning them against an uncalibrated local
+                # clock would delete still-valid cooldowns when the school clock runs behind.
+                if offset_known:
+                    school_now = clock() + server_offset
+                    fresh = {wid: until for wid, until in task.data['cooldowns'].items()
+                             if until > school_now}
+                    if len(fresh) != len(task.data['cooldowns']):
+                        task.data['cooldowns'] = fresh
+                        task.save()
                 if not refresh_mine and not (
                         history is not None and opening_scan and 0 <= clock() - mine_at < 10):
                     health(phase='my_activities', next_check_at=0,

@@ -265,3 +265,11 @@ def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
     assert messages[0]['From'] == (mailbox or 'sender@example.org')
     assert messages[0]['To'] == (mailbox or 'receiver@example.org')
     assert password not in capsys.readouterr().out
+
+
+def test_resolve_pending_requires_an_interactive_terminal(tmp_path, monkeypatch, capsys):
+    from seu_reserve.cli import main
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('os.environ', {})
+    assert main(['--resolve-pending']) == 1
+    assert 'event=interactive_terminal_required' in capsys.readouterr().out

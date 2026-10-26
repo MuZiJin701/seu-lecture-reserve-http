@@ -9,7 +9,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from seu_reserve.app import Settings, run, scan_delay, school_clock_offset
+from seu_reserve.app import Settings, resolve_pending, run, scan_delay, school_clock_offset
 from seu_reserve.model import moment
 
 
@@ -785,6 +785,50 @@ def test_school_clock_offset_calibrates_opening_window():
     # Day-scale divergence is a fixture or a broken clock, never useful scheduling input.
     assert school_clock_offset([{'_SERVER_NOW': '2026-10-19 12:00:00'}], now) == 0
     assert school_clock_offset([{'_SERVER_NOW': 'invalid'}], now) == 0
+
+
+def test_resolve_pending_confirms_when_school_history_shows_it(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    school.submit_timeout = False
+    school.mine = [{**lecture(), 'HD_WID': 'one', 'YYZT': '已预约'}]
+    assert resolve_pending(Settings(state_dir=tmp_path), session=school,
+                           environ={'SEU_USERNAME': 'test-user'},
+                           prompt=lambda _: 'confirm') == 0
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
+    assert school.submitted == ['one']
+    assert 'event=pending_confirmed' in (tmp_path / 'events.log').read_text()
+
+
+def test_resolve_pending_requires_explicit_confirmation_when_absent(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    school.submit_timeout = False
+    school.mine = []
+    settings = Settings(state_dir=tmp_path)
+    environ = {'SEU_USERNAME': 'test-user'}
+    assert resolve_pending(settings, session=school, environ=environ,
+                           prompt=lambda _: 'wrong') == 1
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'pending'
+    assert 'event=pending_resolution_cancelled' in (tmp_path / 'events.log').read_text()
+    assert resolve_pending(settings, session=school, environ=environ,
+                           prompt=lambda _: 'confirm') == 0
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
+    assert school.submitted == ['one']
+    log = (tmp_path / 'events.log').read_text()
+    assert 'event=pending_released_by_operator' in log
+
+
+def test_resolve_pending_rejects_a_non_pending_task(tmp_path):
+    school = School()
+    assert resolve_pending(Settings(state_dir=tmp_path), session=school,
+                           environ={'SEU_USERNAME': 'test-user'},
+                           prompt=lambda _: 'confirm') == 1
+    assert 'event=pending_not_found' in (tmp_path / 'events.log').read_text()
 
 
 def test_pending_misses_keep_task_pending_without_resubmitting(tmp_path):

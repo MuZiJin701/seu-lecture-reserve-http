@@ -124,7 +124,7 @@ sudo systemctl stop seu-lecture-reserve-http.service
 uv run --locked main.py --status
 ```
 
-The stopped service may be collected and reported as not found; task state and logs remain. Running the startup commands again resumes the task without cancelling reservations. If SMS authentication requires input, background operation saves the task and exits; confirm it has exited, handle the prompt in the foreground, then resume background operation. An uncertain reservation result re-checks the original activity only; other submissions stay paused, absence is not treated as failure, and the school record must be reviewed manually.
+The stopped service may be collected and reported as not found; task state and logs remain. Running the startup commands again resumes the task without cancelling reservations. If SMS authentication requires input, background operation saves the task and exits; confirm it has exited, handle the prompt in the foreground, then resume background operation. An uncertain reservation result re-checks the original activity only; other submissions stay paused and absence is not treated as failure. Review the school record manually, stop the background service, then run `uv run --locked main.py --resolve-pending` and confirm explicitly; that command never submits a reservation.
 
 This version has passed offline checks. A real submit-and-cancel flow was verified on a test activity on 2026-10-25. Target-lecture hit rate, SMS recovery and at least 24 hours of operation still require separate acceptance testing; see [acceptance boundaries](docs/usage.md#验收记录). [Business rules](docs/requirements.md) and the [usage guide](docs/usage.md) contain the details (Chinese).
 

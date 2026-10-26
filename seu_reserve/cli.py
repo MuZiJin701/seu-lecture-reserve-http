@@ -18,7 +18,7 @@ from typing import Any
 from dotenv import dotenv_values
 from dotenv.parser import parse_stream
 
-from .app import SELECTION_REASONS, Settings, run
+from .app import SELECTION_REASONS, Settings, resolve_pending, run
 from .mail import Mailer, mail_failure_reason, mail_history
 from .model import SHANGHAI
 from .state import read_json, task_running
@@ -154,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument('--new-task', action='store_true', help='compatibility: recheck a completed goal (normal startup also rechecks)')
     mode.add_argument('--status', action='store_true', help='show local task status and private selection details without network access')
     mode.add_argument('--test-mail', action='store_true', help='send one test email without school login or reservations')
+    mode.add_argument('--resolve-pending', action='store_true',
+                      help='interactively verify an unconfirmed submission and clear it only after explicit confirmation')
     args = parser.parse_args(argv)
     if not args.status:
         print('SEU Lecture Reserve HTTPS | by MuZiJin701\n'
@@ -182,12 +184,17 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             print('event=test_mail_accepted', flush=True)
             return 0
+        if args.resolve_pending and not sys.stdin.isatty():
+            print('event=interactive_terminal_required', flush=True)
+            return 1
         if not sys.stdin.isatty() and any(not environ.get(key) for key in ('SEU_USERNAME', 'SEU_PASSWORD')):
             print('event=credentials_require_terminal', flush=True)
             return 1
         for key, label in (('SEU_USERNAME', '一卡通号：'), ('SEU_PASSWORD', '密码：')):
             if not environ.get(key):
                 environ[key] = getpass(label)
+        if args.resolve_pending:
+            return resolve_pending(settings, environ=environ)
         recognize = None
         if not args.check:
             try:

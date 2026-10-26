@@ -327,3 +327,20 @@ def test_captcha_cooldown_uses_school_clock_basis(tmp_path):
     assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop, recognize=lambda _: '') == 130
     captchas = [url for _, url, _ in school.requests if url.endswith('vcode.do')]
     assert len(captchas) == 4
+
+
+def test_cooldown_survives_restart_before_clock_calibration(tmp_path):
+    school = ActivitySchool()
+    school.activities = [activity(YYKSSJ='2029-12-31 18:00:00', YYJSSJ='2029-12-31 20:00:00')]
+    school.server_now = moment('2029-12-31 18:50:00').strftime('%Y-%m-%d %H:%M:%S')
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 2:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop, recognize=lambda _: '') == 130
+    assert sum(url.endswith('vcode.do') for _, url, _ in school.requests) == 4
+    school.requests.clear()
+    waits.clear()
+    assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop, recognize=lambda _: '') == 130
+    assert sum(url.endswith('vcode.do') for _, url, _ in school.requests) == 0

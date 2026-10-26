@@ -6,6 +6,7 @@ import threading
 import time
 from http.client import RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -177,6 +178,8 @@ def test_initial_gateway_connection_failure_switches_only_gateway_once(monkeypat
 
 def test_total_deadline_interrupts_a_slow_drip_response():
     class SlowResponse:
+        status_code = 200
+        headers = {}
         raw = object()
         closed = False
         def iter_content(self, chunk_size):
@@ -194,6 +197,137 @@ def test_total_deadline_interrupts_a_slow_drip_response():
     with pytest.raises(RemoteError, match='network_timeout'):
         client.request('GET', 'https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do')
     assert SlowSession.response.closed
+
+
+class UnreadableBody:
+    """A response body that fails the test when anyone asks for its bytes."""
+
+    def __init__(self):
+        self.read = False
+        self.closed = False
+
+    def read1(self, amt, decode_content=None):
+        self.read = True
+        raise AssertionError('error and redirect bodies must not be read')
+
+    def stream(self, chunk_size, decode_content=True):
+        self.read = True
+        raise AssertionError('error and redirect bodies must not be streamed')
+
+    def close(self):
+        self.closed = True
+
+    def release_conn(self):
+        pass
+
+
+def response_with(status, body, headers=None):
+    response = requests.Response()
+    response.status_code = status
+    response.headers.update(headers or {})
+    response.raw = body
+    return response
+
+
+def client_returning(response):
+    class Session:
+        def request(self, method, url, **kwargs):
+            return response
+    return Client(Session(), {}, input, lambda _: None)
+
+
+@pytest.mark.parametrize('status, reason, header, retry_after', [
+    (429, 'server_backoff', '120', 120.0),
+    (502, 'service_unavailable', '2', 2.0),
+    (503, 'service_unavailable', '3', 3.0),
+    (504, 'service_unavailable', None, 0.0),
+])
+def test_error_status_and_retry_after_are_decided_before_the_body(status, reason, header, retry_after):
+    body = UnreadableBody()
+    client = client_returning(response_with(status, body, {'Retry-After': header} if header else {}))
+    client.timeout = 5
+    with pytest.raises(RemoteError) as error:
+        client.request('GET', 'https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do')
+    assert str(error.value) == reason
+    assert error.value.retry_after == retry_after
+    assert error.value.http_status == status
+    assert not body.read
+
+
+@pytest.mark.parametrize('status', [301, 403, 500])
+def test_non_200_body_is_never_consumed(status):
+    body = UnreadableBody()
+    client = client_returning(response_with(status, body))
+    result = client.request('GET', 'https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do')
+    assert result.status_code == status
+    assert not body.read
+
+
+class ChunkedBody:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.calls = []
+        self.released = False
+
+    def read1(self, amt, decode_content=None):
+        self.calls.append((amt, decode_content))
+        return self.chunks.pop(0) if self.chunks else b''
+
+    def release_conn(self):
+        self.released = True
+
+
+def test_body_is_read_in_large_chunks_and_preserves_content():
+    body = ChunkedBody([b'a' * 65536, b'b' * 65536, b'c' * 1000])
+    client = client_returning(response_with(200, body))
+    result = client.request('GET', 'https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do')
+    assert result.content == b'a' * 65536 + b'b' * 65536 + b'c' * 1000
+    # Compressed responses must be decoded like Requests' own body reads.
+    assert body.calls == [(65536, True)] * 4
+    assert body.released
+
+
+class DeadlineSock:
+    def __init__(self):
+        self.timeouts = []
+
+    def gettimeout(self):
+        return 10.0
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+
+class BlockingBody:
+    def __init__(self, sock):
+        self._fp = SimpleNamespace(fp=SimpleNamespace(raw=SimpleNamespace(_sock=sock)))
+        self.reads = 0
+        self.closed = False
+
+    def read1(self, amt, decode_content=None):
+        self.reads += 1
+        if self.reads == 1:
+            return b'x'
+        raise TimeoutError
+
+    def close(self):
+        self.closed = True
+
+    def release_conn(self):
+        pass
+
+
+def test_remaining_budget_bounds_a_blocking_body_read():
+    sock = DeadlineSock()
+    body = BlockingBody(sock)
+    client = client_returning(response_with(200, body))
+    client.timeout = 0.5
+    with pytest.raises(RemoteError, match='network_timeout'):
+        client.request('GET', 'https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do')
+    assert body.reads == 2
+    assert body.closed
+    assert 0 < sock.timeouts[0] <= 0.5
+    assert sock.timeouts[-1] == 10.0
 
 
 @pytest.mark.parametrize('failure', [

@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 import requests
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.serialization import load_der_public_key
+from urllib3.exceptions import ReadTimeoutError
 
 BASE = 'https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu'
 ENTRY = BASE + '/*default/index.do'
@@ -24,6 +25,9 @@ CAS = 'https://auth.seu.edu.cn/auth/casback/'
 GATEWAY = 'https://vpn.seu.edu.cn'
 API_PARAMS = {'clientType': 'SDPBrowserClient', 'platform': 'Linux', 'lang': 'zh-CN'}
 HOSTS = {'auth.seu.edu.cn', 'vpn.seu.edu.cn', 'ehall.seu.edu.cn'}
+# Read bodies in large chunks and bound each blocking read by the remaining request budget:
+# one-byte iteration made every response byte pass through Python code and timing checks.
+RESPONSE_CHUNK_SIZE = 65536
 
 
 class GatewayIPAdapter(requests.adapters.HTTPAdapter):
@@ -126,18 +130,26 @@ class Client:
         try:
             response = self.session.request(method, url, timeout=self.timeout, allow_redirects=False,
                                             verify=True, headers=headers, stream=True, **kwargs)
+            if response.status_code in (429, 502, 503, 504):
+                # Decide from the status line and headers first: a slow or malformed error body
+                # must not turn an explicit rate-limit/overload answer into a generic network
+                # timeout that loses the wait the school asked for.
+                status = response.status_code
+                retry_after = retry_after_seconds(response)
+                self._discard(response)
+                if status == 429:
+                    raise RemoteError('server_backoff', retry_after, http_status=429)
+                raise RemoteError('service_unavailable', retry_after, http_status=status)
+            if response.status_code != 200:
+                # Only 200 bodies are consumed later (JSON payload or captcha image); redirect
+                # and error bodies are never needed.
+                self._discard(response)
+                return response
             if getattr(response, 'raw', None) is not None:
-                # A single Requests/urllib3 timeout is reset between reads; stream the body and
-                # enforce a real wall-clock deadline so a slow-drip response cannot block the
-                # synchronous scan indefinitely.
-                chunks: list[bytes] = []
-                for chunk in response.iter_content(chunk_size=1):
-                    if time.monotonic() > deadline:
-                        response.close()
-                        raise RemoteError('network_timeout')
-                    if chunk:
-                        chunks.append(chunk)
-                response._content = b''.join(chunks)
+                # A single Requests/urllib3 timeout is reset between reads; read the body with
+                # the remaining wall-clock budget as the per-read socket timeout so a slow-drip
+                # response cannot overshoot the total response deadline.
+                response._content = self._read_body(response, deadline)
                 response._content_consumed = True
                 response.close()
         except requests.exceptions.SSLError as exc:
@@ -172,15 +184,87 @@ class Client:
             raise failure from None
         except requests.RequestException:
             raise RemoteError('network_failure') from None
-        if response.status_code == 429:
-            # Explicit rate limiting: wait for the server's own window when it provides one.
-            raise RemoteError('server_backoff', retry_after_seconds(response), http_status=429)
-        if response.status_code in (502, 503, 504):
-            # Temporary overload/gateway failure, not a rate-limit decision; the app applies a
-            # short bounded recovery instead of the exponential 20-40-80 s limiter backoff.
-            raise RemoteError('service_unavailable', retry_after_seconds(response),
-                              http_status=response.status_code)
         return response
+
+    @staticmethod
+    def _discard(response: Any) -> None:
+        if getattr(response, 'raw', None) is not None:
+            response.close()
+
+    @staticmethod
+    def _response_socket(raw: Any) -> Any:
+        """Best-effort access to the socket behind a streamed urllib3 response."""
+        sock = getattr(getattr(raw, '_connection', None), 'sock', None)
+        if sock is not None:
+            return sock
+        buffered = getattr(getattr(raw, '_fp', None), 'fp', None)
+        return getattr(getattr(buffered, 'raw', None), '_sock', None)
+
+    def _read_body(self, response: Any, deadline: float) -> bytes:
+        raw = response.raw
+        read1 = getattr(raw, 'read1', None)
+        if read1 is None:
+            return self._read_body_chunks(response, deadline)
+        sock = self._response_socket(raw)
+        original_timeout = None
+        if sock is not None:
+            try:
+                original_timeout = sock.gettimeout()
+            except OSError:
+                sock = None
+        body = bytearray()
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RemoteError('network_timeout')
+                if sock is not None:
+                    try:
+                        # Bound the next blocking read by the budget that is actually left
+                        # rather than by the whole request timeout.
+                        sock.settimeout(max(remaining, 0.001))
+                    except OSError:
+                        sock = None
+                try:
+                    # decode_content matches Requests' own body reads; the raw flag defaults to
+                    # False and would otherwise return compressed bytes to JSON parsing.
+                    chunk = read1(RESPONSE_CHUNK_SIZE, decode_content=True)
+                except (ReadTimeoutError, TimeoutError):
+                    raise RemoteError('network_timeout') from None
+                except Exception:
+                    # Body failures happen after the request was sent, so the outcome is
+                    # unknown; a fixed reason code keeps submissions pending, never retried.
+                    raise RemoteError('connection_failure') from None
+                if not chunk:
+                    break
+                body.extend(chunk)
+        except RemoteError:
+            self._discard(response)
+            raise
+        finally:
+            if sock is not None and original_timeout is not None:
+                try:
+                    sock.settimeout(original_timeout)
+                except OSError:
+                    pass
+        return bytes(body)
+
+    def _read_body_chunks(self, response: Any, deadline: float) -> bytes:
+        """Fallback for response objects without read1(); bounded per received chunk."""
+        chunks: list[bytes] = []
+        try:
+            for chunk in response.iter_content(chunk_size=RESPONSE_CHUNK_SIZE):
+                if time.monotonic() > deadline:
+                    raise RemoteError('network_timeout')
+                if chunk:
+                    chunks.append(chunk)
+        except (ReadTimeoutError, TimeoutError):
+            self._discard(response)
+            raise RemoteError('network_timeout') from None
+        except RemoteError:
+            self._discard(response)
+            raise
+        return b''.join(chunks)
 
     def get(self, url: str) -> Any:
         for _ in range(12):

@@ -298,7 +298,7 @@ def test_future_reservation_missing_breach_field_does_not_block_next_submission(
     assert school.submitted == ['next-law']
 
 
-def test_legacy_one_success_reopens_and_preserves_wait_and_pending(tmp_path):
+def test_legacy_one_success_reopens_and_clamps_long_wait(tmp_path):
     saved = {'version': 1, 'account': hashlib.sha256(b'test-user').hexdigest(),
              'status': 'done', 'activity': 'old-success', 'cooldowns': {}, 'retry_at': 200}
     path = tmp_path / 'task.json'
@@ -311,8 +311,9 @@ def test_legacy_one_success_reopens_and_preserves_wait_and_pending(tmp_path):
     assert execute(school, tmp_path, clock=lambda: 100, sleep=wait) == 130
     migrated = json.loads(path.read_text())
     assert migrated['version'] == 2 and migrated['status'] == 'scanning'
-    assert not migrated['activity'] and migrated['retry_at'] == 200
-    assert waits == [100] and not school.requests
+    # A legacy generic wait has no server-directed marker, so it is clamped to the short schedule.
+    assert not migrated['activity'] and migrated['retry_at'] == 105
+    assert waits == [5] and not school.requests
     saved.update(status='pending', activity='uncertain', retry_at=0)
     path.write_text(json.dumps(saved))
     school.mine = attended()

@@ -3,6 +3,7 @@ import json
 import socket
 import sys
 import threading
+import types
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import requests
@@ -281,19 +282,19 @@ def test_pending_submission_is_confirmed_by_school_activity_id_after_restart(tmp
 def test_query_failure_alerts_once_after_five_minutes_and_recovery_clears_it(tmp_path):
     school = School()
     school.activities = [lecture(YYZT='未开放')]
-    school.query_statuses = [500] * 30
+    school.query_statuses = [500] * 400
     events, delays = [], []
     now = 1000.0
     def wait(seconds):
         nonlocal now
         delays.append(seconds)
         now += seconds
-        if len(delays) == 6:
+        if events or len(delays) > 200:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, notify=events.append, sleep=wait, clock=lambda: now) == 130
     assert events == ['query_failure']
-    assert delays[:4] == [20, 40, 80, 160]
-    assert sum(delays[:4]) == 300
+    assert delays[:4] == [1, 2, 4, 5]
+    assert max(delays) <= 5
     saved = json.loads((tmp_path / 'task.json').read_text())
     assert saved['query_failure_since'] == 1000 and 'query_failure' in saved['alerts']
     saved['retry_at'] = 0
@@ -781,7 +782,7 @@ def test_persistent_activity_query_failure_backs_off_and_notifies(tmp_path):
         if len(delays) == 3:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, sleep=stop, notify=events.append) == 130
-    assert delays == [20, 40, 80]
+    assert delays == [1, 2, 4]
     assert events == []
 
 
@@ -935,12 +936,13 @@ def test_sustained_captcha_failure_raises_a_step_alert(tmp_path):
     def wait(seconds):
         waits.append(seconds)
         now[0] += seconds
-        if events:
+        if events or len(waits) > 200:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, sleep=wait, clock=lambda: now[0],
                    notify=events.append) == 130
     assert events == ['reservation_step_failure']
-    assert waits == [20, 40, 80, 160, 300]
+    assert waits[:4] == [1, 2, 4, 5]
+    assert max(waits) <= 5
 
 
 def test_step_alert_survives_restart(tmp_path):
@@ -1528,3 +1530,81 @@ def test_legacy_confirmed_hold_missing_category_cannot_allow_extra_booking(tmp_p
         assert sum(url.endswith('queryMyActivityList.do') for _, url, _ in school.requests) == 1
     else:
         assert 'event=attendance_category_unknown' in (tmp_path / 'events.log').read_text()
+
+def test_transient_failures_use_bounded_short_backoff_not_generic_twenty(tmp_path):
+    class Flaky(School):
+        def request(self, method, url, **kwargs):
+            if url.endswith('queryActivityList.do'):
+                raise requests.ConnectionError('connection reset')
+            return super().request(method, url, **kwargs)
+
+    waits = []
+
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 4:
+            raise KeyboardInterrupt
+
+    assert execute(Flaky(), tmp_path, sleep=stop) == 130
+    assert waits == [1, 2, 4, 5]
+
+
+def test_429_without_retry_after_uses_short_backoff_not_twenty_seconds(tmp_path):
+    school = School()
+    school.query_statuses = [429] * 4
+    waits = []
+
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 3:
+            raise KeyboardInterrupt
+
+    assert execute(school, tmp_path, sleep=stop) == 130
+    assert waits == [1, 2, 4]
+
+
+def test_restart_clamps_legacy_generic_wait_to_short_backoff(tmp_path):
+    school = School()
+    assert execute(school, tmp_path) == 130
+    path = tmp_path / 'task.json'
+    saved = json.loads(path.read_text())
+    saved['retry_at'] = moment('2026-10-18 12:00:00').timestamp() + 100
+    saved.pop('retry_server', None)
+    path.write_text(json.dumps(saved))
+    waits = []
+
+    def stop(seconds):
+        waits.append(seconds)
+        raise KeyboardInterrupt
+
+    assert execute(school, tmp_path, sleep=stop) == 130
+    assert waits == [5]
+
+
+def test_ocr_model_is_warmed_once_before_the_first_submission(tmp_path, monkeypatch):
+    created = []
+
+    class Engine:
+        def __init__(self, show_ad=False):
+            assert show_ad is False
+            created.append('engine')
+
+        def classification(self, image):
+            return '1234'
+
+    fake = types.ModuleType('ddddocr')
+    fake.DdddOcr = Engine
+    monkeypatch.setitem(sys.modules, 'ddddocr', fake)
+    school = School()
+    school.activities = [lecture()]
+    assert execute(school, tmp_path, recognize=None) == 130
+    assert created == ['engine']
+    assert school.submitted == ['one']
+    lines = [json.loads(line) for line in
+             (tmp_path / 'diagnostics.jsonl').read_text().splitlines()]
+    warm = [line for line in lines if line['event'] == 'ocr_ready']
+    assert len(warm) == 1 and warm[0]['duration_seconds'] >= 0
+    started = next(line for line in lines if line['event'] == 'submission_started')
+    assert warm[0]['at'] <= started['at']
+    assert started['captcha_seconds'] >= 0
+    assert started['ocr_seconds'] >= 0

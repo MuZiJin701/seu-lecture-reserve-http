@@ -267,4 +267,7 @@ def test_ocr_failures_cooldown_and_submission_reply_are_diagnosed(tmp_path):
     lines = diagnostics(other)
     assert [line['outcome'] for line in lines if line['event'] == 'submission_reply'] == ['unconfirmed']
     assert [line['attempt'] for line in lines if line['event'] == 'submission_started'] == [1]
+    started = next(line for line in lines if line['event'] == 'submission_started')
+    assert started['captcha_seconds'] >= 0
+    assert started['ocr_seconds'] >= 0
     assert 'PRIVATE' not in (other / 'diagnostics.jsonl').read_text()

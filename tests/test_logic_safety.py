@@ -23,7 +23,7 @@ def test_unknown_activity_list_response_alerts_instead_of_silent_wait(tmp_path, 
     assert execute(school, tmp_path, sleep=wait, notify=events.append) == 130
     assert not school.submitted
     assert events == []
-    assert waits == [20, 40, 80]
+    assert waits == [1, 2, 4]
 
 
 def test_non_ascii_ocr_is_retried_without_submitting(tmp_path):

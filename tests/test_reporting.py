@@ -40,13 +40,18 @@ def clear_retry(directory):
     path.write_text(json.dumps(saved))
 
 
-def advancing(start, stop_after):
+def advancing(start, stop_after=5):
+    """Advance simulated time until the five-minute query alert is due.
+
+    The bounded short backoff retries every few seconds, so reaching five minutes needs many
+    iterations; stop_after is kept for call-site compatibility.
+    """
     state = {'now': start}
     waits = []
     def wait(seconds):
         waits.append(seconds)
         state['now'] += seconds
-        if len(waits) >= stop_after:
+        if state['now'] - start >= 310 or len(waits) >= 300:
             raise KeyboardInterrupt
     return state, waits, wait
 
@@ -74,11 +79,11 @@ def test_no_daily_report_at_twenty_and_no_report_timestamp(tmp_path, smtp):
 def test_query_failure_mails_once_after_five_minutes_and_recovery_does_not(tmp_path, smtp):
     school = School()
     school.activities = [lecture(YYZT='未开放')]
-    school.query_statuses = [500] * 20
+    school.query_statuses = [500] * 300
     state, waits, wait = advancing(1000.0, 5)
     assert mailed_run(school, tmp_path, clock=lambda: state['now'], sleep=wait) == 130
-    assert waits[:4] == [20, 40, 80, 160]
-    assert sum(waits[:4]) == 300
+    assert waits[:4] == [1, 2, 4, 5]
+    assert max(waits) <= 5
     assert smtp.send_message.call_count == 1
     assert '持续查询失败' in smtp.send_message.call_args.args[0]['Subject']
     saved = json.loads((tmp_path / 'task.json').read_text())
@@ -97,7 +102,7 @@ def test_query_failure_mails_once_after_five_minutes_and_recovery_does_not(tmp_p
 def test_new_outage_after_recovery_alerts_again_after_five_minutes(tmp_path, smtp):
     school = School()
     school.activities = [lecture(YYZT='未开放')]
-    school.query_statuses = [500] * 20
+    school.query_statuses = [500] * 300
     state, waits, wait = advancing(1000.0, 5)
     assert mailed_run(school, tmp_path, clock=lambda: state['now'], sleep=wait) == 130
     clear_retry(tmp_path)
@@ -106,16 +111,16 @@ def test_new_outage_after_recovery_alerts_again_after_five_minutes(tmp_path, smt
         raise KeyboardInterrupt
     assert mailed_run(school, tmp_path, clock=lambda: state['now'], sleep=stop) == 130
     assert smtp.send_message.call_count == 1
-    school.query_statuses = [500] * 20
+    school.query_statuses = [500] * 300
     state, waits, wait = advancing(state['now'], 5)
     assert mailed_run(school, tmp_path, clock=lambda: state['now'], sleep=wait) == 130
-    assert sum(waits[:4]) == 300 and smtp.send_message.call_count == 2
+    assert max(waits) <= 5 and smtp.send_message.call_count == 2
 
 
 def test_partial_recovery_does_not_clear_query_alert(tmp_path, smtp):
     school = School()
     school.activities = [lecture(YYZT='未开放')]
-    school.query_statuses = [500] * 20
+    school.query_statuses = [500] * 300
     state, waits, wait = advancing(1000.0, 5)
     assert mailed_run(school, tmp_path, clock=lambda: state['now'], sleep=wait) == 130
     assert smtp.send_message.call_count == 1
@@ -149,7 +154,7 @@ def test_authentication_alert_attempt_survives_restart_even_if_mail_failed(tmp_p
 def test_query_alert_attempt_survives_restart_even_if_mail_failed(tmp_path):
     school = School()
     school.activities = [lecture(YYZT='未开放')]
-    school.query_statuses = [500] * 30
+    school.query_statuses = [500] * 300
     events = []
     def notify(event):
         events.append(event)
@@ -249,7 +254,7 @@ def test_alert_mail_uses_current_confirmed_progress_without_details(tmp_path, sm
     school = School()
     school.mine = attended(3)
     school.mine[0]['HDMC'] = 'PRIVATE lecture title'
-    school.query_statuses = [500] * 20
+    school.query_statuses = [500] * 300
     state, waits, wait = advancing(1000.0, 5)
     assert mailed_run(school, tmp_path, clock=lambda: state['now'], sleep=wait) == 130
     assert smtp.send_message.call_count == 1
@@ -295,3 +300,5 @@ def test_disabled_mail_read_only_and_completed_tasks_do_not_mail(tmp_path, smtp)
     assert smtp.send_message.call_count == 0
     saved = json.loads((tmp_path / 'completed' / 'task.json').read_text())
     assert 'last_report_at' not in saved and saved['health']['last_mail_event'] == 'none'
+
+

@@ -53,9 +53,19 @@ OPENING_QUERY_TIMEOUT = 6
 # During the opening window, reuse the history fetched immediately before it instead of
 # synchronously refreshing at the opening instant; the trade-off is bounded stale conflict data.
 OPENING_HISTORY_TTL = 60.0
-# 502/503/504 mean the server is overloaded, not that a rate limit is in force; recover in seconds
-# during an opening instead of the 20-40-80 s limiter backoff. Explicit Retry-After still wins.
+# 502/503/504 mean the server is overloaded, not that a rate limit is in force; recover in seconds.
+# Explicit Retry-After still wins.
 OVERLOAD_RETRY_CAP = 5.0
+
+
+def short_backoff(failures: int) -> float:
+    """Bounded short retry schedule: 1, 2, 4, 5, 5 ... seconds.
+
+    The old 20-40-80 s generic schedule could park the scanner for the whole opening after one
+    transient failure. Opening windows last seconds, so retries stay frequent; a server-directed
+    Retry-After is handled separately and still honored exactly.
+    """
+    return min(OVERLOAD_RETRY_CAP, 2.0 ** min(max(failures - 1, 0), 3))
 
 
 def terminal_prompt(label: str) -> str:
@@ -380,6 +390,14 @@ def run(settings: Settings, *, session: Any = None,
                                         ensure_ascii=False, allow_nan=False) + '\n')
         except (OSError, ValueError):
             record('diagnostic_write_failed')
+    def load_recognizer() -> Callable[[bytes], str]:
+        # Load the OCR model once before an opening: first use inside a submission path costs
+        # roughly 1-2 s and is paid exactly at the worst moment.
+        started = clock()
+        import ddddocr
+        engine = ddddocr.DdddOcr(show_ad=False).classification
+        diagnostic('ocr_ready', duration_seconds=max(0, clock() - started))
+        return engine
     def send_mail(event: str) -> None:
         if notify is None:
             return
@@ -635,16 +653,23 @@ def run(settings: Settings, *, session: Any = None,
                 task.data.pop('hold', None)
                 task.save()
         checkpoint = task
-        def defer(seconds: float) -> None:
+        def defer(seconds: float, *, server_directed: bool = False) -> None:
             checkpoint.data['retry_at'] = clock() + seconds
+            checkpoint.data['retry_server'] = server_directed
             checkpoint.save()
             health(phase='backoff', next_check_at=checkpoint.data['retry_at'])
             pause(seconds)
             checkpoint.data['retry_at'] = 0
+            checkpoint.data.pop('retry_server', None)
             checkpoint.save()
         remaining = task.data.get('retry_at', 0) - clock()
         if remaining > 0:
-            defer(remaining)
+            # Older snapshots could hold a generic 20-300 s wait; only a server-directed
+            # (Retry-After) wait may survive a restart at its full length.
+            server_directed = task.data.get('retry_server') is True
+            if not server_directed:
+                remaining = min(remaining, OVERLOAD_RETRY_CAP)
+            defer(remaining, server_directed=server_directed)
         authenticated = False
         failures = 0
         unconfirmed_checks = 0
@@ -672,6 +697,13 @@ def run(settings: Settings, *, session: Any = None,
                     authenticated = True
                     clear_alert('authentication_required')
                     record('authentication_succeeded')
+                    if recognize is None:
+                        try:
+                            recognize = load_recognizer()
+                        except Exception as exc:
+                            # Degrade to the lazy load at the first candidate; the run fails
+                            # there only if OCR is genuinely unusable.
+                            diagnostic('ocr_unavailable', reason=type(exc).__name__)
                 if task.data['status'] != 'pending':
                     holds_now = hold_entries()
                     expired = [wid for wid, entry in holds_now.items()
@@ -920,6 +952,7 @@ def run(settings: Settings, *, session: Any = None,
                 for lecture in candidates:
                     for attempt in range(4):
                         health(phase='captcha')
+                        captcha_started = clock()
                         try:
                             binary = client.captcha()
                         except RemoteError as exc:
@@ -927,12 +960,12 @@ def run(settings: Settings, *, session: Any = None,
                             diagnostic('captcha_error', wid=lecture.wid, reason=str(exc),
                                        attempt=attempt + 1)
                             raise
+                        captcha_seconds = max(0, clock() - captcha_started)
                         if recognize is None:
-                            started = clock()
-                            import ddddocr
-                            recognize = ddddocr.DdddOcr(show_ad=False).classification
-                            diagnostic('ocr_ready', duration_seconds=max(0, clock() - started))
+                            recognize = load_recognizer()
+                        ocr_started = clock()
                         code = recognize(binary).strip()
+                        ocr_seconds = max(0, clock() - ocr_started)
                         if not code or not code.isascii() or not code.isalnum() or len(code) > 16:
                             diagnostic('ocr_invalid', wid=lecture.wid, attempt=attempt + 1)
                             if attempt == 3:
@@ -954,7 +987,9 @@ def run(settings: Settings, *, session: Any = None,
                         unconfirmed_checks = 0
                         health(phase='submitting')
                         submission_started = clock()
-                        diagnostic('submission_started', wid=lecture.wid, attempt=attempt + 1)
+                        diagnostic('submission_started', wid=lecture.wid, attempt=attempt + 1,
+                                   captcha_seconds=round(captcha_seconds, 3),
+                                   ocr_seconds=round(ocr_seconds, 3))
                         try:
                             reply = client.submit(lecture.wid, code)
                         except RemoteError as exc:
@@ -976,7 +1011,9 @@ def run(settings: Settings, *, session: Any = None,
                                 break
                             if isinstance(exc, AuthenticationExpired):
                                 authenticated = False
-                            defer(max(1, exc.retry_after) if opening_scan else max(20, exc.retry_after))
+                            wait = exc.retry_after if exc.retry_after > 0 else (
+                                FAST_INTERVAL if opening_scan else short_backoff(1))
+                            defer(wait, server_directed=exc.retry_after > 0)
                             break
                         step_recovered()
                         message = reply.get('msg', '')
@@ -1058,7 +1095,7 @@ def run(settings: Settings, *, session: Any = None,
                 failures += 1
                 query_failed(scan_started)
                 health(last_error='authentication_expired', last_error_at=clock(), failure_count=failures)
-                defer(min(300, 10 * 2 ** min(failures, 5)))
+                defer(short_backoff(failures))
             except (RemoteError, ValueError) as exc:
                 if isinstance(exc, ValueError):
                     # A structurally invalid history is not a cache we can keep using.
@@ -1092,14 +1129,11 @@ def run(settings: Settings, *, session: Any = None,
                          and reason in FAST_RETRY_REASONS and not exc.retry_after)
                 retry = exc.retry_after if isinstance(exc, RemoteError) else 0
                 if reason == 'service_unavailable':
-                    # Temporary overload/gateway failure: recover within seconds, not the limiter
-                    # 20-40-80 s schedule. An explicit Retry-After still takes precedence.
+                    # Temporary overload/gateway failure: recover within seconds. An explicit
+                    # Retry-After still takes precedence.
                     failures += 1
                     health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
-                    if retry > 0:
-                        delay = retry
-                    else:
-                        delay = min(OVERLOAD_RETRY_CAP, 2.0 ** min(failures - 1, 3))
+                    delay = retry if retry > 0 else short_backoff(failures)
                 elif quick:
                     # Opening seconds are scarce: retry transient request failures at the fast cadence.
                     health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
@@ -1107,8 +1141,8 @@ def run(settings: Settings, *, session: Any = None,
                 else:
                     failures += 1
                     health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
-                    delay = retry if retry > 0 else min(300, 10 * 2 ** min(failures, 5))
-                defer(delay)
+                    delay = retry if retry > 0 else short_backoff(failures)
+                defer(delay, server_directed=retry > 0)
     except (KeyboardInterrupt, EOFError):
         return 130
     except (AuthenticationRejected, RemoteError, ValueError, OSError) as exc:

@@ -84,6 +84,7 @@ class Task:
                         or (data['version'] == 1 and data['status'] == 'done' and not data['activity'])
                         or type(data.get('retry_at', 0)) not in (int, float)
                         or not 0 <= data.get('retry_at', 0) <= 253402214400
+                        or not isinstance(data.get('retry_server', False), bool)
                         or any(not isinstance(k, str) or type(v) not in (int, float)
                                or not 0 <= v <= 253402214400 for k, v in data['cooldowns'].items())):
                     raise ValueError('state_invalid')

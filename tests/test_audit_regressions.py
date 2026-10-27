@@ -127,7 +127,8 @@ def test_unusable_retry_after_cannot_persist_an_unloadable_task(tmp_path, header
             return response
     assert execute(ThrottledSchool(), tmp_path, clock=lambda: 1000) == 130
     saved = json.loads((tmp_path / 'task.json').read_text())
-    assert saved['retry_at'] == 1020
+    # An unusable Retry-After falls back to the bounded short schedule, never a 20 s wait.
+    assert saved['retry_at'] == 1001
     assert saved['health']['last_error'] == 'server_backoff'
 
 

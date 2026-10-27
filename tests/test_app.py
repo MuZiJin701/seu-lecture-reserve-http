@@ -10,8 +10,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from seu_reserve.app import Settings, resolve_pending, run, scan_delay, school_clock_offset
-from seu_reserve.model import moment
+from seu_reserve.app import (Settings, progress_rows, resolve_pending, run, scan_delay,
+                             school_clock_offset)
+from seu_reserve.model import moment, progress
 
 
 class School:
@@ -1209,6 +1210,154 @@ def test_activity_list_confirmation_keeps_hold_until_history_syncs(tmp_path):
     assert school.submitted == ['one']
     assert saved.get('holds', {}).get('one', {}).get('confirmed') is True
     assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
+
+
+def test_pending_mine_rate_limit_does_not_query_the_activity_list(tmp_path):
+    class HistoryLimited(School):
+        limited = False
+        list_calls = 0
+        def request(self, method, url, **kwargs):
+            if url.endswith('queryActivityList.do'):
+                self.list_calls += 1
+            if self.limited and url.endswith('queryMyActivityList.do'):
+                response = requests.Response()
+                response.url = url
+                response.status_code = 429
+                response.headers['Retry-After'] = '600'
+                response._content = b'{}'
+                self.requests.append((method, url, kwargs))
+                return response
+            return super().request(method, url, **kwargs)
+    school = HistoryLimited()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved['retry_at'] = 0
+    saved.pop('step_failure_since', None)
+    saved.pop('query_failure_since', None)
+    state_path.write_text(json.dumps(saved))
+    school.limited = True
+    school.list_calls = 0
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        if sum(waits) >= 600:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, sleep=stop) == 130
+    assert sum(waits) >= 600
+    assert all(seconds >= 100 for seconds in waits)
+    assert school.list_calls == 0
+
+
+def test_pending_activity_list_rate_limit_does_not_count_a_check(tmp_path):
+    class ActivityLimited(School):
+        limited = False
+        def request(self, method, url, **kwargs):
+            if self.limited and url.endswith('queryActivityList.do'):
+                response = requests.Response()
+                response.url = url
+                response.status_code = 429
+                response.headers['Retry-After'] = '600'
+                response._content = b'{}'
+                self.requests.append((method, url, kwargs))
+                return response
+            return super().request(method, url, **kwargs)
+    school = ActivityLimited()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved['retry_at'] = 0
+    saved.pop('step_failure_since', None)
+    saved.pop('query_failure_since', None)
+    state_path.write_text(json.dumps(saved))
+    school.limited = True
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        if sum(waits) >= 600:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, sleep=stop) == 130
+    saved = json.loads(state_path.read_text())
+    assert sum(waits) >= 600
+    assert all(seconds >= 100 for seconds in waits)
+    assert saved.get('pending_checks', 0) == 0
+
+
+def test_success_reply_saves_pending_clear_and_confirmed_hold_together(tmp_path, monkeypatch):
+    import seu_reserve.app as app_module
+    snapshots = []
+    original_save = app_module.Task.save
+    def save(self):
+        original_save(self)
+        snapshots.append(json.loads(self.path.read_text()))
+    monkeypatch.setattr(app_module.Task, 'save', save)
+    school = School()
+    school.activities = [lecture()]
+    school.submit_replies = [{'code': -1, 'msg': '您已预约该活动'}]
+    assert execute(school, tmp_path) == 130
+    seen_pending = False
+    dangerous = []
+    for snapshot in snapshots:
+        if snapshot.get('status') == 'pending':
+            seen_pending = True
+        if (seen_pending and snapshot.get('status') == 'scanning'
+                and not snapshot.get('activity')
+                and snapshot.get('holds', {}).get('one', {}).get('confirmed') is not True):
+            dangerous.append(snapshot)
+    assert dangerous == []
+
+
+def test_confirmed_hold_counts_toward_progress_and_suppresses_candidates(tmp_path):
+    now = moment('2026-10-18 12:00:00').timestamp()
+    categories = ['人文与科学素养系列讲座_心理健康', '人文与科学素养系列讲座_法律',
+                  '人文与科学素养系列讲座-艺术类', '人文与科学素养系列讲座_其他']
+    history = [lecture(f'p{index}', HDLX_DISPLAY=categories[index % 4],
+                       KSSJ=f'2030-01-0{index + 1} 10:00:00',
+                       JSSJ=f'2030-01-0{index + 1} 11:00:00', YYZT='已预约')
+               for index in range(7)]
+    holds = {'held': {'start': moment('2030-02-01 10:00:00').timestamp(),
+                      'end': moment('2030-02-01 11:00:00').timestamp(),
+                      'since': now, 'until': now + 600, 'attempts': 0,
+                      'confirmed': True, 'category': '人文与科学素养系列讲座_其他'}}
+    planned = progress(progress_rows(history, holds, now), now)
+    assert sum(planned.planned.values()) == 8
+    assert not planned.missing
+    school = School()
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved['holds'] = holds
+    state_path.write_text(json.dumps(saved))
+    school.mine = history
+    school.activities = [lecture('other', KSSJ='2030-03-01 10:00:00',
+                                 JSSJ='2030-03-01 11:00:00')]
+    assert execute(school, tmp_path, sleep=interrupted) == 130
+    assert school.submitted == []
+
+
+def test_resolve_pending_clears_legacy_hold(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved['retry_at'] = 0
+    saved['hold'] = {'activity': 'one', 'start': 1893463200.0, 'end': 1893466800.0,
+                     'since': 1792296000.0, 'until': 1792296600.0, 'attempts': 0}
+    saved.pop('holds', None)
+    state_path.write_text(json.dumps(saved))
+    school.submit_timeout = False
+    school.mine = []
+    assert resolve_pending(Settings(state_dir=tmp_path), session=school,
+                           environ={'SEU_USERNAME': 'test-user'},
+                           prompt=lambda _: 'confirm') == 0
+    assert 'hold' not in json.loads(state_path.read_text())
+    assert 'holds' not in json.loads(state_path.read_text())
 
 
 def test_pending_confirms_from_activity_list_when_history_fails(tmp_path):

@@ -104,6 +104,10 @@ class Task:
                 checks = data.get('pending_checks')
                 if checks is not None and (type(checks) is not int or not 0 <= checks <= 1_000_000):
                     raise ValueError('state_invalid')
+                pending_category = data.get('pending_category')
+                if pending_category is not None and (
+                        not isinstance(pending_category, str) or not pending_category):
+                    raise ValueError('state_invalid')
                 hold = data.get('hold')
                 if hold is not None:
                     if (not isinstance(hold, dict)
@@ -129,7 +133,9 @@ class Task:
                                 or not entry['end'] > entry['start']
                                 or type(entry.get('attempts')) is not int
                                 or not 0 <= entry['attempts'] <= 100
-                                or not isinstance(entry.get('confirmed'), bool)):
+                                or not isinstance(entry.get('confirmed'), bool)
+                                or entry.get('category') is not None and (
+                                    not isinstance(entry['category'], str) or not entry['category'])):
                             raise ValueError('state_invalid')
                 if username and account != data['account']:
                     raise ValueError('state_account_mismatch')

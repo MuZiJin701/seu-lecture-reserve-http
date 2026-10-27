@@ -75,6 +75,44 @@ class Settings:
     offline: bool = True
     mail_success: bool = False
 
+def server_wait_error(exc: BaseException) -> bool:
+    """True when the school explicitly asked us to wait before another request."""
+    return (isinstance(exc, RemoteError)
+            and (exc.retry_after > 0 or str(exc) == 'server_backoff'))
+
+
+def progress_rows(history: list[dict[str, Any]], holds: Mapping[str, Any] | None,
+                  now: float) -> list[dict[str, Any]]:
+    """Merge confirmed local holds that the school history has not shown yet."""
+    rows = list(history)
+    known: set[str] = set()
+    for row in history:
+        try:
+            known.add(activity_id(row))
+        except ValueError:
+            continue
+    for wid, entry in (holds or {}).items():
+        if not isinstance(entry, dict) or not entry.get('confirmed'):
+            continue
+        if wid in known:
+            continue
+        category = entry.get('category')
+        if not isinstance(category, str) or not category:
+            continue
+        try:
+            start = datetime.fromtimestamp(float(entry['start']), SHANGHAI)
+            end = datetime.fromtimestamp(float(entry['end']), SHANGHAI)
+        except (KeyError, TypeError, ValueError, OSError, OverflowError):
+            continue
+        if end.timestamp() <= now:
+            continue
+        rows.append({'HD_WID': wid, 'YYZT': '已预约', 'JZXL_DISPLAY': category,
+                     'KSSJ': start.strftime('%Y-%m-%d %H:%M:%S'),
+                     'JSSJ': end.strftime('%Y-%m-%d %H:%M:%S'),
+                     'SFDK': '0', 'SFWY': '0'})
+    return rows
+
+
 def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: Progress,
                       mine: list[dict[str, Any]], cooldowns: Mapping[str, float],
                       now: float, *, cooldown_clock_known: bool = True,
@@ -253,11 +291,13 @@ def resolve_pending(settings: Settings, *, session: Any = None,
             return 1
         if pending_wid in booked:
             task.data.update(status='scanning', activity='')
-            for field in ('pending_checks', 'pending_since', 'pending_start', 'pending_end'):
+            for field in ('pending_checks', 'pending_since', 'pending_start', 'pending_end',
+                          'pending_category'):
                 task.data.pop(field, None)
             holds = task.data.get('holds')
             if isinstance(holds, dict):
                 holds.pop(pending_wid, None)
+            task.data.pop('hold', None)
             task.save()
             _state_event(settings, 'pending_confirmed')
             return 0
@@ -268,11 +308,13 @@ def resolve_pending(settings: Settings, *, session: Any = None,
             _state_event(settings, 'pending_resolution_cancelled')
             return 1
         task.data.update(status='scanning', activity='')
-        for field in ('pending_checks', 'pending_since', 'pending_start', 'pending_end'):
+        for field in ('pending_checks', 'pending_since', 'pending_start', 'pending_end',
+                      'pending_category'):
             task.data.pop(field, None)
         holds = task.data.get('holds')
         if isinstance(holds, dict):
             holds.pop(pending_wid, None)
+        task.data.pop('hold', None)
         task.save()
         _state_event(settings, 'pending_released_by_operator')
         return 0
@@ -445,7 +487,8 @@ def run(settings: Settings, *, session: Any = None,
         clear_alert('reservation_unconfirmed')
         emit('reservation_succeeded')
 
-    def ensure_hold(wid: str, start: float, end: float, *, confirmed: bool, source: str) -> bool:
+    def ensure_hold(wid: str, start: float, end: float, *, confirmed: bool, source: str,
+                    category: str | None = None, save: bool = True) -> bool:
         """Add/confirm one activity's local interval; return True on a new confirmation."""
         if task is None:
             return False
@@ -458,13 +501,16 @@ def run(settings: Settings, *, session: Any = None,
             entry = dict(start=float(start), end=float(end), since=clock(),
                          until=max(float(until), clock()), attempts=0, confirmed=False)
             holds[wid] = entry
+        if category and not entry.get('category'):
+            entry['category'] = category
         newly_confirmed = False
         if confirmed and not entry.get('confirmed'):
             entry['confirmed'] = True
             newly_confirmed = True
-        task.save()
-        if newly_confirmed:
-            emit_success(wid, source)
+        if save:
+            task.save()
+            if newly_confirmed:
+                emit_success(wid, source)
         return newly_confirmed
 
     def remove_hold(wid: str) -> None:
@@ -632,11 +678,13 @@ def run(settings: Settings, *, session: Any = None,
                 refresh_mine = False
                 if task.data['status'] == 'pending':
                     # Verify from both read-only sources: either explicit success record is enough,
-                    # and a failing endpoint must not hide the other one.
+                    # and a failing endpoint must not hide the other one. A server-directed wait
+                    # (429/Retry-After) aborts immediately so no other request bypasses it.
                     pending_wid = task.data['activity']
                     history = None
                     rows = None
                     pending_error: BaseException | None = None
+                    confirmed_newly = False
                     health(phase='my_activities', next_check_at=0)
                     mine_started = clock()
                     try:
@@ -645,6 +693,8 @@ def run(settings: Settings, *, session: Any = None,
                         mine_seconds = max(0, clock() - mine_started)
                         refresh_mine = True
                     except (RemoteError, ValueError) as exc:
+                        if server_wait_error(exc):
+                            raise
                         pending_error = exc
                     booked = set()
                     if history is not None:
@@ -654,6 +704,8 @@ def run(settings: Settings, *, session: Any = None,
                         try:
                             rows = client.activities()
                         except (RemoteError, ValueError) as exc:
+                            if server_wait_error(exc):
+                                raise
                             pending_error = pending_error or exc
                         if rows is not None:
                             for row in rows:
@@ -668,32 +720,38 @@ def run(settings: Settings, *, session: Any = None,
                                 except ValueError:
                                     break
                                 if judged.availability == 'already_reserved':
-                                    ensure_hold(pending_wid, judged.start.timestamp(),
-                                                judged.end.timestamp(), confirmed=True,
-                                                source='pending_activity_list')
+                                    confirmed_newly = ensure_hold(
+                                        pending_wid, judged.start.timestamp(),
+                                        judged.end.timestamp(), confirmed=True,
+                                        source='pending_activity_list',
+                                        category=judged.category, save=False)
                                     confirmed = True
                                 break
                     if pending_wid in booked:
                         confirmed = True
                     if confirmed:
-                        emitted = False
+                        need_emit = False
                         if history is not None and pending_wid in booked:
                             entry = hold_entries().get(pending_wid)
-                            emitted = bool(isinstance(entry, dict) and entry.get('confirmed'))
-                            remove_hold(pending_wid)
+                            already = bool(isinstance(entry, dict) and entry.get('confirmed'))
+                            holds = task.data.get('holds')
+                            if isinstance(holds, dict):
+                                holds.pop(pending_wid, None)
                             source = 'pending_history'
+                            need_emit = not already
                         else:
-                            emitted = True  # ensure_hold() already emitted or it was confirmed before
                             source = 'pending_activity_list'
+                            need_emit = confirmed_newly
                         diagnostic('reservation_confirmed', wid=pending_wid, source=source)
                         task.data.update(status='scanning', activity='')
-                        for field in ('pending_checks', 'pending_since', 'pending_start', 'pending_end'):
+                        for field in ('pending_checks', 'pending_since', 'pending_start',
+                                      'pending_end', 'pending_category'):
                             task.data.pop(field, None)
                         task.save()
                         clear_alert('reservation_unconfirmed')
                         health(last_query_at=clock(), failure_count=0)
                         step_recovered()
-                        if not emitted:
+                        if need_emit:
                             emit_success(pending_wid, source)
                         unconfirmed_checks = 0
                     else:
@@ -716,10 +774,13 @@ def run(settings: Settings, *, session: Any = None,
                             task.data.pop('pending_since', None)
                             started = task.data.pop('pending_start', None)
                             ended = task.data.pop('pending_end', None)
+                            category = task.data.pop('pending_category', None)
                             if (isinstance(started, (int, float))
                                     and isinstance(ended, (int, float)) and ended > started):
                                 ensure_hold(pending_wid, float(started), float(ended),
-                                            confirmed=False, source='pending_release')
+                                            confirmed=False, source='pending_release',
+                                            category=category if isinstance(category, str) else None,
+                                            save=False)
                             task.save()
                             clear_alert('reservation_unconfirmed')
                             diagnostic('reservation_unconfirmed_released', wid=pending_wid,
@@ -766,7 +827,8 @@ def run(settings: Settings, *, session: Any = None,
                                 break
                             if judged.availability == 'already_reserved':
                                 ensure_hold(held_wid, judged.start.timestamp(),
-                                            judged.end.timestamp(), confirmed=True, source='activity_list')
+                                            judged.end.timestamp(), confirmed=True,
+                                            source='activity_list', category=judged.category)
                             break
                 if not refresh_mine and not (
                         history is not None and opening_scan and 0 <= clock() - mine_at < OPENING_HISTORY_TTL):
@@ -795,7 +857,8 @@ def run(settings: Settings, *, session: Any = None,
                         diagnostic('reservation_hold_synced', wid=held_wid)
                         if not already_confirmed:
                             emit_success(held_wid, 'history')
-                current = progress(history, clock() + server_offset)
+                current = progress(progress_rows(history, hold_entries(), clock() + server_offset),
+                                   clock() + server_offset)
                 latest_progress, progress_at = current, mine_at
                 if current.done:
                     newly_completed = task.data['status'] != 'done'
@@ -874,7 +937,8 @@ def run(settings: Settings, *, session: Any = None,
                         task.data.update(status='pending', activity=lecture.wid,
                                          pending_checks=0, pending_since=clock(),
                                          pending_start=lecture.start.timestamp(),
-                                         pending_end=lecture.end.timestamp())
+                                         pending_end=lecture.end.timestamp(),
+                                         pending_category=lecture.category)
                         task.save()
                         unconfirmed_checks = 0
                         health(phase='submitting')
@@ -895,6 +959,7 @@ def run(settings: Settings, *, session: Any = None,
                                 task.data.pop('pending_since', None)
                                 task.data.pop('pending_start', None)
                                 task.data.pop('pending_end', None)
+                                task.data.pop('pending_category', None)
                                 task.save()
                                 diagnostic('submission_connect_failed', wid=lecture.wid)
                                 break
@@ -922,13 +987,18 @@ def run(settings: Settings, *, session: Any = None,
                                    duration_seconds=max(0, clock() - submission_started))
                         if already_reserved and not has_code(reply, 0):
                             # Explicit evidence that the earlier submission is already registered.
+                            # Clear pending and persist the confirmed hold in one atomic save.
                             task.data.update(status='scanning', activity='')
-                            for field in ('pending_checks', 'pending_since', 'pending_start', 'pending_end'):
+                            for field in ('pending_checks', 'pending_since', 'pending_start',
+                                          'pending_end', 'pending_category'):
                                 task.data.pop(field, None)
+                            newly_confirmed = ensure_hold(
+                                lecture.wid, lecture.start.timestamp(), lecture.end.timestamp(),
+                                confirmed=True, source='submit_reply',
+                                category=lecture.category, save=False)
                             task.save()
-                            ensure_hold(lecture.wid, lecture.start.timestamp(),
-                                        lecture.end.timestamp(), confirmed=True,
-                                        source='submit_reply')
+                            if newly_confirmed:
+                                emit_success(lecture.wid, 'submit_reply')
                             restart_scan = True
                             break
                         if (has_code(reply, 0) or type(reply.get('code')) is not int

@@ -96,7 +96,12 @@ def test_pending_timeout_is_released_automatically_before_rescanning(tmp_path):
                                        ('hold', {'activity': 'one', 'start': 2.0, 'end': 1.0,
                                                  'since': 1.0, 'until': 2.0, 'attempts': 0}),
                                        ('hold', {'activity': 'one', 'start': 1.0, 'end': 2.0,
-                                                 'since': 1.0, 'until': 2.0, 'attempts': 'x'})])
+                                                 'since': 1.0, 'until': 2.0, 'attempts': 'x'}),
+                                       ('holds', {'one': {'start': 2.0, 'end': 1.0, 'since': 1.0,
+                                                          'until': 2.0, 'attempts': 0,
+                                                          'confirmed': False}}),
+                                       ('holds', {'one': {'start': 1.0, 'end': 2.0, 'since': 1.0,
+                                                          'until': 2.0, 'attempts': 0}})])
 def test_invalid_recovery_deadlines_are_not_used_or_overwritten(tmp_path, field, value):
     school = School()
     assert execute(school, tmp_path) == 130

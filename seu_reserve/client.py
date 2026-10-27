@@ -53,12 +53,28 @@ class _DeadlineSocket:
     def recv_into(self, buffer: Any, nbytes: int = 0, flags: int = 0) -> int:
         if not self._wait_for_data():
             raise socket.timeout('response deadline exceeded')
+        if not self._tighten_timeout():
+            raise socket.timeout('response deadline exceeded')
         return self._sock.recv_into(buffer, nbytes, flags)
 
     def recv(self, bufsize: int, flags: int = 0) -> bytes:
         if not self._wait_for_data():
             raise socket.timeout('response deadline exceeded')
+        if not self._tighten_timeout():
+            raise socket.timeout('response deadline exceeded')
         return self._sock.recv(bufsize, flags)
+
+    def _tighten_timeout(self) -> bool:
+        # select() only says the raw socket is readable; TLS may still block waiting for the
+        # rest of a record. Bound that inner blocking read by the same deadline.
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            self._sock.settimeout(max(remaining, 0.001))
+        except OSError:
+            pass
+        return True
 
     def _wait_for_data(self) -> bool:
         # TLS may already hold decrypted bytes that select() cannot see.
@@ -94,6 +110,24 @@ class _DeadlineHTTPConnection(Urllib3HTTPConnection):
         self._response_deadline = _current_request_deadline() or fallback
         Urllib3HTTPConnection.request(self, *args, **kwargs)
 
+    def connect(self) -> None:
+        deadline = _current_request_deadline()
+        if deadline is None:
+            return Urllib3HTTPConnection.connect(self)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout('response deadline exceeded')
+        original = self.timeout
+        self.timeout = min(float(original), remaining) if original is not None else remaining
+        try:
+            Urllib3HTTPConnection.connect(self)
+        finally:
+            if original is not None:
+                self.timeout = original
+        if time.monotonic() > deadline:
+            self.close()
+            raise socket.timeout('response deadline exceeded')
+
     def getresponse(self) -> Any:
         deadline = self._response_deadline
         if deadline is None or self.sock is None:
@@ -117,6 +151,24 @@ class _DeadlineHTTPSConnection(Urllib3HTTPSConnection):
         fallback = (time.monotonic() + float(timeout)) if timeout is not None else None
         self._response_deadline = _current_request_deadline() or fallback
         Urllib3HTTPSConnection.request(self, *args, **kwargs)
+
+    def connect(self) -> None:
+        deadline = _current_request_deadline()
+        if deadline is None:
+            return Urllib3HTTPSConnection.connect(self)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout('response deadline exceeded')
+        original = self.timeout
+        self.timeout = min(float(original), remaining) if original is not None else remaining
+        try:
+            Urllib3HTTPSConnection.connect(self)
+        finally:
+            if original is not None:
+                self.timeout = original
+        if time.monotonic() > deadline:
+            self.close()
+            raise socket.timeout('response deadline exceeded')
 
     def getresponse(self) -> Any:
         deadline = self._response_deadline

@@ -1000,7 +1000,7 @@ def test_unconfirmed_hold_blocks_a_conflicting_activity(tmp_path):
     assert execute(school, tmp_path, sleep=stop) == 130
     saved = json.loads(state_path.read_text())
     assert school.submitted == ['one']
-    assert saved['hold']['activity'] == 'one'
+    assert saved['holds']['one']['start'] < saved['holds']['one']['end']
     assert 'event=reservation_unconfirmed_released' in (tmp_path / 'events.log').read_text()
     assert 'event=reservation_succeeded' not in (tmp_path / 'events.log').read_text()
 
@@ -1019,7 +1019,8 @@ def test_unconfirmed_hold_retries_the_original_activity(tmp_path):
     assert execute(school, tmp_path, sleep=stop) == 130
     saved = json.loads((tmp_path / 'task.json').read_text())
     assert school.submitted == ['one', 'one']
-    assert saved['status'] == 'scanning' and 'hold' not in saved
+    assert saved['status'] == 'scanning'
+    assert not saved.get('holds') or saved['holds'].get('one', {}).get('confirmed') is True
     assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
 
 
@@ -1053,11 +1054,12 @@ def test_unconfirmed_hold_clears_on_history_evidence(tmp_path):
         if len(waits) == 3:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, sleep=stop) == 130
-    assert 'hold' in json.loads(state_path.read_text())
+    assert 'holds' in json.loads(state_path.read_text())
     school.hide_history = False
     assert execute(school, tmp_path) == 130
-    assert json.loads(state_path.read_text()).get('status') == 'scanning'
-    assert 'hold' not in json.loads(state_path.read_text())
+    still = json.loads(state_path.read_text())
+    assert still.get('status') == 'scanning'
+    assert 'one' not in still.get('holds', {})
     assert school.submitted == ['one']
     assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
 
@@ -1068,7 +1070,8 @@ def test_already_reserved_reply_confirms_instead_of_pending(tmp_path):
     school.submit_replies = [{'code': -1, 'msg': '您已预约该活动'}]
     assert execute(school, tmp_path) == 130
     saved = json.loads((tmp_path / 'task.json').read_text())
-    assert saved['status'] == 'scanning' and not saved['activity'] and 'hold' not in saved
+    assert saved['status'] == 'scanning' and not saved['activity']
+    assert saved['holds']['one']['confirmed'] is True
     assert 'event=reservation_hold_confirmed' in (tmp_path / 'events.log').read_text()
     assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
 
@@ -1104,8 +1107,133 @@ def test_unconfirmed_hold_expires_and_allows_conflicting_activity(tmp_path):
         if len(waits) == 3:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, sleep=stop, clock=lambda: start) == 130
-    assert 'hold' in json.loads(state_path.read_text())
+    assert 'holds' in json.loads(state_path.read_text())
     later = start + 601
     assert execute(school, tmp_path, clock=lambda: later) == 130
     assert school.submitted == ['one', 'two']
     assert 'event=reservation_hold_expired' in (tmp_path / 'events.log').read_text()
+
+
+def test_hold_for_a_survives_confirming_a_different_activity(tmp_path):
+    class LostA(School):
+        def request(self, method, url, **kwargs):
+            if url.endswith('addReservation.do') and kwargs['data']['wid'] == 'one':
+                self.submitted.append('one')
+                self.activities = [row for row in self.activities if row.get('WID') != 'one']
+                raise requests.Timeout('response lost after the server applied it')
+            return super().request(method, url, **kwargs)
+    school = LostA()
+    school.activities = [lecture('one'), lecture('three'),
+                         lecture('two', KSSJ='2030-01-01 14:00:00', JSSJ='2030-01-01 15:00:00')]
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved['retry_at'] = 0
+    state_path.write_text(json.dumps(saved))
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 3:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, sleep=stop) == 130
+    saved = json.loads(state_path.read_text())
+    assert school.submitted == ['one', 'two']
+    assert 'one' in saved.get('holds', {})
+    assert 'three' not in school.submitted
+
+
+def test_second_timeout_gets_its_own_hold(tmp_path):
+    class LostA(School):
+        def request(self, method, url, **kwargs):
+            if url.endswith('addReservation.do') and kwargs['data']['wid'] == 'one':
+                self.submitted.append('one')
+                self.activities = [row for row in self.activities if row.get('WID') != 'one']
+                raise requests.Timeout('response lost after the server applied it')
+            return super().request(method, url, **kwargs)
+    school = LostA()
+    school.submit_timeout = True
+    school.activities = [lecture('one'), lecture('two', KSSJ='2030-01-01 14:00:00',
+                                                  JSSJ='2030-01-01 15:00:00')]
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved['retry_at'] = 0
+    state_path.write_text(json.dumps(saved))
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 6:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, sleep=stop) == 130
+    saved = json.loads(state_path.read_text())
+    assert {'one', 'two'} <= set(saved.get('holds', {}))
+
+
+def test_already_reserved_reply_does_not_keep_old_candidates(tmp_path):
+    school = School()
+    school.activities = [lecture('one'), lecture('three')]
+    school.submit_replies = [{'code': -1, 'msg': '您已预约该活动'}]
+    assert execute(school, tmp_path) == 130
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert school.submitted == ['one']
+    assert saved.get('holds', {}).get('one', {}).get('confirmed') is True
+    assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
+
+
+def test_activity_list_confirmation_keeps_hold_until_history_syncs(tmp_path):
+    class LostA(School):
+        def request(self, method, url, **kwargs):
+            if url.endswith('addReservation.do') and kwargs['data']['wid'] == 'one':
+                self.submitted.append('one')
+                self.activities = [row for row in self.activities if row.get('WID') != 'one']
+                raise requests.Timeout('response lost after the server applied it')
+            return super().request(method, url, **kwargs)
+    school = LostA()
+    first = lecture('one')
+    school.activities = [first, lecture('three')]
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved['retry_at'] = 0
+    state_path.write_text(json.dumps(saved))
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        if len(waits) == 3:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, sleep=stop) == 130
+    assert 'holds' in json.loads(state_path.read_text())
+    school.activities = [{**first, 'YYZT': '已预约'}, lecture('three')]
+    assert execute(school, tmp_path, sleep=interrupted) == 130
+    saved = json.loads(state_path.read_text())
+    assert school.submitted == ['one']
+    assert saved.get('holds', {}).get('one', {}).get('confirmed') is True
+    assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
+
+
+def test_pending_confirms_from_activity_list_when_history_fails(tmp_path):
+    class HistoryDown(School):
+        down = False
+        mine_calls = 0
+        def request(self, method, url, **kwargs):
+            if self.down and url.endswith('queryMyActivityList.do'):
+                self.mine_calls += 1
+                raise requests.Timeout('history down')
+            return super().request(method, url, **kwargs)
+    school = HistoryDown()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved['retry_at'] = 0
+    state_path.write_text(json.dumps(saved))
+    school.submit_timeout = False
+    school.down = True
+    school.activities[0]['YYZT'] = '已预约'
+    assert execute(school, tmp_path, sleep=interrupted) == 130
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert school.mine_calls >= 1
+    assert saved['status'] == 'scanning' and not saved['activity']
+    assert any(url.endswith('queryActivityList.do') for _, url, _ in school.requests)
+    assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()

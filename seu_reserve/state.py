@@ -115,6 +115,22 @@ class Task:
                             or type(hold.get('attempts')) is not int
                             or not 0 <= hold['attempts'] <= 100):
                         raise ValueError('state_invalid')
+                holds = data.get('holds')
+                if holds is not None:
+                    if not isinstance(holds, dict):
+                        raise ValueError('state_invalid')
+                    for wid, entry in holds.items():
+                        if (not isinstance(wid, str) or not wid or len(wid) > 512
+                                or not isinstance(entry, dict)
+                                or any(type(entry.get(key)) not in (int, float)
+                                       or not math.isfinite(entry[key])
+                                       or not 0 <= entry[key] <= 253402214400
+                                       for key in ('start', 'end', 'since', 'until'))
+                                or not entry['end'] > entry['start']
+                                or type(entry.get('attempts')) is not int
+                                or not 0 <= entry['attempts'] <= 100
+                                or not isinstance(entry.get('confirmed'), bool)):
+                            raise ValueError('state_invalid')
                 if username and account != data['account']:
                     raise ValueError('state_account_mismatch')
                 if not username and (data['status'] != 'done' or data['version'] == 1):

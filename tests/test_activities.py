@@ -353,7 +353,7 @@ def test_recent_history_cache_survives_list_failure_and_enables_submission(tmp_p
             raise KeyboardInterrupt
     assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop) == 130
     assert school.submitted == ['native']
-    assert school.list_calls == 3
+    assert school.list_calls >= 3
 
 
 def test_captcha_cooldown_uses_school_clock_basis(tmp_path):

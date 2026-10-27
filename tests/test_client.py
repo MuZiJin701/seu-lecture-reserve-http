@@ -604,6 +604,23 @@ def test_install_deadline_pools_covers_proxy_managers():
         assert manager.pool_classes_by_scheme == DEADLINE_POOLS
 
 
+def test_deadline_socket_tightens_the_blocking_recv_timeout(monkeypatch):
+    import seu_reserve.client as client_module
+    class Raw:
+        def __init__(self):
+            self.timeouts = []
+        def settimeout(self, value):
+            self.timeouts.append(value)
+        def recv_into(self, buffer, nbytes=0, flags=0):
+            return 0
+    raw = Raw()
+    sock = client_module._DeadlineSocket(raw, time.monotonic() + 0.2)
+    monkeypatch.setattr(client_module.select, 'select', lambda r, w, x, timeout: (r, [], []))
+    sock.recv_into(bytearray(8))
+    assert raw.timeouts
+    assert 0 < raw.timeouts[-1] <= 0.21
+
+
 @pytest.fixture
 def slow_header_proxy():
     class Handler(BaseHTTPRequestHandler):

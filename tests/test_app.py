@@ -169,6 +169,8 @@ def execute(school, directory, **options):
     options.setdefault('notify', lambda _: None)
     options.setdefault('prompt', interrupted)
     options.setdefault('recognize', lambda image: '1234')
+    # The background poller adds real threads and requests; tests exercise it explicitly.
+    options.setdefault('background_poller', False)
     settings = options.pop('settings', Settings(state_dir=directory))
     return run(settings, session=school,
                environ={'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},

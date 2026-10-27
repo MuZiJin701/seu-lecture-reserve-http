@@ -19,6 +19,7 @@ from .model import (GOAL_CATEGORIES, Lecture, Progress, REQUIRED_CATEGORIES, SHA
                     activity_id, category_name, interval, moment, progress, reserved,
                     test_notice)
 from .mail import Mailer, mail_failure_reason, mail_history
+from .poller import ActivityPoller
 from .state import Task, open_nofollow
 
 DEFAULT_CATEGORIES = GOAL_CATEGORIES
@@ -53,6 +54,11 @@ OPENING_QUERY_TIMEOUT = 6
 # During the opening window, reuse the history fetched immediately before it instead of
 # synchronously refreshing at the opening instant; the trade-off is bounded stale conflict data.
 OPENING_HISTORY_TTL = 60.0
+# A background read-only activity list fetched by the poller is used only while this fresh; a
+# stale snapshot falls back to a normal synchronous query.
+POLLER_SNAPSHOT_MAX_AGE = 0.75
+# After a poller failure, do not recreate it for at least this long (server Retry-After wins).
+POLLER_RETRY_MIN_SECONDS = 5.0
 # 502/503/504 mean the server is overloaded, not that a rate limit is in force; recover in seconds.
 # Explicit Retry-After still wins.
 OVERLOAD_RETRY_CAP = 5.0
@@ -343,7 +349,8 @@ def run(settings: Settings, *, session: Any = None,
         notify: Callable[[str], None] | None = None, sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
         recognize: Callable[[bytes], str] | None = None,
-        check_only: bool = False, new_task: bool = False) -> int:
+        check_only: bool = False, new_task: bool = False,
+        background_poller: bool = True) -> int:
     environ = os.environ if environ is None else environ
     announced: set[str] = set()
     alerts: dict[str, float] = {}
@@ -353,6 +360,22 @@ def run(settings: Settings, *, session: Any = None,
     progress_at = 0.0
     task: Task | None = None
     client = None
+    activity_poller: ActivityPoller | None = None
+    poller_client: Client | None = None
+    poller_retry_at = 0.0
+    poller_allowed = False
+
+    def stop_poller() -> None:
+        nonlocal activity_poller, poller_client
+        if activity_poller is not None:
+            activity_poller.stop()
+            activity_poller = None
+        if poller_client is not None:
+            session = getattr(poller_client, 'session', None)
+            close = getattr(session, 'close', None)
+            if callable(close):
+                close()
+            poller_client = None
     mail_state_ready = False
     final_phase = 'stopped'
     stage = 'configuration'
@@ -679,6 +702,58 @@ def run(settings: Settings, *, session: Any = None,
         history: list[dict[str, Any]] | None = None
         mine_at = 0.0
         progress_probe_attempted = False
+
+        def pause_poller() -> None:
+            """Stop background polling after an error and keep a short restart cooldown."""
+            nonlocal poller_retry_at, poller_allowed
+            poller_allowed = False
+            poller = activity_poller
+            if poller is not None:
+                snapshot = poller.snapshot()
+                if snapshot is not None and snapshot.error is not None:
+                    poller_retry_at = max(
+                        poller_retry_at,
+                        clock() + max(POLLER_RETRY_MIN_SECONDS, snapshot.retry_after))
+            stop_poller()
+
+        def sync_poller(active: bool) -> None:
+            """Run the read-only poller only while the opening window is active."""
+            nonlocal activity_poller, poller_client, poller_retry_at, poller_allowed
+            if (not background_poller or check_only or not active or not authenticated
+                    or not poller_allowed):
+                stop_poller()
+                return
+            if activity_poller is not None and activity_poller.running:
+                return
+            if activity_poller is not None:
+                snapshot = activity_poller.snapshot()
+                if snapshot is not None and snapshot.error is not None:
+                    poller_retry_at = max(
+                        poller_retry_at,
+                        clock() + max(POLLER_RETRY_MIN_SECONDS, snapshot.retry_after))
+                stop_poller()
+            if clock() < poller_retry_at:
+                return
+            if poller_client is None:
+                poller_client = client.clone_readonly()
+            activity_poller = ActivityPoller(poller_client.activities,
+                                             interval=FAST_INTERVAL, clock=clock)
+            activity_poller.start()
+
+        def list_rows() -> tuple[list[dict[str, Any]], float, str]:
+            """Prefer a fresh poller snapshot; fall back to a synchronous query."""
+            nonlocal poller_allowed
+            poller = activity_poller
+            snapshot = poller.snapshot() if poller is not None else None
+            if (snapshot is not None and snapshot.error is None
+                    and 0 <= clock() - snapshot.at <= POLLER_SNAPSHOT_MAX_AGE):
+                poller_allowed = True
+                return snapshot.rows, 0.0, 'poller'
+            started = clock()
+            rows = client.activities()
+            poller_allowed = True
+            return rows, max(0, clock() - started), 'query'
+
         previous_selection = task.data.get('selection')
         details: list[dict[str, Any]] = (previous_selection.get('activities', [])
                                          if isinstance(previous_selection, dict) else [])
@@ -691,6 +766,8 @@ def run(settings: Settings, *, session: Any = None,
                 opening_scan = scan_delay(details, school_now, 0, SCAN_INTERVAL, known_openings)[1]
                 client.timeout = OPENING_QUERY_TIMEOUT if opening_scan else 10
                 mail_blocked = opening_scan
+                activities_source = 'query'
+                sync_poller(opening_scan)
                 if not authenticated:
                     health(phase='authentication', next_check_at=0)
                     client.authenticate()
@@ -704,6 +781,8 @@ def run(settings: Settings, *, session: Any = None,
                             # Degrade to the lazy load at the first candidate; the run fails
                             # there only if OCR is genuinely unusable.
                             diagnostic('ocr_unavailable', reason=type(exc).__name__)
+                    stop_poller()
+                    sync_poller(opening_scan)
                 if task.data['status'] != 'pending':
                     holds_now = hold_entries()
                     expired = [wid for wid, entry in holds_now.items()
@@ -743,7 +822,7 @@ def run(settings: Settings, *, session: Any = None,
                     if pending_wid not in booked:
                         health(phase='activities', next_check_at=0)
                         try:
-                            rows = client.activities()
+                            rows, _, activities_source = list_rows()
                         except (RemoteError, ValueError) as exc:
                             if server_wait_error(exc):
                                 raise
@@ -838,9 +917,7 @@ def run(settings: Settings, *, session: Any = None,
                 # Query the opening-critical list before the slower history refresh: a slow or
                 # failing my-activities endpoint must not hide the next reservation opening.
                 health(phase='activities')
-                activities_started = clock()
-                rows = client.activities()
-                activities_seconds = max(0, clock() - activities_started)
+                rows, activities_seconds, activities_source = list_rows()
                 if school_clock_known(rows, clock()):
                     server_offset = school_clock_offset(rows, clock())
                     offset_known = True
@@ -941,6 +1018,7 @@ def run(settings: Settings, *, session: Any = None,
                                           known_openings)[1]
                 mail_blocked = opening_scan
                 client.timeout = SUBMIT_TIMEOUT if opening_scan else 10
+                sync_poller(opening_scan)
                 previous_selection = task.data.get('selection')
                 if (not isinstance(previous_selection, dict)
                         or previous_selection.get('activities') != details):
@@ -1013,6 +1091,7 @@ def run(settings: Settings, *, session: Any = None,
                                 authenticated = False
                             wait = exc.retry_after if exc.retry_after > 0 else (
                                 FAST_INTERVAL if opening_scan else short_backoff(1))
+                            pause_poller()
                             defer(wait, server_directed=exc.retry_after > 0)
                             break
                         step_recovered()
@@ -1076,7 +1155,8 @@ def run(settings: Settings, *, session: Any = None,
                         diagnostic('scan_timing', mode='opening' if fast else 'normal',
                                    duration_seconds=elapsed, wait_seconds=delay,
                                    history_reused=not refresh_mine,
-                                   mine_seconds=mine_seconds, activities_seconds=activities_seconds)
+                                   mine_seconds=mine_seconds, activities_seconds=activities_seconds,
+                                   rows_source=activities_source)
                         last_timing_at = clock()
                     opening_scan = fast
                     if not fast:
@@ -1095,6 +1175,7 @@ def run(settings: Settings, *, session: Any = None,
                 failures += 1
                 query_failed(scan_started)
                 health(last_error='authentication_expired', last_error_at=clock(), failure_count=failures)
+                pause_poller()
                 defer(short_backoff(failures))
             except (RemoteError, ValueError) as exc:
                 if isinstance(exc, ValueError):
@@ -1142,6 +1223,7 @@ def run(settings: Settings, *, session: Any = None,
                     failures += 1
                     health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
                     delay = retry if retry > 0 else short_backoff(failures)
+                pause_poller()
                 defer(delay, server_directed=retry > 0)
     except (KeyboardInterrupt, EOFError):
         return 130
@@ -1182,6 +1264,7 @@ def run(settings: Settings, *, session: Any = None,
             flush_mail()
         return 1
     finally:
+        stop_poller()
         if task:
             health(phase='manual_required' if snapshot['phase'] == 'manual_required' and final_phase == 'stopped'
                    else final_phase, next_check_at=0)

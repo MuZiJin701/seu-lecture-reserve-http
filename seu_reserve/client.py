@@ -322,6 +322,20 @@ class Client:
         self.gateway_adapter = GatewayIPAdapter(address) if address else None
         self.initial_authentication = True
 
+    def clone_readonly(self) -> 'Client':
+        """Independent client with a copied-cookie session for read-only background queries.
+
+        A requests.Session is not safe to share between threads, so the opening poller gets
+        its own session; the server treats the copied cookies as the same logged-in session.
+        """
+        session = requests.Session()
+        cookies = getattr(self.session, 'cookies', None)
+        if cookies is not None:
+            session.cookies.update(cookies)
+        clone = Client(session, self.environ, self.prompt, self.notify)
+        clone.timeout = self.timeout
+        return clone
+
     def request(self, method: str, url: str, **kwargs: Any) -> Any:
         parsed = urlsplit(url)
         if parsed.scheme == 'http' and parsed.hostname == 'ehall.seu.edu.cn' and parsed.port in (None, 80):

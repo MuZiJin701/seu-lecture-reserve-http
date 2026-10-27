@@ -325,6 +325,46 @@ def test_overload_503_with_retry_after_is_honored(tmp_path):
     assert waits == [2]
 
 
+def test_opening_overload_and_rate_limit_recover_without_extra_probes(tmp_path):
+    now = [OPEN - 31]
+    calls = []
+    class Congested(ActivitySchool):
+        errors = []
+        def request(self, method, url, **kwargs):
+            endpoint = urlsplit(url).path.rsplit('/', 1)[-1]
+            if endpoint == 'queryActivityList.do' and self.submitted:
+                raise KeyboardInterrupt
+            if '/modules/hdyy/' in url:
+                calls.append((endpoint, kwargs['timeout']))
+                now[0] += {'queryActivityList.do': 0.4, 'queryMyActivityList.do': 0.2,
+                           'vcode.do': 0.3, 'addReservation.do': 0.4}[endpoint]
+            response = super().request(method, url, **kwargs)
+            if endpoint == 'queryActivityList.do' and self.errors:
+                response.status_code = self.errors.pop(0)
+                response._content = b''
+                if response.status_code == 429:
+                    response.headers['Retry-After'] = '2'
+            return response
+    school = Congested()
+    school.activities = [activity()]
+    assert execute(school, tmp_path, clock=lambda: now[0]) == 130
+    now[0] = OPEN
+    calls.clear()
+    school.errors = [503, 503, 503, 504, 429]
+    waits = []
+    def wait(seconds):
+        waits.append(seconds)
+        assert len(waits) <= 5
+        now[0] += seconds
+    assert execute(school, tmp_path, clock=lambda: now[0], sleep=wait) == 130
+    assert waits == [1, 2, 4, 5, 2]
+    assert calls == [('queryActivityList.do', 6), ('queryMyActivityList.do', 6),
+                     *[('queryActivityList.do', 6)] * 5,
+                     ('vcode.do', 8), ('addReservation.do', 8), ('queryMyActivityList.do', 6)]
+    assert school.submitted == ['native']
+    assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
+
+
 def test_recent_history_cache_survives_list_failure_and_enables_submission(tmp_path):
     open_text = moment('2029-12-31 19:00:00').strftime('%Y-%m-%d %H:%M:%S')
     pre_open_text = moment('2029-12-31 18:59:50').strftime('%Y-%m-%d %H:%M:%S')

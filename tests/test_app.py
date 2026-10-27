@@ -1,6 +1,7 @@
 import base64
 import json
 import socket
+import sys
 import threading
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -1386,3 +1387,144 @@ def test_pending_confirms_from_activity_list_when_history_fails(tmp_path):
     assert saved['status'] == 'scanning' and not saved['activity']
     assert any(url.endswith('queryActivityList.do') for _, url, _ in school.requests)
     assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
+
+
+@pytest.mark.parametrize('source', ['submit_reply', 'pending_release'])
+def test_interrupt_before_hold_creation_keeps_pending_and_blocks_conflicts(tmp_path, source):
+    school = School()
+    first = lecture('one')
+    school.activities = [first, lecture('two')]
+    if source == 'submit_reply':
+        school.submit_replies = [{'code': -1, 'msg': '您已预约该活动'}]
+    else:
+        school.submit_timeout = True
+        assert execute(school, tmp_path) == 130
+        path = tmp_path / 'task.json'
+        saved = json.loads(path.read_text())
+        saved['retry_at'] = 0
+        path.write_text(json.dumps(saved))
+        school.activities = [lecture('two')]
+
+    interrupted_hold = False
+    def interrupt(frame, event, arg):
+        nonlocal interrupted_hold
+        if (event == 'call' and frame.f_code.co_filename == run.__code__.co_filename
+                and frame.f_code.co_name == 'ensure_hold' and not interrupted_hold):
+            interrupted_hold = True
+            raise KeyboardInterrupt
+        return interrupt
+    previous_trace = sys.gettrace()
+    try:
+        sys.settrace(interrupt)
+        assert execute(school, tmp_path, sleep=lambda _: None) == 130
+    finally:
+        sys.settrace(previous_trace)
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert interrupted_hold
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+    assert saved['pending_start'] < saved['pending_end']
+
+    school.submit_timeout = False
+    school.activities = [{**first, 'YYZT': '已预约'}, lecture('two')]
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == ['one']
+
+
+@pytest.mark.parametrize('missing', ['pending_start', 'pending_end'])
+def test_pending_without_a_complete_interval_does_not_resume_submissions(tmp_path, missing):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    path = tmp_path / 'task.json'
+    saved = json.loads(path.read_text())
+    saved.update(retry_at=0, pending_checks=2)
+    saved.pop(missing)
+    path.write_text(json.dumps(saved))
+    school.activities = [lecture('two')]
+    assert execute(school, tmp_path) == 130
+    saved = json.loads(path.read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+    assert school.submitted == ['one']
+
+
+def test_null_optional_holds_still_preserve_success_evidence(tmp_path):
+    school = School()
+    assert execute(school, tmp_path) == 130
+    path = tmp_path / 'task.json'
+    saved = json.loads(path.read_text())
+    saved['holds'] = None
+    path.write_text(json.dumps(saved))
+    school.activities = [lecture('one'), lecture('two')]
+    school.submit_replies = [{'code': -1, 'msg': '您已预约该活动'}]
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == ['one']
+    assert json.loads(path.read_text())['holds']['one']['confirmed'] is True
+
+
+@pytest.mark.parametrize('found', [False, True])
+@pytest.mark.parametrize('existing_holds', [False, True])
+def test_resolve_pending_preserves_another_activitys_legacy_hold(tmp_path, found, existing_holds):
+    school = School()
+    assert execute(school, tmp_path) == 130
+    path = tmp_path / 'task.json'
+    saved = json.loads(path.read_text())
+    now = moment('2026-10-18 12:00:00').timestamp()
+    hold = dict(activity='one', start=moment('2030-01-01 10:00:00').timestamp(),
+                end=moment('2030-01-01 11:00:00').timestamp(),
+                since=now, until=now + 600, attempts=1)
+    saved.update(status='pending', activity='two', hold=hold,
+                 pending_start=moment('2030-01-01 14:00:00').timestamp(),
+                 pending_end=moment('2030-01-01 15:00:00').timestamp())
+    if existing_holds:
+        saved['holds'] = {'three': dict(start=hold['start'] + 86400, end=hold['end'] + 86400,
+                                       since=now, until=now + 600, attempts=0, confirmed=False)}
+    path.write_text(json.dumps(saved))
+    if found:
+        school.mine = [lecture('two', YYZT='已预约', KSSJ='2030-01-01 14:00:00',
+                               JSSJ='2030-01-01 15:00:00')]
+    assert resolve_pending(Settings(state_dir=tmp_path), session=school,
+                           environ={'SEU_USERNAME': 'test-user'},
+                           prompt=lambda _: 'confirm') == 0
+    assert json.loads(path.read_text())['hold'] == hold
+    school.activities = [lecture('conflict')]
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == []
+    migrated = json.loads(path.read_text())['holds']
+    assert 'one' in migrated
+    if existing_holds:
+        assert 'three' in migrated
+
+
+@pytest.mark.parametrize('listed', [False, True])
+def test_legacy_confirmed_hold_missing_category_cannot_allow_extra_booking(tmp_path, listed):
+    school = School()
+    assert execute(school, tmp_path) == 130
+    path = tmp_path / 'task.json'
+    saved = json.loads(path.read_text())
+    now = moment('2026-10-18 12:00:00').timestamp()
+    held = lecture('held', KSSJ='2030-02-01 10:00:00', JSSJ='2030-02-01 11:00:00')
+    saved['holds'] = {'held': dict(start=moment(held['KSSJ']).timestamp(),
+                                  end=moment(held['JSSJ']).timestamp(), since=now,
+                                  until=now + 600, attempts=0, confirmed=True)}
+    path.write_text(json.dumps(saved))
+    categories = ['人文与科学素养系列讲座_心理健康', '人文与科学素养系列讲座_法律',
+                  '人文与科学素养系列讲座-艺术类']
+    school.mine = [lecture(f'old{i}', HDLX_DISPLAY=categories[i % 3], YYZT='已预约',
+                           KSSJ=f'2030-01-{i + 1:02d} 10:00:00',
+                           JSSJ=f'2030-01-{i + 1:02d} 11:00:00') for i in range(7)]
+    school.activities = [lecture('extra', KSSJ='2030-03-01 10:00:00',
+                                 JSSJ='2030-03-01 11:00:00')]
+    if listed:
+        school.activities.append(held)
+    school.requests.clear()
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == []
+    current = json.loads(path.read_text())
+    assert current['holds']['held']['confirmed'] is True
+    if listed:
+        assert current['holds']['held']['category'] == held['HDLX_DISPLAY']
+        assert sum(url.endswith('queryActivityList.do') for _, url, _ in school.requests) == 1
+        assert sum(url.endswith('queryMyActivityList.do') for _, url, _ in school.requests) == 1
+    else:
+        assert 'event=attendance_category_unknown' in (tmp_path / 'events.log').read_text()

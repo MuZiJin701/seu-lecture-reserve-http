@@ -98,7 +98,7 @@ def progress_rows(history: list[dict[str, Any]], holds: Mapping[str, Any] | None
             continue
         category = entry.get('category')
         if not isinstance(category, str) or not category:
-            continue
+            raise ValueError('attendance_category_unknown')
         try:
             start = datetime.fromtimestamp(float(entry['start']), SHANGHAI)
             end = datetime.fromtimestamp(float(entry['end']), SHANGHAI)
@@ -297,7 +297,9 @@ def resolve_pending(settings: Settings, *, session: Any = None,
             holds = task.data.get('holds')
             if isinstance(holds, dict):
                 holds.pop(pending_wid, None)
-            task.data.pop('hold', None)
+            legacy = task.data.get('hold')
+            if isinstance(legacy, dict) and legacy.get('activity') == pending_wid:
+                task.data.pop('hold', None)
             task.save()
             _state_event(settings, 'pending_confirmed')
             return 0
@@ -314,7 +316,9 @@ def resolve_pending(settings: Settings, *, session: Any = None,
         holds = task.data.get('holds')
         if isinstance(holds, dict):
             holds.pop(pending_wid, None)
-        task.data.pop('hold', None)
+        legacy = task.data.get('hold')
+        if isinstance(legacy, dict) and legacy.get('activity') == pending_wid:
+            task.data.pop('hold', None)
         task.save()
         _state_event(settings, 'pending_released_by_operator')
         return 0
@@ -492,9 +496,11 @@ def run(settings: Settings, *, session: Any = None,
         """Add/confirm one activity's local interval; return True on a new confirmation."""
         if task is None:
             return False
-        holds = task.data.setdefault('holds', {})
+        holds = task.data.get('holds')
+        if holds is None:
+            holds = task.data['holds'] = {}
         if not isinstance(holds, dict):
-            return False
+            raise ValueError('state_invalid')
         entry = holds.get(wid)
         if not isinstance(entry, dict):
             until = min(float(start), clock() + PENDING_HOLD_SECONDS)
@@ -616,14 +622,17 @@ def run(settings: Settings, *, session: Any = None,
         if new_task and task.data['status'] != 'done':
             raise ValueError('active_task_cannot_be_reset')
         record('task_started')
-        legacy_hold = task.data.pop('hold', None)
-        if isinstance(legacy_hold, dict) and not task.data.get('holds'):
+        legacy_hold = task.data.get('hold')
+        if isinstance(legacy_hold, dict):
             wid = legacy_hold.get('activity')
             if isinstance(wid, str) and wid:
-                task.data['holds'] = {wid: dict(
+                holds = task.data.get('holds') or {}
+                task.data['holds'] = holds
+                holds.setdefault(wid, dict(
                     start=legacy_hold.get('start', 0), end=legacy_hold.get('end', 0),
                     since=legacy_hold.get('since', 0), until=legacy_hold.get('until', 0),
-                    attempts=legacy_hold.get('attempts', 0), confirmed=False)}
+                    attempts=legacy_hold.get('attempts', 0), confirmed=False))
+                task.data.pop('hold', None)
                 task.save()
         checkpoint = task
         def defer(seconds: float) -> None:
@@ -769,26 +778,27 @@ def run(settings: Settings, *, session: Any = None,
                         if unconfirmed_checks == 1:
                             emit('reservation_unconfirmed')
                         if unconfirmed_checks >= PENDING_AUTO_RELEASE_CHECKS:
-                            task.data.update(status='scanning', activity='')
-                            task.data.pop('pending_checks', None)
-                            task.data.pop('pending_since', None)
-                            started = task.data.pop('pending_start', None)
-                            ended = task.data.pop('pending_end', None)
-                            category = task.data.pop('pending_category', None)
+                            started = task.data.get('pending_start')
+                            ended = task.data.get('pending_end')
+                            category = task.data.get('pending_category')
                             if (isinstance(started, (int, float))
                                     and isinstance(ended, (int, float)) and ended > started):
                                 ensure_hold(pending_wid, float(started), float(ended),
                                             confirmed=False, source='pending_release',
                                             category=category if isinstance(category, str) else None,
                                             save=False)
-                            task.save()
-                            clear_alert('reservation_unconfirmed')
-                            diagnostic('reservation_unconfirmed_released', wid=pending_wid,
-                                       checks=unconfirmed_checks,
-                                       hold=pending_wid in hold_entries())
-                            record('reservation_unconfirmed_released')
-                            unconfirmed_checks = 0
-                            continue
+                                task.data.update(status='scanning', activity='')
+                                for field in ('pending_checks', 'pending_since', 'pending_start',
+                                              'pending_end', 'pending_category'):
+                                    task.data.pop(field, None)
+                                task.save()
+                                clear_alert('reservation_unconfirmed')
+                                diagnostic('reservation_unconfirmed_released', wid=pending_wid,
+                                           checks=unconfirmed_checks,
+                                           hold=pending_wid in hold_entries())
+                                record('reservation_unconfirmed_released')
+                                unconfirmed_checks = 0
+                                continue
                         pause_value = PENDING_MISS_PAUSE
                         health(phase='confirming', next_check_at=clock() + pause_value)
                         pause(pause_value)
@@ -825,7 +835,8 @@ def run(settings: Settings, *, session: Any = None,
                                 judged = Lecture.read(row, now=clock() + server_offset)
                             except ValueError:
                                 break
-                            if judged.availability == 'already_reserved':
+                            if (judged.availability == 'already_reserved'
+                                    or held_entry.get('confirmed') and not held_entry.get('category')):
                                 ensure_hold(held_wid, judged.start.timestamp(),
                                             judged.end.timestamp(), confirmed=True,
                                             source='activity_list', category=judged.category)
@@ -987,15 +998,15 @@ def run(settings: Settings, *, session: Any = None,
                                    duration_seconds=max(0, clock() - submission_started))
                         if already_reserved and not has_code(reply, 0):
                             # Explicit evidence that the earlier submission is already registered.
-                            # Clear pending and persist the confirmed hold in one atomic save.
-                            task.data.update(status='scanning', activity='')
-                            for field in ('pending_checks', 'pending_since', 'pending_start',
-                                          'pending_end', 'pending_category'):
-                                task.data.pop(field, None)
+                            # Keep pending until its replacement exists: Ctrl+C cleanup also saves.
                             newly_confirmed = ensure_hold(
                                 lecture.wid, lecture.start.timestamp(), lecture.end.timestamp(),
                                 confirmed=True, source='submit_reply',
                                 category=lecture.category, save=False)
+                            task.data.update(status='scanning', activity='')
+                            for field in ('pending_checks', 'pending_since', 'pending_start',
+                                          'pending_end', 'pending_category'):
+                                task.data.pop(field, None)
                             task.save()
                             if newly_confirmed:
                                 emit_success(lecture.wid, 'submit_reply')

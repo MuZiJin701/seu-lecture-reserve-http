@@ -19,6 +19,18 @@ class Snapshot:
     at: float
     error: str | None = None
     retry_after: float = 0.0
+    # When the error carried a usable server-directed wait (429/Retry-After or the
+    # server_backoff code), the scan loop must observe the same pause instead of falling
+    # back to a synchronous query.
+    failed_at: float = 0.0
+    server_directed: bool = False
+
+
+def server_directed_error(exc: BaseException) -> bool:
+    """Whether a request error asked the client to wait before another request."""
+    retry_after = float(getattr(exc, 'retry_after', 0) or 0)
+    return (retry_after > 0 or getattr(exc, 'http_status', None) == 429
+            or getattr(exc, 'args', ())[:1] == ('server_backoff',))
 
 
 class ActivityPoller:
@@ -42,18 +54,21 @@ class ActivityPoller:
         return thread is not None and thread.is_alive()
 
     def poll_once(self) -> bool:
-        """One query; store the result (or the error type and Retry-After)."""
+        """One query; store the result (or the error type, Retry-After and wait class)."""
         started = self._clock()
         try:
             rows = self._query()
         except Exception as exc:
+            retry_after = float(getattr(exc, 'retry_after', 0) or 0)
             with self._lock:
                 previous = self._snapshot
                 self._snapshot = Snapshot(
                     rows=previous.rows if previous is not None else [],
                     at=previous.at if previous is not None else started,
                     error=type(exc).__name__,
-                    retry_after=float(getattr(exc, 'retry_after', 0) or 0))
+                    retry_after=retry_after,
+                    failed_at=self._clock(),
+                    server_directed=server_directed_error(exc))
             return False
         with self._lock:
             self._snapshot = Snapshot(rows=rows, at=self._clock())

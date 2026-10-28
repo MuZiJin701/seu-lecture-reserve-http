@@ -148,7 +148,8 @@ def test_example_is_valid_dotenv_with_the_confirmed_default_categories(tmp_path)
     assert result.returncode == 0
     assert result.stdout.splitlines()[0] == 'status=not_started'
     settings, _ = configuration_from(tmp_path / '.env', {})
-    assert settings.categories == GOAL_CATEGORIES and COFFEE_CATEGORY in settings.categories
+    assert settings.categories == GOAL_CATEGORIES + (COFFEE_CATEGORY,)
+    assert COFFEE_CATEGORY not in GOAL_CATEGORIES
 
 
 def test_gateway_ip_is_loaded_from_dotenv_and_process_takes_precedence(tmp_path):

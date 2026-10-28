@@ -12,7 +12,7 @@ SERIES_CATEGORIES = ('人文与科学素养系列讲座_心理健康', '人文�
                      '人文与科学素养系列讲座-艺术类', '人文与科学素养系列讲座_其他')
 REQUIRED_CATEGORIES = SERIES_CATEGORIES[:3]
 COFFEE_CATEGORY = '“SEU咖啡间”系列沙龙活动'
-GOAL_CATEGORIES = SERIES_CATEGORIES + (COFFEE_CATEGORY,)
+GOAL_CATEGORIES = SERIES_CATEGORIES
 
 
 def category_name(value: Any) -> Any:
@@ -40,7 +40,7 @@ class Progress:
 
     def needs(self, category: str) -> bool:
         category = category_name(category)
-        return (category in GOAL_CATEGORIES and (category in self.missing
+        return ((category in GOAL_CATEGORIES or category == COFFEE_CATEGORY) and (category in self.missing
                 or sum(self.completed.values()) + sum(self.planned.values()) + len(self.missing) < 8))
 
 
@@ -65,6 +65,8 @@ def progress(rows: list[dict[str, Any]], now: float) -> Progress:
         category = category_name(row.get('JZXL_DISPLAY', row.get('HDLX_DISPLAY')))
         if not isinstance(category, str) or not category:
             raise ValueError('attendance_category_unknown')
+        if category == COFFEE_CATEGORY:
+            continue
         if category not in GOAL_CATEGORIES:
             raise ValueError('attendance_category_unknown')
         start, end = interval(row)

@@ -15,14 +15,14 @@ from typing import Any
 import requests
 
 from .client import AuthenticationExpired, AuthenticationRejected, Client, RemoteError, has_code
-from .model import (GOAL_CATEGORIES, Lecture, Progress, REQUIRED_CATEGORIES, SHANGHAI,
+from .model import (COFFEE_CATEGORY, GOAL_CATEGORIES, Lecture, Progress, REQUIRED_CATEGORIES, SHANGHAI,
                     activity_id, category_name, interval, moment, progress, reserved,
                     test_notice)
 from .mail import Mailer, mail_failure_reason, mail_history
 from .poller import ActivityPoller
 from .state import Task, open_nofollow
 
-DEFAULT_CATEGORIES = GOAL_CATEGORIES
+DEFAULT_CATEGORIES = GOAL_CATEGORIES + (COFFEE_CATEGORY,)
 QUERY_FAILURE_SECONDS = 5 * 60
 STEP_FAILURE_SECONDS = 5 * 60
 MAJOR_MAIL_EVENTS = {'authentication_required', 'query_failure', 'task_failed', 'unexpected_failure',
@@ -364,6 +364,10 @@ def run(settings: Settings, *, session: Any = None,
     poller_client: Client | None = None
     poller_retry_at = 0.0
     poller_allowed = False
+    # An absolute deadline copied from a server-directed poller error. The scan loop checks it
+    # before falling back to a synchronous query, so the background and foreground requests
+    # share one server-requested pause.
+    poller_wait_until = 0.0
 
     def stop_poller() -> None:
         nonlocal activity_poller, poller_client
@@ -376,6 +380,25 @@ def run(settings: Settings, *, session: Any = None,
             if callable(close):
                 close()
             poller_client = None
+
+    def absorb_poller_wait() -> None:
+        """Copy a server-directed wait from a failed poller into the scan loop's deadline."""
+        nonlocal poller_wait_until
+        poller = activity_poller
+        snapshot = poller.snapshot() if poller is not None else None
+        if snapshot is None or snapshot.error is None or not snapshot.server_directed:
+            return
+        wait = snapshot.retry_after if snapshot.retry_after > 0 else short_backoff(1)
+        based_at = snapshot.failed_at if snapshot.failed_at > 0 else clock()
+        poller_wait_until = max(poller_wait_until, based_at + wait)
+
+    def poller_wait_error() -> None:
+        """Abort before a new request while the background poller's server wait is pending."""
+        absorb_poller_wait()
+        remaining = poller_wait_until - clock()
+        if remaining > 0:
+            raise RemoteError('server_backoff', remaining, http_status=429)
+
     mail_state_ready = False
     final_phase = 'stopped'
     stage = 'configuration'
@@ -714,6 +737,7 @@ def run(settings: Settings, *, session: Any = None,
                     poller_retry_at = max(
                         poller_retry_at,
                         clock() + max(POLLER_RETRY_MIN_SECONDS, snapshot.retry_after))
+                    absorb_poller_wait()
             stop_poller()
 
         def sync_poller(active: bool) -> None:
@@ -721,6 +745,7 @@ def run(settings: Settings, *, session: Any = None,
             nonlocal activity_poller, poller_client, poller_retry_at, poller_allowed
             if (not background_poller or check_only or not active or not authenticated
                     or not poller_allowed):
+                absorb_poller_wait()
                 stop_poller()
                 return
             if activity_poller is not None and activity_poller.running:
@@ -731,6 +756,7 @@ def run(settings: Settings, *, session: Any = None,
                     poller_retry_at = max(
                         poller_retry_at,
                         clock() + max(POLLER_RETRY_MIN_SECONDS, snapshot.retry_after))
+                    absorb_poller_wait()
                 stop_poller()
             if clock() < poller_retry_at:
                 return
@@ -749,6 +775,11 @@ def run(settings: Settings, *, session: Any = None,
                     and 0 <= clock() - snapshot.at <= POLLER_SNAPSHOT_MAX_AGE):
                 poller_allowed = True
                 return snapshot.rows, 0.0, 'poller'
+            if snapshot is not None and snapshot.error is not None:
+                absorb_poller_wait()
+            # The server already told the background poller to wait; do not send another
+            # list request inside that window just because the background thread stopped.
+            poller_wait_error()
             started = clock()
             rows = client.activities()
             poller_allowed = True
@@ -768,6 +799,9 @@ def run(settings: Settings, *, session: Any = None,
                 mail_blocked = opening_scan
                 activities_source = 'query'
                 sync_poller(opening_scan)
+                # A server-directed wait reported by the background poller applies to every
+                # foreground request too, including re-authentication and history probes.
+                poller_wait_error()
                 if not authenticated:
                     health(phase='authentication', next_check_at=0)
                     client.authenticate()
@@ -805,6 +839,19 @@ def run(settings: Settings, *, session: Any = None,
                     rows = None
                     pending_error: BaseException | None = None
                     confirmed_newly = False
+                    # Absence only becomes evidence after a complete two-source check. Any
+                    # failed or unusable source keeps pending and must not advance the
+                    # unfilled counter toward automatic release.
+                    source_complete = True
+
+                    def abandon_check(error: BaseException) -> None:
+                        # A failed, aborted or unusable check is not valid absence evidence:
+                        # persist the restart of the consecutive-valid count before the
+                        # scan-level backoff (or server-directed wait) retries it.
+                        task.data.pop('pending_checks', None)
+                        task.save()
+                        raise error
+
                     health(phase='my_activities', next_check_at=0)
                     mine_started = clock()
                     try:
@@ -814,19 +861,23 @@ def run(settings: Settings, *, session: Any = None,
                         refresh_mine = True
                     except (RemoteError, ValueError) as exc:
                         if server_wait_error(exc):
-                            raise
+                            abandon_check(exc)
                         pending_error = exc
                     booked = set()
                     if history is not None:
-                        booked = {activity_id(row) for row in history if reserved(row)}
+                        try:
+                            booked = {activity_id(row) for row in history if reserved(row)}
+                        except ValueError as exc:
+                            abandon_check(exc)
                     if pending_wid not in booked:
                         health(phase='activities', next_check_at=0)
                         try:
                             rows, _, activities_source = list_rows()
                         except (RemoteError, ValueError) as exc:
                             if server_wait_error(exc):
-                                raise
+                                abandon_check(exc)
                             pending_error = pending_error or exc
+                            source_complete = False
                         if rows is not None:
                             for row in rows:
                                 try:
@@ -838,6 +889,7 @@ def run(settings: Settings, *, session: Any = None,
                                 try:
                                     judged = Lecture.read(row, now=clock() + server_offset)
                                 except ValueError:
+                                    source_complete = False
                                     break
                                 if judged.availability == 'already_reserved':
                                     confirmed_newly = ensure_hold(
@@ -876,7 +928,14 @@ def run(settings: Settings, *, session: Any = None,
                         unconfirmed_checks = 0
                     else:
                         if history is None:
-                            raise pending_error if pending_error is not None else RemoteError('network_timeout')
+                            abandon_check(pending_error if pending_error is not None
+                                          else RemoteError('network_timeout'))
+                        if not source_complete:
+                            # A failed or unreadable activity-list source is not absence
+                            # evidence: keep pending and let the scan-level backoff retry the
+                            # check instead of counting it toward automatic release.
+                            abandon_check(pending_error if pending_error is not None
+                                          else ValueError('pending_activity_unreadable'))
                         failures = 0
                         health(last_query_at=clock(), failure_count=0)
                         query_recovered()
@@ -1029,6 +1088,9 @@ def run(settings: Settings, *, session: Any = None,
                 restart_scan = False
                 for lecture in candidates:
                     for attempt in range(4):
+                        # The poller may have failed after the scan start; do not fetch a
+                        # captcha for a submission the server asked us to postpone.
+                        poller_wait_error()
                         health(phase='captcha')
                         captcha_started = clock()
                         try:
@@ -1051,6 +1113,9 @@ def run(settings: Settings, *, session: Any = None,
                                 task.save()
                                 diagnostic('captcha_cooldown', wid=lecture.wid, seconds=300)
                             continue
+                        # Re-check after the captcha round-trip: a wait learned during it must
+                        # stop the submission while the task is still in scanning state.
+                        poller_wait_error()
                         # Persist before sending: a crash must recover by querying, never resubmitting.
                         retry_hold = hold_entries().get(lecture.wid)
                         if isinstance(retry_hold, dict):

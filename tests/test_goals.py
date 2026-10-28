@@ -5,7 +5,7 @@ from collections import Counter
 import pytest
 
 from seu_reserve.model import (COFFEE_CATEGORY, GOAL_CATEGORIES, SERIES_CATEGORIES, Progress,
-                               category_name, progress, test_notice as is_test_notice)
+                               category_name, moment, progress, test_notice as is_test_notice)
 from test_app import School, execute, lecture
 
 
@@ -100,27 +100,129 @@ def test_eight_attended_without_art_still_books_art(tmp_path):
     assert school.submitted == ['needed-art']
 
 
-def test_salon_counts_toward_goal_and_both_quote_variants_match(tmp_path):
+@pytest.mark.parametrize('category', [COFFEE_CATEGORY, '“SEU咖啡间"系列沙龙活动'])
+@pytest.mark.parametrize('enabled', [True, False])
+def test_salon_booking_follows_configuration_without_goal_credit(tmp_path, category, enabled):
     from seu_reserve.app import Settings
-    coffee_ascii = '“SEU咖啡间"系列沙龙活动'
-    assert category_name(coffee_ascii) == COFFEE_CATEGORY
+    assert category_name(category) == COFFEE_CATEGORY
     assert category_name(COFFEE_CATEGORY) == COFFEE_CATEGORY
-    assert COFFEE_CATEGORY in GOAL_CATEGORIES
+    assert COFFEE_CATEGORY not in GOAL_CATEGORIES
     school = School()
-    school.activities = [lecture(HDLX_DISPLAY=coffee_ascii)]
-    assert execute(school, tmp_path, settings=Settings(state_dir=tmp_path, categories=GOAL_CATEGORIES)) == 130
-    assert school.submitted == ['one']
-    school.mine = attended(7) + [lecture('coffee-history', YYZT='已预约', SFDK='1',
-                                        HDLX_DISPLAY=coffee_ascii)]
-    assert progress(school.mine, 0).done
+    school.activities = [lecture(HDLX_DISPLAY=category)]
+    settings = Settings(state_dir=tmp_path,
+                        categories=GOAL_CATEGORIES + ((category,) if enabled else ()))
+    assert execute(school, tmp_path, settings=settings) == 130
+    assert school.submitted == (['one'] if enabled else [])
+    current = progress(school.mine, 0)
+    assert not current.completed and not current.planned
 
 
-def test_salon_uses_goal_gap_but_never_displaces_missing_required_category():
+def test_disabled_salon_does_not_require_candidate_fields(tmp_path):
+    from seu_reserve.app import Settings
+    school = School()
+    school.activities = [{'JZXL_DISPLAY': COFFEE_CATEGORY}]
+    assert execute(school, tmp_path,
+                   settings=Settings(state_dir=tmp_path, categories=GOAL_CATEGORIES)) == 130
+    assert not school.submitted
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert saved['selection']['activities'][0]['reason'] == 'category_not_allowed'
+
+
+@pytest.mark.parametrize('category', [COFFEE_CATEGORY, '“SEU咖啡间"系列沙龙活动'])
+@pytest.mark.parametrize('checked', ['0', '1', None])
+def test_salon_does_not_count_as_completed_or_planned(category, checked):
+    row = lecture('coffee-history', YYZT='已预约', SFDK=checked, HDLX_DISPLAY=category)
+    current = progress(attended(7) + [row], 0)
+    assert current == progress(attended(7), 0)
+    assert not current.done and not current.planned
+    assert progress(attended(8) + [row], 0).done
+
+
+def test_salon_booking_still_leaves_room_for_required_categories():
     covered = Counter({PSYCHOLOGY: 3, LAW: 2, ART: 1, OTHER: 1})
     assert sum(covered.values()) == 7 and Progress(covered, Counter()).needs(COFFEE_CATEGORY)
     missing_art = Counter({PSYCHOLOGY: 3, LAW: 2, OTHER: 2})
     assert not Progress(missing_art, Counter()).needs(COFFEE_CATEGORY)
     assert Progress(missing_art, Counter()).needs(ART)
+
+
+@pytest.mark.parametrize('completed', [False, True])
+def test_salon_does_not_extend_a_covered_or_completed_lecture_task(tmp_path, completed):
+    school = School()
+    school.mine = attended(8) if completed else attended(7) + [
+        lecture('planned-eighth', YYZT='已预约', HDLX_DISPLAY=OTHER)]
+    school.activities = [lecture('coffee', HDLX_DISPLAY=COFFEE_CATEGORY,
+                                 KSSJ='2030-01-01 12:00:00', JSSJ='2030-01-01 13:00:00')]
+    assert execute(school, tmp_path) == (0 if completed else 130)
+    assert not school.submitted
+
+
+def test_salon_reservation_still_blocks_conflicting_lectures(tmp_path):
+    school = School()
+    salon = lecture('coffee-booked', YYZT='已预约', HDLX_DISPLAY=COFFEE_CATEGORY,
+                    SFDK=None, SFWY=None)
+    school.mine = [dict(salon)]
+    school.activities = [lecture('conflicting'), lecture('safe',
+        KSSJ='2030-01-01 12:00:00', JSSJ='2030-01-01 13:00:00')]
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == ['safe']
+    assert school.mine[0] == salon
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert saved['selection']['activities'][0]['reason'] == 'time_conflict'
+
+
+def test_completed_task_rechecks_progress_without_salon_credit(tmp_path):
+    school = School()
+    school.mine = attended()
+    assert execute(school, tmp_path) == 0
+    school.mine = attended(7) + [lecture('coffee-history', YYZT='已预约',
+        SFDK='1', HDLX_DISPLAY=COFFEE_CATEGORY,
+        KSSJ='2020-02-01 10:00:00', JSSJ='2020-02-01 11:00:00')]
+    school.activities = [lecture('replacement', HDLX_DISPLAY=OTHER)]
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == ['replacement']
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
+
+
+def test_ended_salon_without_attendance_result_does_not_block_progress(tmp_path):
+    school = School()
+    school.mine = attended(7) + [lecture('coffee-history', YYZT='已预约',
+        SFDK=None, SFWY=None, HDLX_DISPLAY=COFFEE_CATEGORY,
+        KSSJ='2020-02-01 10:00:00', JSSJ='2020-02-01 11:00:00')]
+    school.activities = [lecture('replacement', HDLX_DISPLAY=OTHER)]
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == ['replacement']
+
+
+def test_salon_with_unknown_conflict_time_still_blocks_new_submissions(tmp_path):
+    school = School()
+    school.mine = [lecture('coffee-booked', YYZT='已预约', HDLX_DISPLAY=COFFEE_CATEGORY,
+                           KSSJ='unknown')]
+    school.activities = [lecture()]
+    assert execute(school, tmp_path) == 130
+    assert not school.submitted
+
+
+def test_confirmed_salon_hold_keeps_conflict_protection_without_goal_credit(tmp_path):
+    school = School()
+    assert execute(school, tmp_path) == 130
+    path = tmp_path / 'task.json'
+    saved = json.loads(path.read_text())
+    now = moment('2026-10-18 12:00:00').timestamp()
+    saved['holds'] = {'coffee-held': dict(
+        start=moment('2030-01-01 10:00:00').timestamp(),
+        end=moment('2030-01-01 11:00:00').timestamp(),
+        since=now, until=now + 600, attempts=0, confirmed=True, category=COFFEE_CATEGORY)}
+    path.write_text(json.dumps(saved))
+    school.mine = attended(7)
+    school.activities = [lecture('conflicting', HDLX_DISPLAY=OTHER),
+                         lecture('safe', HDLX_DISPLAY=OTHER,
+                                 KSSJ='2030-01-01 12:00:00', JSSJ='2030-01-01 13:00:00')]
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == ['safe']
+    saved = json.loads(path.read_text())
+    assert saved['holds']['coffee-held']['confirmed'] is True
+    assert saved['selection']['activities'][0]['reason'] == 'time_conflict'
 
 
 @pytest.mark.parametrize('title', ['系统测试讲座', '请勿预约', '购票公告'])

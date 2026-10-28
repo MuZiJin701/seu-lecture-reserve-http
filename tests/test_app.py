@@ -1292,6 +1292,219 @@ def test_pending_activity_list_rate_limit_does_not_count_a_check(tmp_path):
     assert saved.get('pending_checks', 0) == 0
 
 
+def test_failed_verification_source_does_not_advance_auto_release(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved.update(retry_at=0)
+    saved.pop('step_failure_since', None)
+    saved.pop('query_failure_since', None)
+    state_path.write_text(json.dumps(saved))
+
+    clock = [moment('2026-10-18 12:00:00').timestamp()]
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+        if len(waits) >= 6:
+            raise KeyboardInterrupt
+
+    broken = School()
+    broken.mine = []
+    broken.activities = []
+    broken.query_statuses = [503] * 50
+    assert execute(broken, tmp_path, sleep=stop, clock=lambda: clock[0]) == 130
+
+    saved = json.loads(state_path.read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+    assert saved.get('pending_checks', 0) == 0
+    logs = (tmp_path / 'diagnostics.jsonl').read_text()
+    assert 'reservation_checked' not in logs
+    assert 'reservation_unconfirmed_released' not in logs
+    assert any(url.endswith('queryActivityList.do') for _, url, _ in broken.requests)
+
+
+def test_failed_check_does_not_count_but_later_valid_checks_still_release(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved.update(retry_at=0)
+    saved.pop('step_failure_since', None)
+    saved.pop('query_failure_since', None)
+    state_path.write_text(json.dumps(saved))
+
+    class Tracked(School):
+        list_calls = 0
+
+        def request(self, method, url, **kwargs):
+            if url.endswith('queryActivityList.do'):
+                self.list_calls += 1
+            return super().request(method, url, **kwargs)
+
+    clock = [moment('2026-10-18 12:00:00').timestamp()]
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+        if 'event=reservation_unconfirmed_released' in (tmp_path / 'events.log').read_text():
+            raise KeyboardInterrupt
+        if len(waits) >= 20:
+            raise KeyboardInterrupt
+
+    later = Tracked()
+    later.mine = []
+    later.activities = [lecture('two')]
+    later.query_statuses = [503, 200, 200]   # one failed check, then two valid ones
+    assert execute(later, tmp_path, sleep=stop, clock=lambda: clock[0]) == 130
+
+    saved = json.loads(state_path.read_text())
+    logs = (tmp_path / 'diagnostics.jsonl').read_text()
+    assert saved['status'] == 'scanning' and not saved['activity']
+    # The failed check no longer counts: three valid checks were needed, so the release only
+    # happened on the fourth list query of the pending period.
+    assert later.list_calls == 5
+    assert logs.count('"event": "reservation_checked"') == 3
+    assert 'reservation_unconfirmed_released' in logs
+
+
+def test_midway_failed_check_restarts_the_consecutive_count(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved.update(retry_at=0)
+    saved.pop('step_failure_since', None)
+    saved.pop('query_failure_since', None)
+    state_path.write_text(json.dumps(saved))
+
+    clock = [moment('2026-10-18 12:00:00').timestamp()]
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+        if 'event=reservation_unconfirmed_released' in (tmp_path / 'events.log').read_text():
+            raise KeyboardInterrupt
+        if len(waits) >= 20:
+            raise KeyboardInterrupt
+
+    later = School()
+    later.mine = []
+    later.activities = [lecture('two')]
+    # valid, valid, failed, valid, valid, valid
+    later.query_statuses = [200, 200, 503, 200, 200, 200]
+    assert execute(later, tmp_path, sleep=stop, clock=lambda: clock[0]) == 130
+
+    events = [json.loads(line) for line in (tmp_path / 'diagnostics.jsonl').read_text().splitlines()]
+    checks = [event['checks'] for event in events
+              if event.get('event') == 'reservation_checked']
+    assert checks == [1, 2, 1, 2, 3]     # the failed check restarted the count
+    assert any(event.get('event') == 'reservation_unconfirmed_released' for event in events)
+
+
+def test_midway_429_restarts_the_consecutive_count(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved.update(retry_at=0)
+    saved.pop('step_failure_since', None)
+    saved.pop('query_failure_since', None)
+    state_path.write_text(json.dumps(saved))
+
+    class MineLimited(School):
+        calls = 0
+
+        def request(self, method, url, **kwargs):
+            if url.endswith('queryMyActivityList.do'):
+                self.calls += 1
+                if self.calls == 3:
+                    response = requests.Response()
+                    response.url = url
+                    response.status_code = 429
+                    response.headers['Retry-After'] = '600'
+                    response._content = b'{}'
+                    self.requests.append((method, url, kwargs))
+                    return response
+            return super().request(method, url, **kwargs)
+
+    clock = [moment('2026-10-18 12:00:00').timestamp()]
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+        if 'event=reservation_unconfirmed_released' in (tmp_path / 'events.log').read_text():
+            raise KeyboardInterrupt
+        if len(waits) >= 20:
+            raise KeyboardInterrupt
+
+    later = MineLimited()
+    later.mine = []
+    later.activities = [lecture('two')]
+    # valid, valid, 429 wait, valid, valid, valid
+    assert execute(later, tmp_path, sleep=stop, clock=lambda: clock[0]) == 130
+
+    events = [json.loads(line) for line in (tmp_path / 'diagnostics.jsonl').read_text().splitlines()]
+    checks = [event['checks'] for event in events
+              if event.get('event') == 'reservation_checked']
+    assert checks == [1, 2, 1, 2, 3]     # the server-directed wait also restarted the count
+    assert any(event.get('event') == 'reservation_unconfirmed_released' for event in events)
+
+
+def test_midway_unreadable_history_restarts_the_consecutive_count(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved.update(retry_at=0)
+    saved.pop('step_failure_since', None)
+    saved.pop('query_failure_since', None)
+    state_path.write_text(json.dumps(saved))
+
+    class HistoryUnreadable(School):
+        calls = 0
+
+        def request(self, method, url, **kwargs):
+            if url.endswith('queryMyActivityList.do'):
+                self.calls += 1
+                self.mine = ([{'YYZT': 'unknown-status'}]   # reserved() raises ValueError
+                             if self.calls == 3 else [])
+            return super().request(method, url, **kwargs)
+
+    clock = [moment('2026-10-18 12:00:00').timestamp()]
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        clock[0] += seconds
+        if 'event=reservation_unconfirmed_released' in (tmp_path / 'events.log').read_text():
+            raise KeyboardInterrupt
+        if len(waits) >= 20:
+            raise KeyboardInterrupt
+
+    later = HistoryUnreadable()
+    later.mine = []
+    later.activities = [lecture('two')]
+    # valid, valid, unreadable history row, valid, valid, valid
+    assert execute(later, tmp_path, sleep=stop, clock=lambda: clock[0]) == 130
+
+    events = [json.loads(line) for line in (tmp_path / 'diagnostics.jsonl').read_text().splitlines()]
+    checks = [event['checks'] for event in events
+              if event.get('event') == 'reservation_checked']
+    assert checks == [1, 2, 1, 2, 3]     # the unreadable check also restarted the count
+    assert any(event.get('event') == 'reservation_unconfirmed_released' for event in events)
+
+
 def test_success_reply_saves_pending_clear_and_confirmed_hold_together(tmp_path, monkeypatch):
     import seu_reserve.app as app_module
     snapshots = []

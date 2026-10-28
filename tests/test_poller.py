@@ -29,7 +29,40 @@ def test_poll_once_records_error_and_retry_after_without_raising():
     assert snapshot is not None
     assert snapshot.error == 'Throttled'
     assert snapshot.retry_after == 7.5
+    assert snapshot.failed_at == 55.0
+    assert snapshot.server_directed is True
     assert snapshot.rows == []
+
+
+def test_plain_failure_is_not_marked_server_directed():
+    class Broken(Exception):
+        pass
+
+    def query():
+        raise Broken('boom')
+
+    poller = ActivityPoller(query, interval=0.25, clock=lambda: 55.0)
+    assert poller.poll_once() is False
+    snapshot = poller.snapshot()
+    assert snapshot is not None
+    assert snapshot.error == 'Broken'
+    assert snapshot.failed_at == 55.0
+    assert snapshot.server_directed is False
+
+
+def test_rate_limited_failure_without_retry_after_is_server_directed():
+    class Limited(Exception):
+        http_status = 429
+
+    def query():
+        raise Limited('slow down')
+
+    poller = ActivityPoller(query, interval=0.25, clock=lambda: 55.0)
+    assert poller.poll_once() is False
+    snapshot = poller.snapshot()
+    assert snapshot is not None
+    assert snapshot.retry_after == 0.0
+    assert snapshot.server_directed is True
 
 
 def test_thread_polls_until_stopped():

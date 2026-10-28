@@ -19,6 +19,10 @@ def test_background_poller_reads_list_during_opening(tmp_path, monkeypatch):
         def activities(self):
             calls.append('poller')
             gate.set()
+            if len(calls) > 1:
+                # Stop the real poller thread after the first read so the scan loop falls back
+                # to its timed wait and the test can end deterministically.
+                raise RuntimeError('single-read poller')
             return [activity()]
 
     monkeypatch.setattr(client_module.Client, 'clone_readonly', lambda self: Clone())

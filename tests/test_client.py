@@ -661,3 +661,123 @@ def test_proxy_header_deadline_is_enforced(slow_header_proxy):
             session.get('http://example.invalid/slow', proxies={'http': slow_header_proxy},
                         timeout=0.2)
         assert time.monotonic() - started < 0.8
+
+
+@pytest.fixture(autouse=True)
+def reset_request_connect():
+    """Keep the connection-observation thread-local from leaking between tests."""
+    import seu_reserve.client as client_module
+    client_module.REQUEST_CONNECT.value = None
+    yield
+    client_module.REQUEST_CONNECT.value = None
+
+
+def test_fake_session_reports_no_connection_and_counts_attempts():
+    client, session = stub_client({'code': 0})
+    assert client.requests_made == 0
+    assert client.last_connect_seconds is None
+    client.request('GET', 'https://ehall.seu.edu.cn/modules/hdyy/vcode.do')
+    assert client.last_connect_seconds is None
+    assert client.requests_made == 1
+    # A connection cost measured for an earlier request must not survive a session that does
+    # not go through urllib3 at all.
+    client.last_connect_seconds = 1.5
+    client.request('GET', 'https://ehall.seu.edu.cn/modules/hdyy/vcode.do')
+    assert client.last_connect_seconds is None
+    assert client.requests_made == 2
+    assert len(session.calls) == 2
+
+
+def test_request_reads_the_connect_cost_and_restores_the_thread_local():
+    import seu_reserve.client as client_module
+
+    class Session:
+        def request(self, method, url, **kwargs):
+            client_module.REQUEST_CONNECT.value = 0.25
+            response = requests.Response()
+            response.status_code = 200
+            response._content = b'{}'
+            return response
+
+    client = Client(Session(), {}, input, lambda _: None)
+    client_module.REQUEST_CONNECT.value = 'outer'
+    client.request('GET', 'https://ehall.seu.edu.cn/modules/hdyy/vcode.do')
+    assert client.last_connect_seconds == 0.25
+    assert client.requests_made == 1
+    assert getattr(client_module.REQUEST_CONNECT, 'value', None) == 'outer'
+
+
+def test_failed_request_counts_the_attempt_and_restores_the_thread_local():
+    import seu_reserve.client as client_module
+
+    class Session:
+        def request(self, method, url, **kwargs):
+            raise requests.ConnectionError(socket.gaierror(socket.EAI_NONAME, 'SECRET DNS failure'))
+
+    client = Client(Session(), {}, input, lambda _: None)
+    client_module.REQUEST_CONNECT.value = 'outer'
+    with pytest.raises(RemoteError, match='connection_failure'):
+        client.request('GET', 'https://ehall.seu.edu.cn/modules/hdyy/vcode.do')
+    assert client.requests_made == 1
+    assert client.last_connect_seconds is None
+    assert getattr(client_module.REQUEST_CONNECT, 'value', None) == 'outer'
+
+
+def test_clone_readonly_has_independent_observability_counters():
+    client, _ = stub_client({'code': 0})
+    client.request('GET', 'https://ehall.seu.edu.cn/modules/hdyy/vcode.do')
+    client.last_connect_seconds = 2.0
+    clone = client.clone_readonly()
+    assert client.requests_made == 1
+    assert client.last_connect_seconds == 2.0
+    assert clone.requests_made == 0
+    assert clone.last_connect_seconds is None
+
+
+def test_new_connection_duration_is_measured_for_http_and_https(monkeypatch):
+    import seu_reserve.client as client_module
+
+    def fake_connect(connection):
+        # time.monotonic() is coarse on Windows (~15 ms), so a sleep shorter than that can
+        # measure as 0.0.
+        time.sleep(0.05)
+
+    monkeypatch.setattr(client_module.Urllib3HTTPConnection, 'connect', fake_connect)
+    monkeypatch.setattr(client_module.Urllib3HTTPSConnection, 'connect', fake_connect)
+    for connection_cls in (client_module._DeadlineHTTPConnection,
+                           client_module._DeadlineHTTPSConnection):
+        connection = connection_cls('example.invalid', 443)
+        client_module.REQUEST_CONNECT.value = None
+        connection_cls.connect(connection)
+        seconds = getattr(client_module.REQUEST_CONNECT, 'value', None)
+        assert isinstance(seconds, float)
+        assert seconds >= 0.02
+
+
+def test_failed_new_connection_still_records_its_duration(monkeypatch):
+    import seu_reserve.client as client_module
+
+    def fail(connection):
+        raise socket.gaierror(socket.EAI_NONAME, 'simulated DNS failure')
+
+    monkeypatch.setattr(client_module.Urllib3HTTPConnection, 'connect', fail)
+    connection = client_module._DeadlineHTTPConnection('example.invalid', 80)
+    with pytest.raises(socket.gaierror):
+        client_module._DeadlineHTTPConnection.connect(connection)
+    seconds = getattr(client_module.REQUEST_CONNECT, 'value', None)
+    assert isinstance(seconds, float)
+    assert seconds >= 0
+
+
+@pytest.mark.parametrize('gateway_server', ['vpn.seu.edu.cn'], indirect=True)
+def test_real_tls_handshake_reaches_last_connect_seconds(gateway_server, monkeypatch):
+    with requests.Session() as session:
+        client = Client(session, {'SEU_VPN_IP': '127.0.0.1'}, input, lambda _: None)
+        monkeypatch.setattr(client, '_authenticate', lambda: client.get(GATEWAY + '/public'))
+        client.authenticate()
+        assert client.requests_made == 2
+        assert isinstance(client.last_connect_seconds, float)
+        assert 0 <= client.last_connect_seconds < 5
+        client.request('GET', GATEWAY + ':443/public')
+        assert client.requests_made == 3
+        assert isinstance(client.last_connect_seconds, float)

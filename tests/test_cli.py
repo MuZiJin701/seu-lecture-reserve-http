@@ -161,6 +161,24 @@ def test_gateway_ip_is_loaded_from_dotenv_and_process_takes_precedence(tmp_path)
     assert configuration_from(config, {'SEU_VPN_IP': '192.0.2.2'})[1]['SEU_VPN_IP'] == '192.0.2.2'
 
 
+def test_opening_speed_switches_default_on_and_can_be_disabled(tmp_path):
+    from seu_reserve.cli import configuration_from
+
+    empty = tmp_path / 'empty.env'
+    empty.write_text('')
+    defaults, _ = configuration_from(empty, {})
+    assert defaults.prewarm is True
+    assert defaults.captcha_prefetch is True
+    assert defaults.poller_align is False
+    config = tmp_path / '.env'
+    config.write_text('SEU_PREWARM=false\nSEU_CAPTCHA_PREFETCH=false\nSEU_POLLER_ALIGN=true\n')
+    settings, _ = configuration_from(config, {})
+    assert settings.prewarm is False
+    assert settings.captcha_prefetch is False
+    assert settings.poller_align is True
+    assert configuration_from(config, {'SEU_PREWARM': 'true'})[0].prewarm is True
+
+
 @pytest.mark.parametrize('configuration, outcome', [
     ('', 'mail_disabled'),
     ('SMTP_USERNAME=sender@gmail.com\n', 'mail_configuration_invalid'),

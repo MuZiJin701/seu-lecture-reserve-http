@@ -8,10 +8,18 @@ import os
 import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 from .mail import mail_history
+
+
+# A backup tool, antivirus scanner or another local reader may briefly hold task.json open on
+# Windows; os.replace then fails with a sharing violation. Retry briefly instead of failing the
+# checkpoint (and flooding the terminal with health_write_failed).
+REPLACE_ATTEMPTS = 4
+REPLACE_RETRY_SECONDS = 0.005
 
 
 def lock_file(fd: int) -> None:
@@ -169,7 +177,7 @@ class Task:
                 json.dump(self.data, target, allow_nan=False)
                 target.flush()
                 os.fsync(target.fileno())
-            os.replace(name, self.path)
+            self._replace(name)
             if sys.platform != 'win32':
                 directory_fd = os.open(self.directory, os.O_DIRECTORY)
                 try:
@@ -179,6 +187,17 @@ class Task:
         finally:
             if os.path.exists(name):
                 os.unlink(name)
+
+    def _replace(self, name: str) -> None:
+        """Publish the checkpoint atomically, tolerating brief reader locks."""
+        for attempt in range(REPLACE_ATTEMPTS):
+            try:
+                os.replace(name, self.path)
+                return
+            except PermissionError:
+                if attempt + 1 == REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(REPLACE_RETRY_SECONDS * (attempt + 1))
 
     def close(self) -> None:
         os.close(self.lock)

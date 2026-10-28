@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -5,6 +6,46 @@ import sys
 import pytest
 
 from seu_reserve.state import Task, open_nofollow
+
+
+def test_save_retries_a_transient_file_sharing_violation(tmp_path, monkeypatch):
+    from seu_reserve import state
+    task = Task(tmp_path, 'test-user')
+    calls = []
+    original_replace = state.os.replace
+    def flaky_replace(src, dst):
+        calls.append(dst)
+        if len(calls) <= 2:
+            raise PermissionError(13, 'sharing violation')
+        original_replace(src, dst)
+    try:
+        monkeypatch.setattr(state.os, 'replace', flaky_replace)
+        task.data['status'] = 'scanning'
+        task.save()
+    finally:
+        task.close()
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert saved['status'] == 'scanning'
+    assert len(calls) == 3
+    assert not list(tmp_path.glob('.task-*'))
+
+
+def test_save_gives_up_after_repeated_file_sharing_violations(tmp_path, monkeypatch):
+    from seu_reserve import state
+    task = Task(tmp_path, 'test-user')
+    calls = []
+    def always_blocked(src, dst):
+        calls.append(dst)
+        raise PermissionError(13, 'sharing violation')
+    try:
+        monkeypatch.setattr(state.os, 'replace', always_blocked)
+        task.data['status'] = 'scanning'
+        with pytest.raises(PermissionError):
+            task.save()
+    finally:
+        task.close()
+    assert len(calls) == state.REPLACE_ATTEMPTS
+    assert not list(tmp_path.glob('.task-*'))
 
 
 def test_task_lock_excludes_another_process_and_releases_on_close(tmp_path):

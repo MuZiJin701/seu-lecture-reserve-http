@@ -62,6 +62,34 @@ POLLER_RETRY_MIN_SECONDS = 5.0
 # 502/503/504 mean the server is overloaded, not that a rate limit is in force; recover in seconds.
 # Explicit Retry-After still wins.
 OVERLOAD_RETRY_CAP = 5.0
+# A concurrent local reader can briefly block the Windows state replace; report such a transient
+# health-save failure at most once a minute instead of on every scan.
+HEALTH_WARNING_INTERVAL = 60.0
+# Health snapshots are not recovery-critical: coalesce the many in-scan updates and flush once at
+# each wait boundary (and at shutdown) instead of fsyncing several times per second. --status can
+# lag the in-memory state by up to this interval; errors are still written immediately.
+HEALTH_WRITE_INTERVAL = 1.0
+# Phase changes that an operator must see immediately (long blocking requests happen in these
+# phases, so the coalesced wait-boundary flush alone would hide them for seconds).
+HEALTH_URGENT_PHASES = frozenset({'authentication', 'captcha', 'submitting', 'confirming',
+                                  'manual_required', 'failed', 'done', 'waiting_for_attendance'})
+# A main-session request shortly before an opening keeps the submit connection warm and refreshes
+# the history cache that the opening reuses. It replaces (not adds to) the normal history refresh.
+PREWARM_LEAD_SECONDS = 2.0
+# Fetch and recognise a captcha just before the opening so the candidate can be submitted without
+# the captcha round-trip on the critical path. The lead is also the timeout budget below: a slow
+# prefetch must finish by the opening instant or fall back to a fresh fetch.
+CAPTCHA_PREFETCH_LEAD_SECONDS = 0.6
+# A prefetched captcha is only reused while this young; otherwise the submit path fetches fresh.
+CAPTCHA_PREFETCH_MAX_AGE = 5.0
+# Off-path requests are bounded: a slow prewarm or prefetch must never block past the opening or
+# eat the candidate-detection latency it is meant to save.
+PREWARM_TIMEOUT = 1.5
+CAPTCHA_PREFETCH_TIMEOUT = 0.6
+# When less time than this is left before the opening, preparation is skipped instead of being
+# forced a minimum request budget that would run past the opening instant.
+PREWARM_MIN_REMAINING = 0.4
+CAPTCHA_PREFETCH_MIN_REMAINING = 0.45
 
 
 def short_backoff(failures: int) -> float:
@@ -90,6 +118,13 @@ class Settings:
     online: bool = True
     offline: bool = True
     mail_success: bool = False
+    # Opening-window latency experiments; both keep the same request ordering and only shift
+    # read-only work off the candidate-to-submit path.
+    captcha_prefetch: bool = True
+    prewarm: bool = True
+    # Aligning a poller poll to the exact opening instant depends on the school-clock offset, which
+    # carries up to a second of truncation/request-latency error; off by default until measured.
+    poller_align: bool = False
 
 def server_wait_error(exc: BaseException) -> bool:
     """True when the school explicitly asked us to wait before another request."""
@@ -364,6 +399,9 @@ def run(settings: Settings, *, session: Any = None,
     poller_client: Client | None = None
     poller_retry_at = 0.0
     poller_allowed = False
+    # Completed-poll version consumed by the last list read: the opening wait only wakes for
+    # polls newer than this.
+    consumed_polls = 0
     # An absolute deadline copied from a server-directed poller error. The scan loop checks it
     # before falling back to a synchronous query, so the background and foreground requests
     # share one server-requested pause.
@@ -400,20 +438,50 @@ def run(settings: Settings, *, session: Any = None,
             raise RemoteError('server_backoff', remaining, http_status=429)
 
     mail_state_ready = False
+    health_warning_at = 0.0
     final_phase = 'stopped'
     stage = 'configuration'
     snapshot: dict[str, Any] = dict(phase='starting', last_query_at=0, last_error='none',
         last_error_at=0, failure_count=0, next_check_at=0, mail_status='disabled',
         last_mail_at=0, last_mail_status='never', last_mail_error='none', last_mail_event='none',
         last_mail_duration_seconds=None, activity_count=None, candidate_count=None)
-    def health(**changes: Any) -> None:
-        snapshot.update(changes, updated_at=clock())
-        if task is not None:
-            task.data['health'] = dict(snapshot)
-            try:
-                task.save()
-            except (OSError, ValueError):
+    health_written_at = 0.0
+    health_written_phase: str | None = None
+    health_dirty = False
+    def write_health() -> None:
+        nonlocal health_warning_at, health_written_at, health_written_phase, health_dirty
+        if task is None:
+            return
+        task.data['health'] = dict(snapshot)
+        try:
+            task.save()
+        except (OSError, ValueError):
+            now = clock()
+            if now - health_warning_at >= HEALTH_WARNING_INTERVAL:
+                health_warning_at = now
                 print('event=health_write_failed', flush=True)
+            return
+        health_dirty = False
+        health_written_at = clock()
+        health_written_phase = snapshot['phase']
+    def health(**changes: Any) -> None:
+        nonlocal health_dirty
+        snapshot.update(changes, updated_at=clock())
+        if task is None:
+            return
+        health_dirty = True
+        urgent = ('last_error' in changes or 'last_error_at' in changes
+                  or 'mail_status' in changes or 'last_mail_status' in changes
+                  or snapshot['phase'] in HEALTH_URGENT_PHASES)
+        if urgent or clock() - health_written_at >= HEALTH_WRITE_INTERVAL:
+            write_health()
+    def flush_health(force: bool = False) -> None:
+        """Write the pending snapshot when the phase changed, the interval elapsed, or forced."""
+        if not health_dirty:
+            return
+        if (force or snapshot['phase'] != health_written_phase
+                or clock() - health_written_at >= HEALTH_WRITE_INTERVAL):
+            write_health()
     def record(event: str) -> None:
         print(('' if check_only else f'{clock():.0f} ') + 'event=' + event, flush=True)
         if check_only:
@@ -549,6 +617,8 @@ def run(settings: Settings, *, session: Any = None,
         return holds if isinstance(holds, dict) else {}
 
     def emit_success(wid: str, source: str) -> None:
+        # The single reservation_confirmed diagnostic for a confirmation lives here; callers
+        # must not log the same confirmation again.
         diagnostic('reservation_confirmed', wid=wid, source=source)
         record('reservation_hold_confirmed')
         step_recovered()
@@ -624,7 +694,7 @@ def run(settings: Settings, *, session: Any = None,
                    f'最近业务错误：{snapshot["last_error"]}\n下次检查计划：{next_check}\n'
                    '进度为最近一次成功核对的记录；未知或较旧时请检查本地运行状态。')
 
-    def pause(seconds: float) -> None:
+    def pause(seconds: float, wake: Callable[[float], bool] | None = None) -> None:
         while True:
             duration = seconds
             for event, since, limit in (
@@ -640,7 +710,17 @@ def run(settings: Settings, *, session: Any = None,
                         duration = min(duration, remaining)
             if seconds <= 0:
                 return
-            sleep(duration)
+            # Persist the latest coalesced snapshot at each wait boundary so --status and an
+            # outside observer always see the state the scan is about to wait in.
+            flush_health()
+            # An opening-window scan may cut the wait short when the background poller
+            # publishes a new list snapshot. ``wake`` blocks for the duration itself, so a
+            # False return already consumed the wait and must not be followed by a sleep.
+            if wake is not None:
+                if wake(duration):
+                    return
+            else:
+                sleep(duration)
             seconds -= duration
     def ask(label: str) -> str:
         health(phase='manual_required', next_check_at=0)
@@ -724,6 +804,8 @@ def run(settings: Settings, *, session: Any = None,
         offset_known = False
         history: list[dict[str, Any]] | None = None
         mine_at = 0.0
+        mine_seconds = 0.0
+        refresh_mine = False
         progress_probe_attempted = False
 
         def pause_poller() -> None:
@@ -740,6 +822,56 @@ def run(settings: Settings, *, session: Any = None,
                     absorb_poller_wait()
             stop_poller()
 
+        # Preparation state is keyed by the school opening timestamp (stable across scans), not by
+        # the locally adjusted time: the school-clock offset is re-estimated from a second-
+        # truncated field and jitters, so a local key would repeat preparation for one opening.
+        scheduled_openings: dict[float, float] = {}
+        calibrated_openings: set[float] = set()
+
+        def next_opening() -> tuple[float, float] | None:
+            """Earliest opening that has not started yet (school clock basis).
+
+            Preparation must target the next not-yet-open lecture, not an already-open window
+            that is still running: selecting a past start makes ``prepare_opening`` bail out and
+            skips prewarm/prefetch for a later lecture in the same fast-polling period.
+            """
+            school_now = clock() + server_offset
+            future = [window for window in known_openings if window[0] > school_now - 1.0]
+            return min(future) if future else None
+
+        def opening_local_estimate(start: float) -> float:
+            """Local-clock estimate of one opening, fixed on first sight so it cannot drift.
+
+            The one allowed correction is the first time the school clock becomes known: an
+            estimate made before calibration may be off by the whole local/school offset.
+            """
+            local = scheduled_openings.get(start)
+            if local is None:
+                local = start - server_offset
+                scheduled_openings[start] = local
+            elif offset_known and start not in calibrated_openings:
+                local = start - server_offset
+                scheduled_openings[start] = local
+            if offset_known:
+                calibrated_openings.add(start)
+            return local
+
+        def align_poller() -> None:
+            """Ask the poller to place one poll right on the next opening instant.
+
+            Off by default: the school-clock offset is derived from a second-truncated timestamp
+            and the list snapshot, so the target carries up to ~1s of error and may land after the
+            opening instead of on it. Enable with SEU_POLLER_ALIGN only after real-run measurement.
+            """
+            if not settings.poller_align:
+                return
+            poller = activity_poller
+            align = getattr(poller, 'align_at', None)
+            if poller is None or align is None:
+                return
+            opening = next_opening()
+            align(None if opening is None else opening_local_estimate(opening[0]))
+
         def sync_poller(active: bool) -> None:
             """Run the read-only poller only while the opening window is active."""
             nonlocal activity_poller, poller_client, poller_retry_at, poller_allowed
@@ -749,6 +881,7 @@ def run(settings: Settings, *, session: Any = None,
                 stop_poller()
                 return
             if activity_poller is not None and activity_poller.running:
+                align_poller()
                 return
             if activity_poller is not None:
                 snapshot = activity_poller.snapshot()
@@ -765,16 +898,30 @@ def run(settings: Settings, *, session: Any = None,
             activity_poller = ActivityPoller(poller_client.activities,
                                              interval=FAST_INTERVAL, clock=clock)
             activity_poller.start()
+            align_poller()
 
-        def list_rows() -> tuple[list[dict[str, Any]], float, str]:
-            """Prefer a fresh poller snapshot; fall back to a synchronous query."""
-            nonlocal poller_allowed
+        def list_rows() -> tuple[list[dict[str, Any]], float, str, float]:
+            """Prefer a fresh poller snapshot; fall back to a synchronous query.
+
+            The fourth value is the snapshot age at consumption (0.0 for a sync query), so a
+            candidate can be attributed to stale list evidence.
+            """
+            nonlocal poller_allowed, consumed_polls
             poller = activity_poller
-            snapshot = poller.snapshot() if poller is not None else None
-            if (snapshot is not None and snapshot.error is None
+            versioned = getattr(poller, 'snapshot_with_version', None)
+            snapshot: Any = None
+            if poller is not None and versioned is not None:
+                # Snapshot and version must come from the same lock: otherwise a poll landing
+                # between the two reads is marked consumed although its rows were never seen.
+                snapshot, version = versioned()
+            else:
+                snapshot = poller.snapshot() if poller is not None else None
+                version = getattr(poller, 'polls', 0)
+            if (poller is not None and snapshot is not None and snapshot.error is None
                     and 0 <= clock() - snapshot.at <= POLLER_SNAPSHOT_MAX_AGE):
                 poller_allowed = True
-                return snapshot.rows, 0.0, 'poller'
+                consumed_polls = version
+                return snapshot.rows, 0.0, 'poller', max(0.0, clock() - snapshot.at)
             if snapshot is not None and snapshot.error is not None:
                 absorb_poller_wait()
             # The server already told the background poller to wait; do not send another
@@ -783,7 +930,116 @@ def run(settings: Settings, *, session: Any = None,
             started = clock()
             rows = client.activities()
             poller_allowed = True
-            return rows, max(0, clock() - started), 'query'
+            return rows, max(0, clock() - started), 'query', 0.0
+
+        # Opening preparation: one warmed history refresh and one prefetched captcha per opening.
+        prewarmed: set[float] = set()
+        prefetched_code: str | None = None
+        prefetched_at = 0.0
+        prefetched_seconds = 0.0
+        prefetched_ocr_seconds = 0.0
+        prefetched_for = 0.0
+
+        def prepare_opening(opening: tuple[float, float] | None) -> float | None:
+            """Do read-only work that must not sit on the candidate-to-submit path.
+
+            Returns the local-clock time of the next pending piece of work so the scan loop can
+            wake exactly then; None when nothing is pending. Both requests are skipped when less
+            than their minimum remaining time is left, because a request that cannot finish before
+            the opening would only delay the submission it is supposed to speed up.
+            """
+            nonlocal history, mine_at, mine_seconds, refresh_mine
+            nonlocal prefetched_code, prefetched_at, prefetched_seconds, prefetched_ocr_seconds
+            nonlocal prefetched_for
+            if opening is None:
+                return None
+            start = opening[0]
+            open_local = opening_local_estimate(start)
+            if open_local < clock() - 1.0:
+                return None
+            deadline: float | None = None
+            if settings.prewarm and start not in prewarmed:
+                now = clock()
+                remaining = open_local - now
+                if now < open_local - PREWARM_LEAD_SECONDS:
+                    if remaining > PREWARM_MIN_REMAINING:
+                        deadline = open_local - PREWARM_LEAD_SECONDS
+                elif remaining > PREWARM_MIN_REMAINING:
+                    prewarmed.add(start)
+                    # Re-check the background wait first: the poller may have learned a
+                    # server-directed pause after the scan-start check.
+                    poller_wait_error()
+                    # Never let a slow history query run past the opening instant: cap the
+                    # timeout to the remaining lead time instead of the 8s submit budget.
+                    budget = max(0.2, min(PREWARM_TIMEOUT, remaining - 0.1))
+                    saved_timeout = client.timeout
+                    client.timeout = min(float(saved_timeout), budget)
+                    started = clock()
+                    try:
+                        # Keep the submit session warm and refresh the history the opening reuses.
+                        history = client.mine()
+                        mine_at = clock()
+                        mine_seconds = max(0, clock() - started)
+                        refresh_mine = True
+                        connect = client.last_connect_seconds
+                        diagnostic('prewarm_history', seconds=round(mine_seconds, 3),
+                                   connect_seconds=round(connect, 3) if connect is not None else None)
+                    except (RemoteError, ValueError) as exc:
+                        if isinstance(exc, AuthenticationExpired) or (
+                                isinstance(exc, RemoteError) and server_wait_error(exc)):
+                            raise
+                        diagnostic('prewarm_failed', reason=type(exc).__name__)
+                    except Exception as exc:
+                        diagnostic('prewarm_failed', reason=type(exc).__name__)
+                    finally:
+                        client.timeout = saved_timeout
+            if (settings.captcha_prefetch and recognize is not None
+                    and prefetched_for != start):
+                # Recompute after the prewarm request: its duration may have crossed the opening.
+                now = clock()
+                remaining = open_local - now
+                target = open_local - CAPTCHA_PREFETCH_LEAD_SECONDS
+                if now < target:
+                    if remaining > CAPTCHA_PREFETCH_MIN_REMAINING:
+                        deadline = target if deadline is None else min(deadline, target)
+                elif remaining > CAPTCHA_PREFETCH_MIN_REMAINING:
+                    # Only prefetch before the opening instant; once it has started a candidate
+                    # may already be waiting, so fetching off the path would only add requests.
+                    prefetched_for = start
+                    poller_wait_error()
+                    # The whole prefetch must finish by the opening instant; otherwise the submit
+                    # path fetches fresh and this attempt has only cost a bounded delay.
+                    budget = max(0.15, min(CAPTCHA_PREFETCH_TIMEOUT, remaining - 0.03))
+                    saved_timeout = client.timeout
+                    client.timeout = min(float(saved_timeout), budget)
+                    try:
+                        started = clock()
+                        binary = client.captcha()
+                        prefetched_seconds = max(0, clock() - started)
+                        ocr_started = clock()
+                        code = recognize(binary).strip()
+                        prefetched_ocr_seconds = max(0, clock() - ocr_started)
+                        if not code or not code.isascii() or not code.isalnum() or len(code) > 16:
+                            diagnostic('captcha_prefetch_invalid')
+                        else:
+                            prefetched_code = code
+                            prefetched_at = clock()
+                            connect = client.last_connect_seconds
+                            diagnostic('captcha_prefetched',
+                                       seconds=round(prefetched_seconds, 3),
+                                       ocr_seconds=round(prefetched_ocr_seconds, 3),
+                                       lead_seconds=round(open_local - prefetched_at, 3),
+                                       connect_seconds=round(connect, 3) if connect is not None else None)
+                    except (RemoteError, ValueError) as exc:
+                        if isinstance(exc, AuthenticationExpired) or (
+                                isinstance(exc, RemoteError) and server_wait_error(exc)):
+                            raise
+                        diagnostic('captcha_prefetch_failed', reason=type(exc).__name__)
+                    except Exception as exc:
+                        diagnostic('captcha_prefetch_failed', reason=type(exc).__name__)
+                    finally:
+                        client.timeout = saved_timeout
+            return deadline
 
         previous_selection = task.data.get('selection')
         details: list[dict[str, Any]] = (previous_selection.get('activities', [])
@@ -831,18 +1087,47 @@ def run(settings: Settings, *, session: Any = None,
                 mine_seconds = 0.0
                 refresh_mine = False
                 if task.data['status'] == 'pending':
-                    # Verify from both read-only sources: either explicit success record is enough,
-                    # and a failing endpoint must not hide the other one. A server-directed wait
-                    # (429/Retry-After) aborts immediately so no other request bypasses it.
+                    # Positive evidence from either read-only source confirms. The poller snapshot
+                    # is already in memory, so consult it before paying for a history query; it
+                    # only counts when taken after the submission was persisted. Absence is never
+                    # evidence here.
                     pending_wid = task.data['activity']
-                    history = None
                     rows = None
+                    pending_history: list[dict[str, Any]] | None = None
                     pending_error: BaseException | None = None
                     confirmed_newly = False
+                    confirmed_override: str | None = None
                     # Absence only becomes evidence after a complete two-source check. Any
                     # failed or unusable source keeps pending and must not advance the
                     # unfilled counter toward automatic release.
                     source_complete = True
+                    pending_since = float(task.data.get('pending_since', 0) or 0)
+                    poller_snapshot = (activity_poller.snapshot()
+                                       if activity_poller is not None else None)
+                    if (poller_snapshot is not None and poller_snapshot.error is None
+                            and poller_snapshot.at >= pending_since and poller_snapshot.rows):
+                        for row in poller_snapshot.rows:
+                            try:
+                                row_wid = activity_id(row)
+                            except ValueError:
+                                continue
+                            if row_wid != pending_wid:
+                                continue
+                            try:
+                                judged = Lecture.read(row, now=clock() + server_offset)
+                            except ValueError:
+                                break
+                            if judged.availability == 'already_reserved':
+                                confirmed_newly = ensure_hold(
+                                    pending_wid, judged.start.timestamp(),
+                                    judged.end.timestamp(), confirmed=True,
+                                    source='pending_snapshot',
+                                    category=judged.category, save=False)
+                                confirmed = True
+                                confirmed_override = 'pending_snapshot'
+                                diagnostic('pending_snapshot_confirmed',
+                                           age_seconds=round(clock() - poller_snapshot.at, 3))
+                            break
 
                     def abandon_check(error: BaseException) -> None:
                         # A failed, aborted or unusable check is not valid absence evidence:
@@ -852,27 +1137,29 @@ def run(settings: Settings, *, session: Any = None,
                         task.save()
                         raise error
 
-                    health(phase='my_activities', next_check_at=0)
-                    mine_started = clock()
-                    try:
-                        history = client.mine()
-                        mine_at = clock()
-                        mine_seconds = max(0, clock() - mine_started)
-                        refresh_mine = True
-                    except (RemoteError, ValueError) as exc:
-                        if server_wait_error(exc):
-                            abandon_check(exc)
-                        pending_error = exc
-                    booked = set()
-                    if history is not None:
+                    if not confirmed:
+                        health(phase='my_activities', next_check_at=0)
+                        mine_started = clock()
                         try:
-                            booked = {activity_id(row) for row in history if reserved(row)}
+                            pending_history = client.mine()
+                            history = pending_history
+                            mine_at = clock()
+                            mine_seconds = max(0, clock() - mine_started)
+                            refresh_mine = True
+                        except (RemoteError, ValueError) as exc:
+                            if server_wait_error(exc):
+                                abandon_check(exc)
+                            pending_error = exc
+                    booked = set()
+                    if pending_history is not None:
+                        try:
+                            booked = {activity_id(row) for row in pending_history if reserved(row)}
                         except ValueError as exc:
                             abandon_check(exc)
-                    if pending_wid not in booked:
+                    if pending_wid not in booked and not confirmed:
                         health(phase='activities', next_check_at=0)
                         try:
-                            rows, _, activities_source = list_rows()
+                            rows, _, activities_source, _ = list_rows()
                         except (RemoteError, ValueError) as exc:
                             if server_wait_error(exc):
                                 abandon_check(exc)
@@ -903,7 +1190,10 @@ def run(settings: Settings, *, session: Any = None,
                         confirmed = True
                     if confirmed:
                         need_emit = False
-                        if history is not None and pending_wid in booked:
+                        if confirmed_override is not None:
+                            source = confirmed_override
+                            need_emit = confirmed_newly
+                        elif pending_history is not None and pending_wid in booked:
                             entry = hold_entries().get(pending_wid)
                             already = bool(isinstance(entry, dict) and entry.get('confirmed'))
                             holds = task.data.get('holds')
@@ -914,7 +1204,6 @@ def run(settings: Settings, *, session: Any = None,
                         else:
                             source = 'pending_activity_list'
                             need_emit = confirmed_newly
-                        diagnostic('reservation_confirmed', wid=pending_wid, source=source)
                         task.data.update(status='scanning', activity='')
                         for field in ('pending_checks', 'pending_since', 'pending_start',
                                       'pending_end', 'pending_category'):
@@ -927,7 +1216,7 @@ def run(settings: Settings, *, session: Any = None,
                             emit_success(pending_wid, source)
                         unconfirmed_checks = 0
                     else:
-                        if history is None:
+                        if pending_history is None:
                             abandon_check(pending_error if pending_error is not None
                                           else RemoteError('network_timeout'))
                         if not source_complete:
@@ -976,7 +1265,7 @@ def run(settings: Settings, *, session: Any = None,
                 # Query the opening-critical list before the slower history refresh: a slow or
                 # failing my-activities endpoint must not hide the next reservation opening.
                 health(phase='activities')
-                rows, activities_seconds, activities_source = list_rows()
+                rows, activities_seconds, activities_source, rows_age = list_rows()
                 if school_clock_known(rows, clock()):
                     server_offset = school_clock_offset(rows, clock())
                     offset_known = True
@@ -1085,6 +1374,19 @@ def run(settings: Settings, *, session: Any = None,
                 task.data['selection'] = dict(updated_at=clock(), activities=details)
                 health(last_query_at=clock(), failure_count=failures, activity_count=len(rows),
                        candidate_count=len(candidates), phase='captcha' if candidates else 'waiting')
+                wake_at: float | None = None
+                if not candidates and task.data['status'] != 'pending':
+                    wake_at = prepare_opening(next_opening())
+                prefetch_ready = False
+                prefetch_age: float | None = None
+                if prefetched_code is not None:
+                    age = clock() - prefetched_at
+                    if 0.0 <= age <= CAPTCHA_PREFETCH_MAX_AGE:
+                        prefetch_ready = True
+                        prefetch_age = age
+                    else:
+                        diagnostic('captcha_prefetch_stale', age_seconds=round(age, 3))
+                        prefetched_code = None
                 restart_scan = False
                 for lecture in candidates:
                     for attempt in range(4):
@@ -1092,20 +1394,35 @@ def run(settings: Settings, *, session: Any = None,
                         # captcha for a submission the server asked us to postpone.
                         poller_wait_error()
                         health(phase='captcha')
-                        captcha_started = clock()
-                        try:
-                            binary = client.captcha()
-                        except RemoteError as exc:
-                            step_failed(clock())
-                            diagnostic('captcha_error', wid=lecture.wid, reason=str(exc),
-                                       attempt=attempt + 1)
-                            raise
-                        captcha_seconds = max(0, clock() - captcha_started)
-                        if recognize is None:
-                            recognize = load_recognizer()
-                        ocr_started = clock()
-                        code = recognize(binary).strip()
-                        ocr_seconds = max(0, clock() - ocr_started)
+                        captcha_source = 'fresh'
+                        captcha_connect: float | None = None
+                        attempt_prefetch_age: float | None = None
+                        if attempt == 0 and prefetch_ready and prefetched_code is not None:
+                            # The captcha was fetched (and recognised) off the critical path;
+                            # submit the candidate immediately.
+                            code = prefetched_code
+                            prefetched_code = None
+                            prefetch_ready = False
+                            attempt_prefetch_age = prefetch_age
+                            captcha_seconds = 0.0
+                            ocr_seconds = 0.0
+                            captcha_source = 'prefetch'
+                        else:
+                            captcha_started = clock()
+                            try:
+                                binary = client.captcha()
+                            except RemoteError as exc:
+                                step_failed(clock())
+                                diagnostic('captcha_error', wid=lecture.wid, reason=str(exc),
+                                           attempt=attempt + 1)
+                                raise
+                            captcha_seconds = max(0, clock() - captcha_started)
+                            captcha_connect = client.last_connect_seconds
+                            if recognize is None:
+                                recognize = load_recognizer()
+                            ocr_started = clock()
+                            code = recognize(binary).strip()
+                            ocr_seconds = max(0, clock() - ocr_started)
                         if not code or not code.isascii() or not code.isalnum() or len(code) > 16:
                             diagnostic('ocr_invalid', wid=lecture.wid, attempt=attempt + 1)
                             if attempt == 3:
@@ -1132,7 +1449,13 @@ def run(settings: Settings, *, session: Any = None,
                         submission_started = clock()
                         diagnostic('submission_started', wid=lecture.wid, attempt=attempt + 1,
                                    captcha_seconds=round(captcha_seconds, 3),
-                                   ocr_seconds=round(ocr_seconds, 3))
+                                   ocr_seconds=round(ocr_seconds, 3),
+                                   captcha_source=captcha_source,
+                                   prefetch_age=(round(attempt_prefetch_age, 3)
+                                                 if attempt_prefetch_age is not None else None),
+                                   connect_seconds=(round(captcha_connect, 3)
+                                                    if captcha_connect is not None else None),
+                                   rows_age=round(rows_age, 3))
                         try:
                             reply = client.submit(lecture.wid, code)
                         except RemoteError as exc:
@@ -1172,6 +1495,7 @@ def run(settings: Settings, *, session: Any = None,
                             word in message for word in ('您已预约', '你已预约', '已预约该',
                                                          '已有预约', '已经预约', '重复预约', '已预约过'))
                         diagnostic('submission_reply', wid=lecture.wid, outcome=outcome,
+                                   captcha_source=captcha_source,
                                    feedback=reply.get('feedback') if reply.get('feedback') in (
                                        'unrecognized_message', 'no_message') else None,
                                    http_status=reply.get('http_status') if type(reply.get('http_status')) is int
@@ -1197,6 +1521,9 @@ def run(settings: Settings, *, session: Any = None,
                                 or not (captcha_wrong or unavailable)):
                             break
                         task.data.update(status='scanning', activity='')
+                        if captcha_wrong and captcha_source == 'prefetch':
+                            # A prefetched captcha was rejected; the next attempt fetches fresh.
+                            diagnostic('captcha_prefetch_rejected', attempt=attempt + 1)
                         if captcha_wrong and attempt == 3:
                             task.data['cooldowns'][lecture.wid] = clock() + server_offset + 300
                             diagnostic('captcha_cooldown', wid=lecture.wid, seconds=300)
@@ -1217,18 +1544,32 @@ def run(settings: Settings, *, session: Any = None,
                                              known_openings)
                     if (fast != opening_scan or fast or not last_timing_at
                             or clock() - last_timing_at >= 300):
+                        poller = activity_poller
                         diagnostic('scan_timing', mode='opening' if fast else 'normal',
                                    duration_seconds=elapsed, wait_seconds=delay,
                                    history_reused=not refresh_mine,
                                    mine_seconds=mine_seconds, activities_seconds=activities_seconds,
-                                   rows_source=activities_source)
+                                   rows_source=activities_source, rows_age=round(rows_age, 3),
+                                   main_requests=client.requests_made,
+                                   poller_polls=getattr(poller, 'polls', 0))
                         last_timing_at = clock()
                     opening_scan = fast
                     if not fast:
                         flush_mail()
                     health(phase='waiting', next_check_at=clock() + delay, failure_count=0)
                     query_recovered()
-                    pause(delay)
+                    if wake_at is not None:
+                        # Wake exactly when the prewarm/history refresh or the captcha prefetch
+                        # is due instead of drifting with the fast interval.
+                        delay = min(delay, max(0.0, wake_at - clock()))
+                    poller = activity_poller
+                    wake = None
+                    if (fast and poller is not None and poller.running
+                            and getattr(poller, 'wait_update', None) is not None):
+                        # Only a poll newer than the consumed snapshot may cut the wait short.
+                        wake = lambda timeout, poller=poller: poller.wait_update(
+                            timeout, consumed_polls)
+                    pause(delay, wake)
                 else:
                     health(phase='confirming', failure_count=0)
             except AuthenticationRejected:
@@ -1333,6 +1674,7 @@ def run(settings: Settings, *, session: Any = None,
         if task:
             health(phase='manual_required' if snapshot['phase'] == 'manual_required' and final_phase == 'stopped'
                    else final_phase, next_check_at=0)
+            flush_health(force=True)
             task.close()
         if session is None and client is not None:
             client.session.close()

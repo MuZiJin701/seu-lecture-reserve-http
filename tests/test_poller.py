@@ -81,3 +81,175 @@ def test_thread_polls_until_stopped():
     assert not poller.running
     assert calls
     assert poller.snapshot() is not None and poller.snapshot().error is None
+
+
+def _started_poller(starts, *, interval):
+    """Poller whose query records its start time on the real clock."""
+
+    def query():
+        starts.append(time.monotonic())
+        return []
+
+    return ActivityPoller(query, interval=interval, clock=time.monotonic)
+
+
+def _wait_for_polls(poller, count, timeout=3.0):
+    """Wait until ``count`` queries have completed; returns the completed count."""
+    deadline = time.monotonic() + timeout
+    while poller.polls < count and time.monotonic() < deadline:
+        poller.wait_update(0.25)
+    return poller.polls
+
+
+def test_polls_counts_completed_queries():
+    class Broken(Exception):
+        pass
+
+    calls = []
+
+    def query():
+        calls.append('one')
+        if len(calls) == 2:
+            raise Broken('boom')
+        return [{'WID': 'one'}]
+
+    poller = ActivityPoller(query, interval=0.25, clock=lambda: 100.0)
+    assert poller.polls == 0
+    assert poller.poll_once() is True
+    assert poller.polls == 1
+    assert poller.poll_once() is False
+    assert poller.polls == 2
+
+
+def test_wait_update_wakes_when_a_poll_completes():
+    poller = ActivityPoller(lambda: [], interval=0.01, clock=time.monotonic)
+    poller.start()
+    try:
+        assert poller.wait_update(2.0) is True
+    finally:
+        poller.stop()
+    assert poller.polls >= 1
+
+
+def test_wait_update_wakes_on_a_failed_poll():
+    class Broken(Exception):
+        pass
+
+    gate = threading.Event()
+
+    def query():
+        gate.wait(3.0)
+        raise Broken('boom')
+
+    poller = ActivityPoller(query, interval=0.01, clock=time.monotonic)
+    poller.start()
+    timer = threading.Timer(0.1, gate.set)
+    timer.start()
+    try:
+        assert poller.wait_update(5.0) is True
+    finally:
+        timer.cancel()
+        poller.stop()
+    assert poller.polls == 1
+    snapshot = poller.snapshot()
+    assert snapshot is not None and snapshot.error == 'Broken'
+
+
+def test_wait_update_times_out_while_idle():
+    poller = ActivityPoller(lambda: [], interval=0.25, clock=time.monotonic)
+    started = time.monotonic()
+    assert poller.wait_update(0.2) is False
+    assert time.monotonic() - started >= 0.15
+
+
+def test_align_at_places_the_next_poll_near_the_target():
+    starts = []
+    poller = _started_poller(starts, interval=0.5)
+    target = time.monotonic() + 0.15
+    poller.align_at(target)
+    poller.start()
+    try:
+        assert _wait_for_polls(poller, 2) >= 2
+    finally:
+        poller.stop()
+    # The first poll runs immediately; the one-shot alignment puts the next one on target.
+    assert len(starts) >= 2
+    assert target - 0.05 <= starts[1] <= target + 0.3
+
+
+def test_align_at_is_one_shot():
+    starts = []
+    poller = _started_poller(starts, interval=0.4)
+    poller.align_at(time.monotonic() + 0.15)
+    poller.start()
+    try:
+        assert _wait_for_polls(poller, 3) >= 3
+    finally:
+        poller.stop()
+    # Only the first wait was pulled to the target; the poll after it is regular again.
+    assert starts[2] - starts[1] >= 0.3
+
+
+def test_align_at_ignores_a_target_beyond_two_intervals():
+    starts = []
+    poller = _started_poller(starts, interval=0.3)
+    poller.align_at(time.monotonic() + 2.0)
+    poller.start()
+    try:
+        assert _wait_for_polls(poller, 2) >= 2
+    finally:
+        poller.stop()
+    assert 0.2 <= starts[1] - starts[0] <= 0.6
+
+
+def test_align_at_none_cancels_a_pending_target():
+    starts = []
+    poller = _started_poller(starts, interval=0.3)
+    poller.align_at(time.monotonic() + 0.15)
+    poller.align_at(None)
+    poller.start()
+    try:
+        assert _wait_for_polls(poller, 2) >= 2
+    finally:
+        poller.stop()
+    assert starts[1] - starts[0] >= 0.2
+
+
+def test_wait_update_reports_a_poll_completed_before_the_wait_started():
+    poller = ActivityPoller(lambda: [], interval=10.0, clock=time.monotonic)
+    assert poller.poll_once() is True
+    started = time.monotonic()
+    assert poller.wait_update(0.5, since=0) is True
+    # The finished poll must be reported immediately, not after the timeout.
+    assert time.monotonic() - started < 0.2
+
+
+def test_wait_update_ignores_a_poll_the_caller_already_consumed():
+    poller = ActivityPoller(lambda: [], interval=10.0, clock=time.monotonic)
+    assert poller.poll_once() is True
+    assert poller.wait_update(0.05, since=poller.polls) is False
+
+
+def test_snapshot_with_version_returns_a_consistent_pair():
+    counter = [0]
+
+    def query():
+        counter[0] += 1
+        return [{'v': counter[0]}]
+
+    poller = ActivityPoller(query, interval=0.01, clock=time.monotonic)
+    poller.start()
+    pairs = []
+    try:
+        deadline = time.monotonic() + 1.0
+        while len(pairs) < 50 and time.monotonic() < deadline:
+            snapshot, version = poller.snapshot_with_version()
+            if snapshot is not None:
+                pairs.append((snapshot.rows[0]['v'], version))
+            time.sleep(0.001)
+    finally:
+        poller.stop()
+    assert len(pairs) >= 10
+    # Rows from poll N and version N are published under the same lock, so a reader can never
+    # mark a version consumed while holding older rows.
+    assert all(row == version for row, version in pairs)

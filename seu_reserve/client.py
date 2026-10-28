@@ -113,14 +113,15 @@ class _DeadlineHTTPConnection(Urllib3HTTPConnection):
     def connect(self) -> None:
         deadline = _current_request_deadline()
         if deadline is None:
-            return Urllib3HTTPConnection.connect(self)
+            _connect_and_measure(Urllib3HTTPConnection.connect, self)
+            return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise socket.timeout('response deadline exceeded')
         original = self.timeout
         self.timeout = min(float(original), remaining) if original is not None else remaining
         try:
-            Urllib3HTTPConnection.connect(self)
+            _connect_and_measure(Urllib3HTTPConnection.connect, self)
         finally:
             if original is not None:
                 self.timeout = original
@@ -155,14 +156,15 @@ class _DeadlineHTTPSConnection(Urllib3HTTPSConnection):
     def connect(self) -> None:
         deadline = _current_request_deadline()
         if deadline is None:
-            return Urllib3HTTPSConnection.connect(self)
+            _connect_and_measure(Urllib3HTTPSConnection.connect, self)
+            return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise socket.timeout('response deadline exceeded')
         original = self.timeout
         self.timeout = min(float(original), remaining) if original is not None else remaining
         try:
-            Urllib3HTTPSConnection.connect(self)
+            _connect_and_measure(Urllib3HTTPSConnection.connect, self)
         finally:
             if original is not None:
                 self.timeout = original
@@ -201,6 +203,24 @@ REQUEST_DEADLINE = threading.local()
 
 def _current_request_deadline() -> float | None:
     return getattr(REQUEST_DEADLINE, 'value', None)
+
+
+# Written by the deadline-aware connection classes only when a request opens a new connection,
+# and saved/cleared by Client.request so each request reports its own connection setup cost.
+REQUEST_CONNECT = threading.local()
+
+
+def _connect_and_measure(connect: Callable[[Any], None], connection: Any) -> None:
+    """Run one new-connection attempt and record its TCP/TLS handshake duration.
+
+    urllib3 calls connect() only for a connection that is not reusable, so writing here keeps
+    reused connections from reporting a connection cost.
+    """
+    started = time.monotonic()
+    try:
+        connect(connection)
+    finally:
+        REQUEST_CONNECT.value = time.monotonic() - started
 
 
 def install_deadline_pools(session: Any) -> None:
@@ -318,6 +338,10 @@ class Client:
         self.prompt = prompt
         self.notify = notify
         self.timeout = 10.0
+        # Observability for callers (app.py): one counter per request attempt and the handshake
+        # cost of the connection that attempt opened, if any.
+        self.requests_made = 0
+        self.last_connect_seconds: float | None = None
         address = environ.get('SEU_VPN_IP', '').strip()
         self.gateway_adapter = GatewayIPAdapter(address) if address else None
         self.initial_authentication = True
@@ -337,6 +361,18 @@ class Client:
         return clone
 
     def request(self, method: str, url: str, **kwargs: Any) -> Any:
+        # Keep the bookkeeping around every attempt, including local rejections and failures:
+        # the connection classes report a handshake in REQUEST_CONNECT on this thread only.
+        previous_connect = getattr(REQUEST_CONNECT, 'value', None)
+        REQUEST_CONNECT.value = None
+        self.requests_made += 1
+        try:
+            return self._request(method, url, **kwargs)
+        finally:
+            self.last_connect_seconds = getattr(REQUEST_CONNECT, 'value', None)
+            REQUEST_CONNECT.value = previous_connect
+
+    def _request(self, method: str, url: str, **kwargs: Any) -> Any:
         parsed = urlsplit(url)
         if parsed.scheme == 'http' and parsed.hostname == 'ehall.seu.edu.cn' and parsed.port in (None, 80):
             url = urlunsplit(('https', 'ehall.seu.edu.cn', parsed.path, parsed.query, parsed.fragment))

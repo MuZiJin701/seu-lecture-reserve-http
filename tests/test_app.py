@@ -1505,6 +1505,55 @@ def test_midway_unreadable_history_restarts_the_consecutive_count(tmp_path):
     assert any(event.get('event') == 'reservation_unconfirmed_released' for event in events)
 
 
+def test_pending_confirmation_logs_one_diagnostic(tmp_path):
+    school = School()
+    school.activities = [lecture(), lecture('two')]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    saved['retry_at'] = 0
+    state_path.write_text(json.dumps(saved))
+
+    school.mine = [{**lecture(), 'HD_WID': 'one', 'YYZT': '已预约'}]
+    assert execute(school, tmp_path) == 130
+
+    diagnostics = [json.loads(line) for line in
+                   (tmp_path / 'diagnostics.jsonl').read_text().splitlines()]
+    confirmed = [row for row in diagnostics
+                 if row.get('event') == 'reservation_confirmed' and row.get('wid') == 'one']
+    assert len(confirmed) == 1
+
+
+def test_health_write_failures_are_reported_once_per_minute(tmp_path, capsys, monkeypatch):
+    import inspect
+    import seu_reserve.app as app_module
+
+    original_save = app_module.Task.save
+
+    def fail_only_from_health(self):
+        caller = inspect.currentframe()
+        caller = caller.f_back if caller is not None else None
+        if caller is not None and caller.f_code.co_name in ('health', 'write_health'):
+            raise OSError('state file temporarily held by a reader')
+        return original_save(self)
+
+    monkeypatch.setattr(app_module.Task, 'save', fail_only_from_health)
+    school = School()
+    school.activities = [lecture()]
+    now = [moment('2026-10-18 12:00:00').timestamp()]
+    waits = []
+    def wait(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+        if len(waits) >= 3:
+            raise KeyboardInterrupt
+
+    assert execute(school, tmp_path, sleep=wait, clock=lambda: now[0]) == 130
+    output = capsys.readouterr().out
+    assert output.count('event=health_write_failed') == 1
+
+
 def test_success_reply_saves_pending_clear_and_confirmed_hold_together(tmp_path, monkeypatch):
     import seu_reserve.app as app_module
     snapshots = []
@@ -1823,3 +1872,386 @@ def test_ocr_model_is_warmed_once_before_the_first_submission(tmp_path, monkeypa
     assert warm[0]['at'] <= started['at']
     assert started['captcha_seconds'] >= 0
     assert started['ocr_seconds'] >= 0
+
+
+class FakePoller:
+    """Deterministic ActivityPoller replacement for opening-window integration tests."""
+
+    instances = []
+    next_rows = []
+    rows_override = None
+    next_wake_once = False
+    at_offset = 0.0
+    on_timeout = None
+
+    def __init__(self, query, *, interval, clock):
+        from seu_reserve.poller import Snapshot
+        self._snapshot_cls = Snapshot
+        self.query = query
+        self.interval = interval
+        self.clock = clock
+        self.rows = list(FakePoller.next_rows)
+        self.error = None
+        self.polls = 0
+        self.running = True
+        self.aligns = []
+        self.waits = []
+        self.versioned_reads = 0
+        self.wake_once = FakePoller.next_wake_once
+        FakePoller.instances.append(self)
+
+    def snapshot(self):
+        rows = (FakePoller.rows_override if FakePoller.rows_override is not None
+                else self.rows)
+        return self._snapshot_cls(rows=list(rows), at=self.clock() + FakePoller.at_offset,
+                                  error=self.error)
+
+    def snapshot_with_version(self):
+        self.versioned_reads += 1
+        return self.snapshot(), self.polls
+
+    def start(self):
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    def align_at(self, when):
+        self.aligns.append(when)
+
+    def wait_update(self, timeout, since=None):
+        self.waits.append(timeout)
+        if self.wake_once:
+            self.wake_once = False
+            return True
+        if FakePoller.on_timeout is not None:
+            FakePoller.on_timeout(timeout)
+        return False
+
+
+def diagnostics_rows(directory):
+    return [json.loads(line) for line in
+            (directory / 'diagnostics.jsonl').read_text().splitlines()]
+
+
+def native_activity(wid='one', *, opens='2026-10-18 12:00:00', closes='2026-10-18 13:00:00'):
+    from test_activities import activity
+    return activity(wid, YYKSSJ=opens, YYJSSJ=closes)
+
+
+def test_pending_confirmation_uses_poller_snapshot_before_history(tmp_path, monkeypatch):
+    import seu_reserve.app as app_module
+    from test_activities import activity
+    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
+    school = School()
+    school.activities = [native_activity()]
+    school.submit_replies = [{'code': 500}]
+    FakePoller.instances.clear()
+    FakePoller.rows_override = None
+    FakePoller.next_rows = school.activities
+    FakePoller.next_wake_once = False
+    clock = lambda: moment('2026-10-18 12:00:00').timestamp()
+    assert execute(school, tmp_path, clock=clock, background_poller=True) == 130
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'pending'
+
+    FakePoller.rows_override = [activity('one', YY_WID='one',
+                                         YYKSSJ='2026-10-18 12:00:00',
+                                         YYJSSJ='2026-10-18 13:00:00')]
+    now = [moment('2026-10-18 12:00:00').timestamp()]
+    def run_clock():
+        return now[0]
+    def wait(seconds):
+        now[0] += max(seconds, 0.0)
+        if now[0] > moment('2026-10-18 12:00:10').timestamp():
+            raise KeyboardInterrupt
+    FakePoller.on_timeout = wait
+    try:
+        assert execute(school, tmp_path, clock=run_clock, sleep=wait,
+                       background_poller=True) == 130
+    finally:
+        FakePoller.on_timeout = None
+    lines = diagnostics_rows(tmp_path)
+    assert any(line['event'] == 'pending_snapshot_confirmed' for line in lines)
+    confirmed = [line for line in lines if line['event'] == 'reservation_confirmed']
+    assert confirmed and confirmed[-1]['source'] == 'pending_snapshot'
+    assert school.mine == []
+    assert school.submitted == ['one']
+
+
+def test_opening_wait_wakes_on_poller_update_without_a_second_sleep(tmp_path, monkeypatch):
+    import seu_reserve.app as app_module
+    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
+    school = School()
+    school.activities = [native_activity(opens='2026-10-18 12:00:10')]
+    FakePoller.instances.clear()
+    FakePoller.rows_override = None
+    FakePoller.at_offset = 0.0
+    FakePoller.next_rows = school.activities
+    FakePoller.next_wake_once = True
+    now = [moment('2026-10-18 12:00:00').timestamp()]
+    stop_at = moment('2026-10-18 12:00:09').timestamp()
+    def clock(): return now[0]
+    def advance(seconds):
+        now[0] += max(seconds, 0.0)
+        if now[0] >= stop_at:
+            raise KeyboardInterrupt
+    FakePoller.on_timeout = advance
+    slept = []
+    def wait(seconds):
+        slept.append(seconds)
+        raise KeyboardInterrupt
+    try:
+        assert execute(school, tmp_path, clock=clock, sleep=wait,
+                       background_poller=True) == 130
+    finally:
+        FakePoller.on_timeout = None
+    poller = FakePoller.instances[0]
+    assert len(poller.waits) >= 2
+    assert poller.versioned_reads >= 1
+    # wait_update already consumed the interval; a timeout must not be followed by sleep again.
+    assert slept == []
+    timings = [line for line in diagnostics_rows(tmp_path) if line['event'] == 'scan_timing']
+    assert timings
+    assert {'rows_age', 'main_requests', 'poller_polls'} <= set(timings[-1])
+
+
+def test_opening_alignment_is_off_by_default_and_opt_in(tmp_path, monkeypatch):
+    import seu_reserve.app as app_module
+    start = moment('2026-10-18 12:00:10').timestamp()
+    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
+    school = School()
+    school.activities = [native_activity(opens='2026-10-18 12:00:10')]
+    FakePoller.instances.clear()
+    FakePoller.rows_override = None
+    FakePoller.at_offset = 0.0
+    FakePoller.next_rows = school.activities
+    FakePoller.next_wake_once = False
+    now = [moment('2026-10-18 12:00:00').timestamp()]
+    def clock(): return now[0]
+    def advance(seconds):
+        now[0] += max(seconds, 0.0)
+        raise KeyboardInterrupt
+    FakePoller.on_timeout = advance
+    try:
+        assert execute(school, tmp_path, clock=clock, sleep=interrupted,
+                       background_poller=True) == 130
+        assert FakePoller.instances[0].aligns == []
+
+        FakePoller.instances.clear()
+        now[0] = moment('2026-10-18 12:00:00').timestamp()
+        assert execute(school, tmp_path, clock=clock, sleep=interrupted,
+                       background_poller=True,
+                       settings=Settings(state_dir=tmp_path, poller_align=True)) == 130
+        aligns = FakePoller.instances[0].aligns
+        assert aligns and abs(aligns[-1] - start) < 1
+    finally:
+        FakePoller.on_timeout = None
+
+
+def test_pending_confirmation_rejects_a_snapshot_older_than_the_submission(tmp_path, monkeypatch):
+    import seu_reserve.app as app_module
+    from test_activities import activity
+    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
+    school = School()
+    school.activities = [native_activity()]
+    school.submit_replies = [{'code': 500}]
+    FakePoller.instances.clear()
+    FakePoller.rows_override = None
+    FakePoller.at_offset = 0.0
+    FakePoller.next_rows = school.activities
+    FakePoller.next_wake_once = False
+    clock = lambda: moment('2026-10-18 12:00:00').timestamp()
+    assert execute(school, tmp_path, clock=clock, background_poller=True) == 130
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'pending'
+
+    FakePoller.rows_override = [activity('one', YY_WID='one',
+                                         YYKSSJ='2026-10-18 12:00:00',
+                                         YYJSSJ='2026-10-18 13:00:00')]
+    FakePoller.at_offset = -30.0
+    now = [moment('2026-10-18 12:00:00').timestamp()]
+    stop_at = moment('2026-10-18 12:00:08').timestamp()
+    def run_clock(): return now[0]
+    def wait(seconds):
+        now[0] += max(seconds, 0.0)
+        if now[0] >= stop_at:
+            raise KeyboardInterrupt
+    FakePoller.on_timeout = wait
+    try:
+        assert execute(school, tmp_path, clock=run_clock, sleep=wait,
+                       background_poller=True) == 130
+    finally:
+        FakePoller.on_timeout = None
+    lines = diagnostics_rows(tmp_path)
+    assert not any(line['event'] == 'pending_snapshot_confirmed' for line in lines)
+    confirmed = [line for line in lines if line['event'] == 'reservation_confirmed']
+    assert all(line['source'] != 'pending_snapshot' for line in confirmed)
+
+
+def test_disabling_prefetch_and_prewarm_restores_the_fresh_captcha_path(tmp_path):
+    school = School()
+    school.activities = [native_activity()]
+    now = [moment('2026-10-18 11:59:57').timestamp()]
+    def clock(): return now[0]
+    def wait(seconds):
+        now[0] += max(seconds, 0.0)
+        if school.submitted:
+            raise KeyboardInterrupt
+    settings = Settings(state_dir=tmp_path, prewarm=False, captcha_prefetch=False)
+    assert execute(school, tmp_path, clock=clock, sleep=wait, settings=settings) == 130
+    lines = diagnostics_rows(tmp_path)
+    assert not any(line['event'] in ('prewarm_history', 'captcha_prefetched') for line in lines)
+    started = [line for line in lines if line['event'] == 'submission_started']
+    assert started and started[0]['captcha_source'] == 'fresh'
+    assert len([1 for _, url, _ in school.requests if url.endswith('vcode.do')]) == 1
+
+
+def test_rejected_prefetched_captcha_falls_back_to_a_fresh_fetch(tmp_path):
+    school = School()
+    school.activities = [native_activity()]
+    school.submit_replies = [{'code': 1, 'msg': '验证码错误'}]
+    now = [moment('2026-10-18 11:59:57').timestamp()]
+    def clock(): return now[0]
+    def wait(seconds):
+        now[0] += max(seconds, 0.0)
+        if school.submitted or len(school.requests) > 500:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=clock, sleep=wait) == 130
+    lines = diagnostics_rows(tmp_path)
+    assert any(line['event'] == 'captcha_prefetch_rejected' for line in lines)
+    sources = [line['captcha_source'] for line in lines
+               if line['event'] == 'submission_started']
+    assert sources[:2] == ['prefetch', 'fresh']
+    assert school.submitted == ['one', 'one']
+    assert len([1 for _, url, _ in school.requests if url.endswith('vcode.do')]) == 2
+
+
+def test_preparation_is_skipped_when_the_opening_is_too_close(tmp_path):
+    school = School()
+    start = moment('2026-10-18 12:00:01').timestamp()
+    school.activities = [native_activity(opens='2026-10-18 12:00:01',
+                                         closes='2026-10-18 13:00:00')]
+    now = [start - 0.1]
+    def clock(): return now[0]
+    def wait(seconds):
+        now[0] += max(seconds, 0.0)
+        if school.submitted:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=clock, sleep=wait) == 130
+    lines = diagnostics_rows(tmp_path)
+    assert not any(line['event'] in ('prewarm_history', 'captcha_prefetched')
+                   for line in lines)
+    started = [line for line in lines if line['event'] == 'submission_started']
+    assert started and started[0]['captcha_source'] == 'fresh'
+    assert school.submitted == ['one']
+
+
+def test_preparation_is_deduplicated_across_school_clock_jitter(tmp_path):
+    from datetime import datetime
+    now = [moment('2026-10-18 11:59:58').timestamp()]
+    class JitterSchool(School):
+        lists = 0
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if urlsplit(url).path.endswith('queryActivityList.do'):
+                self.lists += 1
+                # Second-truncated school clock: the estimated offset moves by up to a second
+                # between snapshots, so a local-time key would repeat preparation.
+                stamp = datetime.fromtimestamp(int(now[0]) + self.lists % 2)
+                self.server_now = stamp.strftime('%Y-%m-%d %H:%M:%S')
+            return response
+    school = JitterSchool()
+    school.activities = [native_activity(opens='2026-10-18 12:00:03',
+                                         closes='2026-10-18 13:00:00')]
+    def clock(): return now[0]
+    def wait(seconds):
+        now[0] += max(seconds, 0.0)
+        if school.submitted:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=clock, sleep=wait) == 130
+    lines = diagnostics_rows(tmp_path)
+    assert sum(line['event'] == 'prewarm_history' for line in lines) == 1
+    assert sum(line['event'] == 'captcha_prefetched' for line in lines) == 1
+    assert school.submitted == ['one']
+
+
+def test_preparation_targets_the_next_not_yet_open_lecture(tmp_path):
+    from test_activities import activity
+    school = School()
+    # The first window is already open and full but still running: it must not hide the second
+    # lecture's preparation target.
+    school.activities = [
+        activity('full', HDZRS=100, YYKSSJ='2026-10-18 12:00:00',
+                 YYJSSJ='2026-10-18 12:10:00'),
+        activity('open', YYKSSJ='2026-10-18 12:00:05', YYJSSJ='2026-10-18 13:00:00'),
+    ]
+    school.hdrs = [{'HD_WID': 'full', 'YYRS': 100}]
+    full_start = moment('2026-10-18 12:00:00').timestamp()
+    now = [moment('2026-10-18 11:59:57').timestamp()]
+    def clock(): return now[0]
+    def wait(seconds):
+        now[0] += max(seconds, 0.0)
+        if school.submitted:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=clock, sleep=wait) == 130
+    lines = diagnostics_rows(tmp_path)
+    assert school.submitted == ['open']
+    assert any(line['event'] == 'prewarm_history' and line['at'] >= full_start
+               for line in lines)
+    assert any(line['event'] == 'captcha_prefetched' and line['at'] >= full_start
+               for line in lines)
+    started = [line for line in lines
+               if line['event'] == 'submission_started' and line['wid'] == 'open']
+    assert started and started[0]['captcha_source'] == 'prefetch'
+
+
+def test_prewarm_and_captcha_prefetch_move_work_before_the_candidate(tmp_path):
+    school = School()
+    school.activities = [native_activity()]
+    now = [moment('2026-10-18 11:59:57').timestamp()]
+    waits = []
+    def clock():
+        return now[0]
+    def wait(seconds):
+        waits.append(seconds)
+        now[0] += max(seconds, 0.0)
+        if school.submitted or len(waits) > 400:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=clock, sleep=wait) == 130
+    assert school.submitted == ['one']
+    lines = diagnostics_rows(tmp_path)
+    assert any(line['event'] == 'prewarm_history' for line in lines)
+    assert any(line['event'] == 'captcha_prefetched' for line in lines)
+    started = [line for line in lines if line['event'] == 'submission_started']
+    assert started and started[0]['captcha_source'] == 'prefetch'
+    assert started[0]['prefetch_age'] is not None
+    prefetch_requests = [url for _, url, _ in school.requests if url.endswith('vcode.do')]
+    assert len(prefetch_requests) == 1
+
+
+def test_health_writes_are_coalesced_and_flushed_on_stop(tmp_path, monkeypatch):
+    import seu_reserve.app as app_module
+    saves = []
+    original_save = app_module.Task.save
+    def counting_save(self):
+        health = self.data.get('health')
+        if isinstance(health, dict):
+            saves.append((health.get('phase'), health.get('next_check_at')))
+        return original_save(self)
+    monkeypatch.setattr(app_module.Task, 'save', counting_save)
+    school = School()
+    school.activities = [native_activity(opens='2026-10-18 12:00:10')]
+    now = [moment('2026-10-18 12:00:00').timestamp()]
+    stop_at = now[0] + 1.2
+    def clock(): return now[0]
+    def wait(seconds):
+        now[0] += max(seconds, 0.0)
+        if now[0] >= stop_at:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=clock, sleep=wait) == 130
+    # Over ~1.2s of fast scanning the wait-boundary heartbeat is throttled: without coalescing
+    # each 0.25s scan wrote several snapshots (~5+ waiting/activity writes).
+    in_scan = [entry for entry in saves if entry[0] in ('activities', 'waiting')]
+    assert len(in_scan) <= 3
+    assert any(phase == 'waiting' and next_check > 0 for phase, next_check in in_scan)
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert saved['health']['phase'] == 'stopped'

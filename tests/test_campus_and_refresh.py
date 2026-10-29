@@ -5,8 +5,9 @@ import pytest
 import requests
 
 import seu_reserve.app as app_module
+import seu_reserve.client as client_module
 from seu_reserve.app import Settings
-from seu_reserve.client import AuthenticationRejected, Client, ENTRY
+from seu_reserve.client import AuthenticationRejected, Client, ENTRY, RemoteError
 from seu_reserve.model import moment
 from test_app import (FakeHistoryPoller, FakePoller, School, execute, interrupted,
                       lecture, native_activity, seed_opening_selection)
@@ -191,3 +192,128 @@ def test_new_background_history_replaces_a_still_cached_history(tmp_path, monkey
     assert not any(url.endswith('queryMyActivityList.do') for _, url, _ in school.requests)
     saved = json.loads((tmp_path / 'task.json').read_text())
     assert saved['selection']['activities'][0]['reason'] == 'time_conflict'
+
+
+class CampusAppEntryFailure(CampusSchool):
+    """Campus CAS login succeeds, but entering the application fails on the first try."""
+
+    def __init__(self, reason):
+        super().__init__()
+        self.reason = reason
+
+    def request(self, method, url, **kwargs):
+        if urlsplit(url).path.endswith('loginRedirect') and self.reason is not None:
+            self.requests.append((method, url, kwargs))
+            reason, self.reason = self.reason, None
+            raise RemoteError(reason)
+        return super().request(method, url, **kwargs)
+
+
+@pytest.mark.parametrize('reason', ['http_failure', 'network_timeout', 'connection_failure',
+                                    'tls_failure'])
+def test_campus_application_entry_network_failure_falls_back(tmp_path, capsys, reason):
+    school = CampusAppEntryFailure(reason)
+    assert execute(school, tmp_path, check_only=True) == 0
+    output = capsys.readouterr().out
+    assert output.count('event=campus_login_fallback') == 1
+    assert any(urlsplit(url).hostname == 'vpn.seu.edu.cn' for _, url, _ in school.requests)
+    assert not school.submitted
+
+
+class CampusSmsRetryAcrossFallback(CampusSchool):
+    """Campus SMS send is rejected, the campus entry fails and the gateway login needs SMS too."""
+
+    def __init__(self):
+        super().__init__(sms=True)
+        self.send_attempts = 0
+        self.campus_redirects = 0
+
+    def request(self, method, url, **kwargs):
+        path = urlsplit(url).path
+        if path.endswith('sendStage2Code'):
+            self.send_attempts += 1
+            response = requests.Response()
+            response.url = url
+            response.status_code = 200
+            response._content = json.dumps({'code': 500 if self.send_attempts == 1 else 200}).encode()
+            return response
+        if path.endswith('loginRedirect') and self.campus_redirects == 0:
+            self.campus_redirects += 1
+            self.requests.append((method, url, kwargs))
+            self.sms = True  # the gateway fallback login must ask for SMS again
+            response = requests.Response()
+            response.url = url
+            response.status_code = 200
+            response._content = b'<html>not the application</html>'
+            return response
+        return super().request(method, url, **kwargs)
+
+
+def test_sms_cooldown_survives_campus_gateway_fallback(monkeypatch):
+    school = CampusSmsRetryAcrossFallback()
+    now = [1000.0]
+    monkeypatch.setattr(client_module.time, 'monotonic', lambda: now[0])
+    answers = [('send', 0.0), ('654321', 0.0), ('send', 0.0), ('send', 60.5), ('654321', 0.0)]
+    pending = list(answers)
+    labels = []
+    attempts_at_wait = []
+
+    def prompt(label):
+        if '等待约' in label:
+            attempts_at_wait.append(school.send_attempts)
+        labels.append(label)
+        if not pending:
+            raise AssertionError('unexpected extra prompt call')
+        answer, advance = pending.pop(0)
+        now[0] += advance
+        return answer
+
+    events = []
+    client = Client(school, {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
+                    prompt, events.append)
+    client.authenticate()
+    # One rejected send in the campus login, one accepted send after the cooldown in the
+    # gateway login: the in-cooldown 'send' never reached the school.
+    assert school.send_attempts == 2
+    assert attempts_at_wait == [1]
+    assert any('等待约 60 秒' in label for label in labels)
+    assert events.count('sms_send_failed') == 1
+    assert events.count('campus_login_fallback') == 1
+    assert not pending and len(labels) == len(answers)
+
+
+class CampusSmsSendRaises(CampusSchool):
+    def __init__(self):
+        super().__init__(sms=True)
+        self.send_attempts = 0
+
+    def request(self, method, url, **kwargs):
+        if urlsplit(url).path.endswith('sendStage2Code'):
+            self.send_attempts += 1
+            raise RemoteError('network_timeout')
+        return super().request(method, url, **kwargs)
+
+
+def test_sms_send_remote_error_cools_down_without_crashing(monkeypatch):
+    school = CampusSmsSendRaises()
+    now = [500.0]
+    monkeypatch.setattr(client_module.time, 'monotonic', lambda: now[0])
+    pending = ['send', '654321']
+    labels = []
+    events = []
+
+    def prompt(label):
+        labels.append(label)
+        if not pending:
+            raise AssertionError('unexpected extra prompt call')
+        return pending.pop(0)
+
+    client = Client(school, {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
+                    prompt, events.append)
+    client.authenticate()
+    assert client.sms_retry_at == 560.0
+    assert school.send_attempts == 1
+    assert events.count('sms_send_failed') == 1
+    assert any('短信发送失败' in label for label in labels)
+    # The next user input was consumed normally instead of being discarded or crashing.
+    assert not pending

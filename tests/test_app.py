@@ -2969,6 +2969,80 @@ def test_stale_background_history_waits_for_its_refresh_instead_of_a_sync_query(
     lines = diagnostics_rows(tmp_path)
     assert any(line['event'] == 'history_background_used' for line in lines)
 
+def test_in_flight_history_completing_at_the_refresh_request_is_still_consumed(
+        tmp_path, monkeypatch):
+    """A poll completing around the refresh request must not force a synchronous history query.
+
+    The initial background snapshot is fresh but structurally invalid, so the scan asks for a
+    refresh. The refresh request then coalesces with the poll already in flight: it completes
+    inside request_refresh(), publishes a fresh valid snapshot, and the returned target version is
+    already reached. Pending is therefore false, and the scan must still re-read the snapshot
+    before falling back to client.mine().
+    """
+    import seu_reserve.app as app_module
+    seed_opening_selection(tmp_path, start='2026-10-18T12:00:10+08:00')
+
+    class CompletingHistory(FakeHistoryPoller):
+        invalid_rows = [{'HD_WID': 'hist1', 'YYZT': '已预约',
+                         'JZXL_DISPLAY': '人文与科学素养系列讲座_心理健康',
+                         'KSSJ': 'not-a-time', 'JSSJ': 'also-bad',
+                         'SFDK': '0', 'SFWY': '0'}]
+        refreshes = []
+
+        def __init__(self, query, *, interval, clock, **kwargs):
+            super().__init__(query, interval=interval, clock=clock, **kwargs)
+            self.polls = 0
+            self.published = list(CompletingHistory.invalid_rows)
+            self.published_at = clock()
+
+        def snapshot(self):
+            from seu_reserve.poller import Snapshot
+            return Snapshot(rows=list(self.published), at=self.published_at)
+
+        def request_refresh(self):
+            CompletingHistory.refreshes.append(self.clock())
+            # The in-flight poll completes around the request, as in the audited race: the
+            # satisfying version is fixed first, then the poll publishes fresh valid rows.
+            target = self.polls + 1
+            self.polls = target
+            self.published = []
+            self.published_at = self.clock()
+            return target
+
+    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
+    monkeypatch.setattr(app_module, 'new_history_poller', CompletingHistory)
+    CompletingHistory.refreshes = []
+    activities = [native_activity(opens='2026-10-18 12:00:10')]
+    FakePoller.instances.clear()
+    FakePoller.rows_override = None
+    FakePoller.at_offset = 0.0
+    FakePoller.next_error = None
+    FakePoller.next_wake_once = False
+    FakeHistoryPoller.rows = []
+    FakeHistoryPoller.error = None
+    FakeHistoryPoller.server_directed = False
+    FakeHistoryPoller.retry_after = 0.0
+    school = School()
+    school.activities = list(activities)
+    FakePoller.next_rows = list(activities)
+    now = [moment('2026-10-18 12:00:00').timestamp()]
+    def clock(): return now[0]
+    def stop(_seconds): raise KeyboardInterrupt
+    FakePoller.on_timeout = stop
+    try:
+        assert execute(school, tmp_path, clock=clock, sleep=stop, background_poller=True,
+                       settings=Settings(state_dir=tmp_path, prewarm=False,
+                                         captcha_prefetch=False)) == 130
+    finally:
+        FakePoller.on_timeout = None
+    lines = diagnostics_rows(tmp_path)
+    assert any(line['event'] == 'history_background_used' for line in lines)
+    history_queries = [url for _, url, _ in school.requests
+                       if url.endswith('queryMyActivityList.do')]
+    assert history_queries == []
+    # One refresh for the whole run: the satisfied in-flight poll is not requested again.
+    assert len(CompletingHistory.refreshes) == 1
+
 def test_candidate_selection_uses_newer_list_snapshot_after_a_long_history_wait(
         tmp_path, monkeypatch):
     import seu_reserve.app as app_module

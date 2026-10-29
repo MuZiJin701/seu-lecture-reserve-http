@@ -347,6 +347,9 @@ class Client:
         address = environ.get('SEU_VPN_IP', '').strip()
         self.gateway_adapter = GatewayIPAdapter(address) if address else None
         self.initial_authentication = True
+        # The school rejects too-frequent SMS sends. The deadline lives on the instance: a
+        # campus -> gateway fallback calls login() a second time and must not reset it.
+        self.sms_retry_at = 0.0
 
     def clone_readonly(self) -> 'Client':
         """Independent client with a copied-cookie session for read-only background queries.
@@ -598,7 +601,6 @@ class Client:
         if not username or not password:
             raise AuthenticationRejected('credentials_missing')
         code = ''
-        send_retry_at = 0.0
         while True:
             captcha = self.payload(self.request('GET', CAS + 'needCaptcha'))
             if not has_code(captcha, 200):
@@ -641,14 +643,23 @@ class Client:
                 sms_hint = ''
                 if answer == 'send':
                     now = time.monotonic()
-                    if now < send_retry_at:
-                        wait = max(1, math.ceil(send_retry_at - now))
+                    if now < self.sms_retry_at:
+                        wait = max(1, math.ceil(self.sms_retry_at - now))
                         sms_hint = f'短信发送被学校拒绝或过于频繁，请等待约 {wait} 秒后再输入 send。'
                         continue
-                    sent = self.cas('sendStage2Code', {'userId': username})
+                    try:
+                        sent = self.cas('sendStage2Code', {'userId': username})
+                    except RemoteError as exc:
+                        # A network, TLS or 429 failure while sending the SMS is not fatal: report
+                        # it, cool down for at least the local interval (or the school's
+                        # Retry-After) and keep the prompt loop so the next input is not lost.
+                        self.notify('sms_send_failed')
+                        self.sms_retry_at = time.monotonic() + max(SMS_RESEND_DELAY, exc.retry_after)
+                        sms_hint = '短信发送失败，可能请求过于频繁；请稍后重试，或直接输入六位验证码。'
+                        continue
                     if not has_code(sent, 200):
                         self.notify('sms_send_failed')
-                        send_retry_at = time.monotonic() + SMS_RESEND_DELAY
+                        self.sms_retry_at = time.monotonic() + SMS_RESEND_DELAY
                         sms_hint = '短信发送失败，可能请求过于频繁；请稍后重试，或直接输入六位验证码。'
                 elif re.fullmatch(r'\d{6}', answer):
                     code = answer
@@ -681,18 +692,24 @@ class Client:
                     raise
             if service is not None and urlsplit(service).hostname == 'ehall.seu.edu.cn':
                 # Campus access goes straight to the application's CAS service, without VPN.
+                # Login errors (credentials, challenges, network failures inside login()) keep
+                # their existing behavior: only the application-entry step below may fall back.
+                result = self.login(service)
                 try:
-                    result = self.login(service)
                     app = self.get(CAS + 'loginRedirect?redirectUrl=' + result['redirectUrl'])
-                    if urlsplit(app.url).hostname == 'ehall.seu.edu.cn' and 'indexjsp.js' in app.text:
+                except (AuthenticationRejected, AuthenticationExpired):
+                    # Authentication failures are never routing failures.
+                    raise
+                except RemoteError:
+                    # After a successful campus CAS login any HTTP/TLS/network failure while
+                    # entering the application (for example after a network change) means the
+                    # campus route is unusable: fall back once to the existing gateway flow.
+                    self.notify('campus_login_fallback')
+                else:
+                    if (urlsplit(app.url).hostname == 'ehall.seu.edu.cn'
+                            and 'indexjsp.js' in app.text):
                         return
-                    raise RemoteError('application_unavailable')
-                except RemoteError as exc:
-                    if str(exc) != 'application_unavailable':
-                        raise
-                    # The campus route is unavailable (for example after a network change):
-                    # fall back to the existing gateway flow. Credential and challenge failures
-                    # are not routing failures, so they still propagate.
+                    # A 200 response that is not the application is the same routing failure.
                     self.notify('campus_login_fallback')
             elif service is None:
                 self.notify('campus_login_fallback')

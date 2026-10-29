@@ -513,7 +513,12 @@ def run(settings: Settings, *, session: Any = None,
     history_client: Client | None = None
     history_retry_at = 0.0
     history_refresh_at = 0.0
-    history_refresh_version = 0
+    # Completed-poll version whose reaching satisfies the outstanding history refresh request
+    # (0: none pending). Recorded from request_refresh() instead of a counter snapshot taken
+    # before the call, so a poll completing around the request is not mistaken for "not pending".
+    history_refresh_target = 0
+    # Reader instance that produced the target: a recycled reader restarts its poll counter.
+    history_refresh_poller: ActivityPoller | None = None
 
     def close_session(session: Any) -> None:
         close = getattr(session, 'close', None)
@@ -1085,26 +1090,40 @@ def run(settings: Settings, *, session: Any = None,
             return clone
 
         def trigger_history_refresh() -> bool:
-            """Ask the history thread to refresh now, throttled; True when a request was sent."""
-            nonlocal history_refresh_at, history_refresh_version
+            """Ask the history thread to refresh now, throttled; True when a request was sent.
+
+            The target version returned by the reader is kept separately from the throttle: a
+            throttled trigger must not forget a refresh that is already pending. Readers that
+            predate the versioned request (or test doubles) return ``None``; their next completed
+            poll is then treated as the satisfying one.
+            """
+            nonlocal history_refresh_at, history_refresh_target, history_refresh_poller
             poller = history_poller
             refresh = getattr(poller, 'request_refresh', None)
             if poller is None or not poller.running or not callable(refresh):
                 return False
+            if poller is not history_refresh_poller:
+                # A recreated reader counts polls from zero; an old target would wait forever.
+                history_refresh_poller = poller
+                history_refresh_target = 0
+                history_refresh_at = 0.0
             now = clock()
             if now - history_refresh_at < HISTORY_REFRESH_MIN_INTERVAL:
                 return False
             history_refresh_at = now
-            history_refresh_version = getattr(poller, 'polls', 0)
-            refresh()
+            before = int(getattr(poller, 'polls', 0) or 0)
+            target = refresh()
+            if not isinstance(target, int) or isinstance(target, bool):
+                target = before + 1
+            history_refresh_target = max(history_refresh_target, target)
             return True
 
         def history_refresh_pending() -> bool:
-            """True while a requested history refresh has not completed yet."""
+            """True while the requested refresh target has not been reached yet."""
             poller = history_poller
-            return (poller is not None and poller.running
-                    and history_refresh_at > 0
-                    and getattr(poller, 'polls', 0) == history_refresh_version)
+            return (poller is not None and poller is history_refresh_poller
+                    and poller.running and history_refresh_target > 0
+                    and int(getattr(poller, 'polls', 0) or 0) < history_refresh_target)
 
         def accept_background_history(snapshot: Any) -> bool:
             """Consume one fresh, structurally valid history snapshot; True when accepted."""
@@ -1753,10 +1772,17 @@ def run(settings: Settings, *, session: Any = None,
                     if (not used_background_history and history_poller is not None
                             and history_refresh_pending()):
                         waiter = getattr(history_poller, 'wait_update', None)
-                        if waiter is not None and waiter(OPENING_QUERY_TIMEOUT,
-                                                         history_refresh_version):
+                        if waiter is not None:
+                            waiter(OPENING_QUERY_TIMEOUT, history_refresh_target - 1)
+                    # Always re-read the published snapshot after the request: a poll that
+                    # completed around it already satisfies the target, so the pending check
+                    # above may be false while the fresh rows only now become visible. Skipping
+                    # this read duplicates that query on the candidate path.
+                    if history_poller is not None:
+                        refreshed_history = history_poller.snapshot()
+                        if refreshed_history is not background_history:
                             used_background_history = accept_background_history(
-                                history_poller.snapshot())
+                                refreshed_history)
                 if not used_background_history and not refresh_mine and not history_still_fresh:
                     poller_wait_error()
                     health(phase='my_activities', next_check_at=0,

@@ -363,6 +363,63 @@ def test_exit_callback_runs_once_for_a_finished_thread():
         poller.stop()
     assert exits == ['closed']
 
+def test_request_refresh_returns_the_version_that_satisfies_it():
+    calls = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def query():
+        calls.append(time.monotonic())
+        started.set()
+        release.wait(3.0)
+        return []
+
+    poller = ActivityPoller(query, interval=10.0, clock=time.monotonic)
+    poller.start()
+    try:
+        assert started.wait(2.0)
+        # The query in flight was started before the request: the poller promises that its
+        # completion (the next polls version) satisfies the refresh.
+        target = poller.request_refresh()
+        assert target == 1
+        assert poller.polls == 0
+        release.set()
+        deadline = time.monotonic() + 2.0
+        while poller._refresh_target and time.monotonic() < deadline:
+            time.sleep(0.005)
+        # The in-flight query satisfied the request without a queued second poll, and the
+        # satisfied target is cleared so a later request is for a fresh version.
+        assert poller.polls == target
+        assert poller._refresh_target == 0
+        assert len(calls) == 1
+        assert poller.request_refresh() == poller.polls + 1
+    finally:
+        release.set()
+        poller.stop()
+
+def test_request_refresh_coalesces_a_repeat_request_into_the_same_target():
+    started = threading.Event()
+    release = threading.Event()
+
+    def query():
+        started.set()
+        release.wait(3.0)
+        return []
+
+    poller = ActivityPoller(query, interval=10.0, clock=time.monotonic)
+    poller.start()
+    try:
+        assert started.wait(2.0)
+        assert poller.request_refresh() == 1
+        assert poller.request_refresh() == 1
+    finally:
+        release.set()
+        poller.stop()
+
+def test_request_refresh_without_a_running_poller_returns_no_target():
+    poller = ActivityPoller(lambda: [], interval=1.0, clock=time.monotonic)
+    assert poller.request_refresh() == 0
+
 def test_refresh_request_during_an_in_flight_query_is_coalesced():
     calls = []
     started = threading.Event()

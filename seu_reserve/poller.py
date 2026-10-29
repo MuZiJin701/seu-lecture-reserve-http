@@ -159,13 +159,22 @@ class ActivityPoller:
         with self._lock:
             self._align = when
 
-    def request_refresh(self) -> None:
-        """Ask the running poller to run a query now; an in-flight query satisfies the request."""
+    def request_refresh(self) -> int:
+        """Ask the running poller to run a query now; return the version that satisfies it.
+
+        An in-flight query satisfies the request, so the target is ``max(pending target,
+        completed polls + 1)`` computed under the same lock as the counter. Returning it lets the
+        caller record the target atomically: a poll that completes around the request is then
+        observed as satisfying it instead of forcing a duplicate query. Returns 0 when the poller
+        is not running (no poll can satisfy the request).
+        """
         if not self.running:
-            return
+            return 0
         with self._lock:
-            self._refresh_target = max(self._refresh_target, self._polls + 1)
+            target = max(self._refresh_target, self._polls + 1)
+            self._refresh_target = target
             self._wake.set()
+            return target
 
     def _call_exit(self) -> None:
         if self._exit_called:

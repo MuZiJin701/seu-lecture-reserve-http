@@ -310,3 +310,55 @@ def test_rate_limit_without_retry_after_also_updates_the_gate():
                             clock=lambda: 50.0, gate=gate)
     assert poller.poll_once() is False
     assert gate.remaining() > 0.5
+
+def test_request_refresh_polls_immediately_instead_of_waiting_for_the_interval():
+    polls = []
+    poller = ActivityPoller(lambda: polls.append(time.monotonic()) or [], interval=10.0,
+                            clock=time.monotonic)
+    poller.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while len(polls) < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert len(polls) == 1
+        poller.request_refresh()
+        deadline = time.monotonic() + 2.0
+        while len(polls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert len(polls) >= 2
+    finally:
+        poller.stop()
+
+
+def test_stop_without_join_does_not_block_on_a_slow_request_and_closes_on_exit():
+    started = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    def query():
+        started.set()
+        release.wait(3.0)
+        return []
+
+    poller = ActivityPoller(query, interval=0.01, clock=time.monotonic,
+                            on_exit=closed.set)
+    poller.start()
+    assert started.wait(2.0)
+    before = time.monotonic()
+    poller.stop(join=False)
+    assert time.monotonic() - before < 0.2
+    assert not closed.is_set()
+    release.set()
+    assert closed.wait(2.0)
+
+
+def test_exit_callback_runs_once_for_a_finished_thread():
+    exits = []
+    poller = ActivityPoller(lambda: [], interval=10.0, clock=time.monotonic,
+                            on_exit=lambda: exits.append('closed'))
+    poller.start()
+    try:
+        assert poller.wait_update(2.0, since=0) is True
+    finally:
+        poller.stop()
+    assert exits == ['closed']

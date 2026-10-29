@@ -60,7 +60,7 @@ def instant_poller(error, retry_after, *, server_directed):
         def start(self):
             pass
 
-        def stop(self):
+        def stop(self, *, join: bool = True):
             pass
 
         def snapshot(self):
@@ -156,7 +156,7 @@ def test_poller_wait_is_rechecked_before_captcha_and_submit(tmp_path, monkeypatc
         def start(self):
             pass
 
-        def stop(self):
+        def stop(self, *, join: bool = True):
             pass
 
         def snapshot(self):

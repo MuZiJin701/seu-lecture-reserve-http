@@ -1924,7 +1924,7 @@ class FakePoller:
     def start(self):
         self.running = True
 
-    def stop(self):
+    def stop(self, *, join: bool = True):
         self.running = False
 
     def align_at(self, when):
@@ -2236,7 +2236,7 @@ class FakeHistoryPoller:
         self.running = True
         FakeHistoryPoller.starts += 1
 
-    def stop(self):
+    def stop(self, *, join: bool = True):
         self.running = False
         FakeHistoryPoller.events.append('history_stop')
 
@@ -2917,3 +2917,54 @@ def test_invalid_salon_history_falls_back_to_sync_in_the_same_scan(tmp_path, mon
     assert 'event=invalid_activity_data' not in events
     saved = json.loads((tmp_path / 'task.json').read_text())
     assert saved['health'].get('failure_count', 0) == 0
+
+def test_stale_background_history_waits_for_its_refresh_instead_of_a_sync_query(
+        tmp_path, monkeypatch):
+    import seu_reserve.app as app_module
+    seed_opening_selection(tmp_path, start='2026-10-18T12:00:10+08:00')
+
+    class StaleThenFreshHistory(FakeHistoryPoller):
+        waits = []
+
+        def snapshot(self):
+            from seu_reserve.poller import Snapshot
+            age = 0.0 if StaleThenFreshHistory.waits else 60.0
+            return Snapshot(rows=list(FakeHistoryPoller.rows), at=self.clock() - age)
+
+        def request_refresh(self):
+            pass
+
+        def wait_update(self, timeout, since=None):
+            StaleThenFreshHistory.waits.append(timeout)
+            return True
+
+    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
+    monkeypatch.setattr(app_module, 'new_history_poller', StaleThenFreshHistory)
+    StaleThenFreshHistory.waits = []
+    activities = [native_activity(opens='2026-10-18 12:00:10')]
+    FakePoller.instances.clear()
+    FakePoller.rows_override = None
+    FakePoller.at_offset = 0.0
+    FakePoller.next_error = None
+    FakePoller.next_wake_once = False
+    FakeHistoryPoller.rows = []
+    FakeHistoryPoller.error = None
+    FakeHistoryPoller.server_directed = False
+    FakeHistoryPoller.retry_after = 0.0
+    school = School()
+    school.activities = list(activities)
+    FakePoller.next_rows = list(activities)
+    now = [moment('2026-10-18 12:00:00').timestamp()]
+    def clock(): return now[0]
+    def stop(_seconds): raise KeyboardInterrupt
+    FakePoller.on_timeout = stop
+    try:
+        assert execute(school, tmp_path, clock=clock, sleep=stop, background_poller=True,
+                       settings=Settings(state_dir=tmp_path, prewarm=False,
+                                         captcha_prefetch=False)) == 130
+    finally:
+        FakePoller.on_timeout = None
+    assert StaleThenFreshHistory.waits and StaleThenFreshHistory.waits[0] == 6
+    assert not any(url.endswith('queryMyActivityList.do') for _, url, _ in school.requests)
+    lines = diagnostics_rows(tmp_path)
+    assert any(line['event'] == 'history_background_used' for line in lines)

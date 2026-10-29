@@ -78,17 +78,22 @@ class WaitGate:
 class ActivityPoller:
     def __init__(self, query: Callable[[], list[dict[str, Any]]], *,
                  interval: float, clock: Callable[[], float] = time.monotonic,
-                 gate: WaitGate | None = None):
+                 gate: WaitGate | None = None,
+                 on_exit: Callable[[], None] | None = None):
         self._query = query
         self._interval = interval
         self._clock = clock
         self._gate = gate
+        self._on_exit = on_exit
+        self._exit_called = False
         self._lock = threading.Lock()
         self._snapshot: Snapshot | None = None
         self._stop = threading.Event()
         # Set after every completed poll (success or failure) so the scan loop can sleep
         # until the next read instead of re-checking wall-clock freshness.
         self._updated = threading.Event()
+        # Wakes the interval wait early for an on-demand refresh (and for stop).
+        self._wake = threading.Event()
         # One-shot start-of-poll target, consumed by the next wait computation. Targets
         # already in the past are dropped so alignment can never rewind or busy-wait.
         self._align: float | None = None
@@ -151,6 +156,17 @@ class ActivityPoller:
         with self._lock:
             self._align = when
 
+    def request_refresh(self) -> None:
+        """Ask the running poller to make its next query now, and then resume the interval."""
+        self._wake.set()
+
+    def _call_exit(self) -> None:
+        if self._exit_called:
+            return
+        self._exit_called = True
+        if self._on_exit is not None:
+            self._on_exit()
+
     def poll_once(self) -> bool:
         """One query; store the result (or the error type, Retry-After and wait class)."""
         started = self._clock()
@@ -188,38 +204,50 @@ class ActivityPoller:
         if self.running:
             return
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread = threading.Thread(target=self._run, name='activity-poller', daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, *, join: bool = True) -> None:
+        """Signal the thread to stop; with ``join=False`` do not wait for an in-flight request.
+
+        The worker owns the exit callback, so a session is closed only after its request has
+        returned. The scan loop therefore never waits on network I/O when a read-only thread is
+        being recycled.
+        """
         thread = self._thread
         self._stop.set()
-        if thread is not None:
-            # Do not stall the scan loop on an in-flight request; the daemon thread finishes
-            # on its own and discards its result. The caller closes the session afterwards.
+        self._wake.set()
+        if join and thread is not None:
             thread.join(timeout=1.0)
         self._thread = None
+        if thread is None:
+            self._call_exit()
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            # Check the shared deadline immediately before each request. The gate is updated by
-            # whichever thread received the 429, so the other reader stops even while the scan
-            # loop is blocked in a captcha or submission request.
-            if self._gate is not None and self._gate.remaining() > 0:
-                return
-            started = self._clock()
-            if not self.poll_once():
-                return
-            wait = self._interval - (self._clock() - started)
-            target = self._take_align()
-            if target is not None:
-                now = self._clock()
-                if now < target and target - now <= 2 * self._interval:
-                    # Exactly when the next poll must start; the target is consumed either
-                    # way, so a missed opening cannot shift later polls.
-                    wait = target - now
-            if wait > 0:
-                self._stop.wait(wait)
+        try:
+            while not self._stop.is_set():
+                # Check the shared deadline immediately before each request. The gate is updated
+                # by whichever thread received the 429, so the other reader stops even while the
+                # scan loop is blocked in a captcha or submission request.
+                if self._gate is not None and self._gate.remaining() > 0:
+                    return
+                started = self._clock()
+                if not self.poll_once():
+                    return
+                wait = self._interval - (self._clock() - started)
+                target = self._take_align()
+                if target is not None:
+                    now = self._clock()
+                    if now < target and target - now <= 2 * self._interval:
+                        # Exactly when the next poll must start; the target is consumed either
+                        # way, so a missed opening cannot shift later polls.
+                        wait = target - now
+                if wait > 0:
+                    if self._wake.wait(wait):
+                        self._wake.clear()
+        finally:
+            self._call_exit()
 
     def _take_align(self) -> float | None:
         """Consume the pending alignment target (one-shot) under the state lock."""

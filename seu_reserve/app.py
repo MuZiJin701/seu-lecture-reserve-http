@@ -1,5 +1,6 @@
 """Application entry point: one task, with replaceable external dependencies."""
 
+import functools
 import json
 import os
 import sys
@@ -60,12 +61,18 @@ POLLER_SNAPSHOT_MAX_AGE = 0.75
 # A stale snapshot with a poll in flight is usually about to be replaced: wait briefly for that
 # poll instead of racing it with a duplicate synchronous list query.
 POLLER_FALLBACK_WAIT = 0.3
+# If the fallback wait times out while the reader is still querying, wait for that single
+# in-flight request instead of racing it with a duplicate synchronous list query.
+POLLER_INFLIGHT_WAIT = OPENING_QUERY_TIMEOUT
 # Background refresh of "my activities" during opening windows: keeps the history cache fresh so a
 # slow history query never sits between a candidate appearing and its submission. The main loop
 # only consumes a snapshot that is recent and error-free; a failed refresh simply ages out and the
 # existing synchronous path (with its pause-on-unreliable rule) takes over.
 HISTORY_REFRESH_INTERVAL = 20.0
 HISTORY_BACKGROUND_FRESH = 30.0
+# Minimum spacing between on-demand history refreshes; keeps a broken history response from
+# turning the proactive refresh into a tight request loop.
+HISTORY_REFRESH_MIN_INTERVAL = 2.0
 # When the school-clock estimate is this uncertain, prewarm/prefetch are skipped: timing them from
 # an early/deadline guess is not safe, and the normal in-scan captcha fetch still works.
 PREPARATION_MAX_UNCERTAINTY = 2.0
@@ -116,9 +123,10 @@ def short_backoff(failures: int) -> float:
 
 def new_history_poller(query: Callable[[], list[dict[str, Any]]], *,
                        interval: float, clock: Callable[[], float],
-                       gate: WaitGate | None = None) -> ActivityPoller:
+                       gate: WaitGate | None = None,
+                       on_exit: Callable[[], None] | None = None) -> ActivityPoller:
     """Build the background "my activities" refresher (injectable for offline tests)."""
-    return ActivityPoller(query, interval=interval, clock=clock, gate=gate)
+    return ActivityPoller(query, interval=interval, clock=clock, gate=gate, on_exit=on_exit)
 
 
 def terminal_prompt(label: str) -> str:
@@ -492,31 +500,35 @@ def run(settings: Settings, *, session: Any = None,
     history_poller: ActivityPoller | None = None
     history_client: Client | None = None
     history_retry_at = 0.0
+    history_refresh_at = 0.0
+    history_refresh_version = 0
+
+    def close_session(session: Any) -> None:
+        close = getattr(session, 'close', None)
+        if callable(close):
+            close()
 
     def stop_poller() -> None:
         nonlocal activity_poller, poller_client
-        if activity_poller is not None:
-            activity_poller.stop()
-            activity_poller = None
-        if poller_client is not None:
-            session = getattr(poller_client, 'session', None)
-            close = getattr(session, 'close', None)
-            if callable(close):
-                close()
-            poller_client = None
+        poller = activity_poller
+        activity_poller = None
+        if poller is not None:
+            # Do not wait for an in-flight request: the worker closes its own session on exit.
+            poller.stop(join=False)
+        elif poller_client is not None:
+            close_session(getattr(poller_client, 'session', None))
+        poller_client = None
 
     def stop_history_poller() -> None:
-        """Stop the background history refresher and close its own session."""
+        """Stop the background history refresher; its worker closes the session on exit."""
         nonlocal history_poller, history_client
         poller = history_poller
-        if poller is not None:
-            poller.stop()
         history_poller = None
-        if history_client is not None:
-            close = getattr(getattr(history_client, 'session', None), 'close', None)
-            if callable(close):
-                close()
-            history_client = None
+        if poller is not None:
+            poller.stop(join=False)
+        elif history_client is not None:
+            close_session(getattr(history_client, 'session', None))
+        history_client = None
 
     def absorb_poller_wait() -> None:
         """Copy a server-directed wait from a failed poller into the scan loop's deadline."""
@@ -1052,6 +1064,47 @@ def run(settings: Settings, *, session: Any = None,
             clone.timeout = OPENING_QUERY_TIMEOUT
             return clone
 
+        def trigger_history_refresh() -> bool:
+            """Ask the history thread to refresh now, throttled; True when a request was sent."""
+            nonlocal history_refresh_at, history_refresh_version
+            poller = history_poller
+            refresh = getattr(poller, 'request_refresh', None)
+            if poller is None or not poller.running or not callable(refresh):
+                return False
+            now = clock()
+            if now - history_refresh_at < HISTORY_REFRESH_MIN_INTERVAL:
+                return False
+            history_refresh_at = now
+            history_refresh_version = getattr(poller, 'polls', 0)
+            refresh()
+            return True
+
+        def history_refresh_pending() -> bool:
+            """True while a requested history refresh has not completed yet."""
+            poller = history_poller
+            return (poller is not None and poller.running
+                    and history_refresh_at > 0
+                    and getattr(poller, 'polls', 0) == history_refresh_version)
+
+        def accept_background_history(snapshot: Any) -> bool:
+            """Consume one fresh, structurally valid history snapshot; True when accepted."""
+            nonlocal history, mine_at, mine_seconds, refresh_mine
+            if snapshot is None or snapshot.error is not None:
+                return False
+            if not (0 <= clock() - snapshot.at <= HISTORY_BACKGROUND_FRESH):
+                return False
+            rows = list(snapshot.rows)
+            invalid = background_history_usable(rows, clock() + server_offset)
+            if invalid is not None:
+                diagnostic('history_background_invalid', reason=invalid)
+                return False
+            history = rows
+            mine_at = snapshot.at
+            mine_seconds = getattr(snapshot, 'seconds', 0.0) or 0.0
+            refresh_mine = True
+            diagnostic('history_background_used', age_seconds=round(clock() - mine_at, 3))
+            return True
+
         def sync_poller(active: bool) -> None:
             """Run the read-only poller only while the opening window is active."""
             nonlocal activity_poller, poller_client, poller_retry_at, poller_allowed
@@ -1079,9 +1132,11 @@ def run(settings: Settings, *, session: Any = None,
                 return
             if poller_client is None:
                 poller_client = background_client()
+            session = getattr(poller_client, 'session', None)
             activity_poller = ActivityPoller(poller_client.activities,
                                              interval=FAST_INTERVAL, clock=clock,
-                                             gate=wait_gate)
+                                             gate=wait_gate,
+                                             on_exit=functools.partial(close_session, session))
             activity_poller.start()
             align_poller()
 
@@ -1122,8 +1177,10 @@ def run(settings: Settings, *, session: Any = None,
             if query is None:
                 stop_history_poller()
                 return
+            session = getattr(history_client, 'session', None)
             history_poller = new_history_poller(query, interval=HISTORY_REFRESH_INTERVAL,
-                                                clock=clock, gate=wait_gate)
+                                                clock=clock, gate=wait_gate,
+                                                on_exit=functools.partial(close_session, session))
             history_poller.start()
 
         def list_rows() -> tuple[list[dict[str, Any]], float, str, float, float, float]:
@@ -1175,6 +1232,23 @@ def run(settings: Settings, *, session: Any = None,
                                     max(0.0, clock() - started))
                         if snapshot is not None and snapshot.error is not None:
                             absorb_poller_wait()
+                    elif poller.running:
+                        # The reader is still querying: wait for that single in-flight request
+                        # rather than issuing a duplicate synchronous list query.
+                        if waiter(POLLER_INFLIGHT_WAIT, version):
+                            snapshot, version = current_pair()
+                            if (snapshot is not None and snapshot.error is None
+                                    and 0 <= clock() - snapshot.at <= POLLER_SNAPSHOT_MAX_AGE):
+                                poller_allowed = True
+                                consumed_polls = version
+                                started = getattr(snapshot, 'started', 0.0) or snapshot.at
+                                last_rows_started = started
+                                return (snapshot.rows, 0.0, 'poller',
+                                        max(0.0, clock() - snapshot.at),
+                                        getattr(snapshot, 'seconds', 0.0) or 0.0,
+                                        max(0.0, clock() - started))
+                            if snapshot is not None and snapshot.error is not None:
+                                absorb_poller_wait()
             # The server already told the background poller to wait; do not send another
             # list request inside that window just because the background thread stopped.
             poller_wait_error()
@@ -1337,6 +1411,18 @@ def run(settings: Settings, *, session: Any = None,
                     sync_poller(opening_scan)
                     stop_history_poller()
                     sync_history_poller(opening_scan and task.data['status'] != 'pending')
+                if (opening_scan and settings.history_background and background_poller
+                        and history_poller is not None and history_poller.running):
+                    # Refresh ahead of a candidate instead of only when the 20 s cycle expires.
+                    background_snapshot = history_poller.snapshot()
+                    background_fresh = (background_snapshot is not None
+                                        and background_snapshot.error is None
+                                        and 0 <= clock() - background_snapshot.at
+                                        <= HISTORY_BACKGROUND_FRESH)
+                    cache_fresh = (history is not None
+                                   and 0 <= clock() - mine_at < OPENING_HISTORY_TTL)
+                    if not background_fresh and not cache_fresh:
+                        trigger_history_refresh()
                 if task.data['status'] != 'pending':
                     holds_now = hold_entries()
                     expired = [wid for wid, entry in holds_now.items()
@@ -1575,32 +1661,24 @@ def run(settings: Settings, *, session: Any = None,
                             break
                 background_history = (history_poller.snapshot()
                                       if history_poller is not None else None)
-                background_fresh = (
-                    opening_scan and background_history is not None
-                    and background_history.error is None
-                    and 0 <= clock() - background_history.at <= HISTORY_BACKGROUND_FRESH)
                 history_still_fresh = (
                     history is not None and opening_scan
                     and 0 <= clock() - mine_at < OPENING_HISTORY_TTL)
                 used_background_history = False
-                if background_fresh and not refresh_mine and not history_still_fresh:
-                    # The background refresher already paid for this query; never let it sit
-                    # between a candidate and its submission. Validate it first: a structurally
-                    # malformed cache must fall back to the synchronous query, not fail the scan.
-                    assert background_history is not None
-                    background_rows = list(background_history.rows)
-                    invalid_reason = background_history_usable(
-                        background_rows, clock() + server_offset)
-                    if invalid_reason is not None:
-                        diagnostic('history_background_invalid', reason=invalid_reason)
-                    else:
-                        history = background_rows
-                        mine_at = background_history.at
-                        mine_seconds = getattr(background_history, 'seconds', 0.0) or 0.0
-                        refresh_mine = True
-                        used_background_history = True
-                        diagnostic('history_background_used',
-                                   age_seconds=round(clock() - mine_at, 3))
+                if opening_scan and not refresh_mine and not history_still_fresh:
+                    # Prefer the single background history query over a synchronous one: ask it
+                    # to refresh now and wait for its published snapshot, so the candidate path
+                    # never races the reader with a duplicate query.
+                    if settings.history_background and background_poller:
+                        trigger_history_refresh()
+                    used_background_history = accept_background_history(background_history)
+                    if (not used_background_history and history_poller is not None
+                            and history_refresh_pending()):
+                        waiter = getattr(history_poller, 'wait_update', None)
+                        if waiter is not None and waiter(OPENING_QUERY_TIMEOUT,
+                                                         history_refresh_version):
+                            used_background_history = accept_background_history(
+                                history_poller.snapshot())
                 if not used_background_history and not refresh_mine and not history_still_fresh:
                     poller_wait_error()
                     health(phase='my_activities', next_check_at=0,
@@ -1809,6 +1887,9 @@ def run(settings: Settings, *, session: Any = None,
                                        'unrecognized_message', 'no_message') else None,
                                    http_status=reply.get('http_status') if type(reply.get('http_status')) is int
                                        and 100 <= reply['http_status'] <= 599 else None,
+                                   connect_seconds=(round(client.last_connect_seconds, 3)
+                                                    if client.last_connect_seconds is not None
+                                                    else None),
                                    duration_seconds=max(0, clock() - submission_started))
                         if already_reserved and not has_code(reply, 0):
                             # Explicit evidence that the earlier submission is already registered.

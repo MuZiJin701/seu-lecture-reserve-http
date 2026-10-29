@@ -789,20 +789,20 @@ def test_persistent_activity_query_failure_backs_off_and_notifies(tmp_path):
     assert events == []
 
 
-def test_scan_delay_uses_quarter_second_window_and_next_opening_boundary():
+def test_scan_delay_uses_tenth_second_window_and_next_opening_boundary():
     start = moment('2030-01-01 10:00:00').timestamp()
     details = [dict(title='讲座', reason='reservation_not_started',
                     reservation_start='2030-01-01T10:00:00+08:00',
                     reservation_end='2030-01-01T12:00:00+08:00')]
     assert scan_delay(details, start - 100, 0, 10) == (10, False)
     assert scan_delay(details, start - 31, 0.2, 10) == (1, False)
-    assert scan_delay(details, start - 30, 0, 10) == (0.25, True)
+    assert scan_delay(details, start - 30, 0, 10) == (0.10, True)
     assert scan_delay(details, start + 10, 0.4, 10) == (0, True)
     assert scan_delay(details, start + 599, 2, 10) == (0, True)
     assert scan_delay(details, start + 601, 0, 10) == (10, False)
     assert scan_delay([], start, 0, 10) == (10, False)
     known = [(start, start + 600)]
-    assert scan_delay([], start - 30, 0, 10, known) == (0.25, True)
+    assert scan_delay([], start - 30, 0, 10, known) == (0.10, True)
     assert scan_delay([], start + 601, 0, 10, known) == (10, False)
 
 

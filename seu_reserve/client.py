@@ -656,6 +656,15 @@ class Client:
         app = self.get(ENTRY)
         if urlsplit(app.url).hostname == 'ehall.seu.edu.cn' and 'indexjsp.js' in app.text:
             return
+        if urlsplit(app.url).hostname == 'auth.seu.edu.cn':
+            service = self.service(app.url)
+            if urlsplit(service).hostname == 'ehall.seu.edu.cn':
+                # Campus access goes straight to the application's CAS service, without VPN.
+                result = self.login(service)
+                app = self.get(CAS + 'loginRedirect?redirectUrl=' + result['redirectUrl'])
+                if urlsplit(app.url).hostname == 'ehall.seu.edu.cn' and 'indexjsp.js' in app.text:
+                    return
+                raise RemoteError('application_unavailable')
         config_url = GATEWAY + '/passport/v1/public/authConfig'
         self.payload(self.request('GET', config_url, params={**API_PARAMS, 'mod': 1, 'needTicket': 1}))
         auth_page = self.get(GATEWAY + '/passport/v1/public/casLogin?sfDomain=CAS-auth')

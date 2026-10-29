@@ -222,7 +222,7 @@ def test_known_opening_survives_a_valid_empty_list(tmp_path):
             raise KeyboardInterrupt
     assert execute(empty, tmp_path, clock=lambda: OPEN - 1, sleep=stop) == 130
     # The retained window keeps the opening cadence even though the latest list was empty.
-    assert waits == [0.25, 0.25]
+    assert waits == [0.10, 0.10]
 
 
 def test_slow_captcha_path_submits_without_an_extra_list_query(tmp_path):
@@ -277,7 +277,7 @@ def test_opening_scan_reuses_history_until_cache_expires(tmp_path):
             raise KeyboardInterrupt
     assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop) == 130
     assert sum(url.endswith('queryMyActivityList.do') for _, url, _ in school.requests) == 1
-    assert waits == [0.25, 0.25, 0.25]
+    assert waits == [0.10, 0.10, 0.10]
 
 
 def test_overload_503_uses_short_bounded_backoff_in_opening(tmp_path):

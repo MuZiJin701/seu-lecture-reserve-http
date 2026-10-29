@@ -29,7 +29,8 @@ STEP_FAILURE_SECONDS = 5 * 60
 MAJOR_MAIL_EVENTS = {'authentication_required', 'query_failure', 'task_failed', 'unexpected_failure',
                      'reservation_step_failure'}
 SCAN_INTERVAL = 10
-FAST_INTERVAL = 0.25
+FAST_INTERVAL = 0.10
+FAST_RETRY_INTERVAL = 0.25
 FAST_RETRY_REASONS = {'network_timeout', 'connect_timeout', 'network_failure', 'connection_failure',
                       'proxy_failure', 'invalid_json', 'invalid_response', 'http_failure',
                       'business_response_invalid', 'business_rows_invalid', 'business_rows_incomplete'}
@@ -72,8 +73,8 @@ POLLER_INFLIGHT_WAIT = OPENING_QUERY_TIMEOUT
 # slow history query never sits between a candidate appearing and its submission. The main loop
 # only consumes a snapshot that is recent and error-free; a failed refresh simply ages out and the
 # existing synchronous path (with its pause-on-unreliable rule) takes over.
-HISTORY_REFRESH_INTERVAL = 20.0
-HISTORY_BACKGROUND_FRESH = 30.0
+HISTORY_REFRESH_INTERVAL = 5.0
+HISTORY_BACKGROUND_FRESH = 10.0
 # Minimum spacing between on-demand history refreshes; keeps a broken history response from
 # turning the proactive refresh into a tight request loop.
 HISTORY_REFRESH_MIN_INTERVAL = 2.0
@@ -1465,7 +1466,7 @@ def run(settings: Settings, *, session: Any = None,
                                         and 0 <= clock() - background_snapshot.at
                                         <= HISTORY_BACKGROUND_FRESH)
                     cache_fresh = (history is not None
-                                   and 0 <= clock() - mine_at < OPENING_HISTORY_TTL)
+                                   and 0 <= clock() - mine_at < HISTORY_BACKGROUND_FRESH)
                     if not background_fresh and not cache_fresh:
                         trigger_history_refresh()
                 if task.data['status'] != 'pending':
@@ -1728,17 +1729,26 @@ def run(settings: Settings, *, session: Any = None,
                             break
                 background_history = (history_poller.snapshot()
                                       if history_poller is not None else None)
+                history_ttl = (HISTORY_BACKGROUND_FRESH
+                               if settings.history_background and background_poller
+                               else OPENING_HISTORY_TTL)
                 history_still_fresh = (
                     history is not None and opening_scan
-                    and 0 <= clock() - mine_at < OPENING_HISTORY_TTL)
+                    and 0 <= clock() - mine_at < history_ttl)
                 used_background_history = False
+                if (opening_scan and not refresh_mine and background_history is not None
+                        and (background_history.at > mine_at or not history_still_fresh
+                             or background_history.error is not None)):
+                    # A newer background result must replace the cached history immediately.
+                    used_background_history = accept_background_history(background_history)
+                    if not used_background_history:
+                        history_still_fresh = False
                 if opening_scan and not refresh_mine and not history_still_fresh:
                     # Prefer the single background history query over a synchronous one: ask it
                     # to refresh now and wait for its published snapshot, so the candidate path
                     # never races the reader with a duplicate query.
                     if settings.history_background and background_poller:
                         trigger_history_refresh()
-                    used_background_history = accept_background_history(background_history)
                     if (not used_background_history and history_poller is not None
                             and history_refresh_pending()):
                         waiter = getattr(history_poller, 'wait_update', None)
@@ -1950,7 +1960,7 @@ def run(settings: Settings, *, session: Any = None,
                             if isinstance(exc, AuthenticationExpired):
                                 authenticated = False
                             wait = exc.retry_after if exc.retry_after > 0 else (
-                                FAST_INTERVAL if opening_scan else short_backoff(1))
+                                FAST_RETRY_INTERVAL if opening_scan else short_backoff(1))
                             pause_query_threads()
                             defer(wait, server_directed=exc.retry_after > 0)
                             break
@@ -2103,7 +2113,7 @@ def run(settings: Settings, *, session: Any = None,
                 elif quick:
                     # Opening seconds are scarce: retry transient request failures at the fast cadence.
                     health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
-                    delay = FAST_INTERVAL
+                    delay = FAST_RETRY_INTERVAL
                 else:
                     failures += 1
                     health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)

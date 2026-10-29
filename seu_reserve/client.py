@@ -631,20 +631,25 @@ class Client:
                 self.prompt('需要尚不支持的认证操作；处理后按回车重试（Ctrl+C 停止）：')
                 continue
             self.notify('authentication_required')
+            sms_hint = ''
             while True:
-                answer = self.prompt('需要短信认证；输入 send 发送/重发短信，或输入六位验证码（Ctrl+C 停止）：').strip()
+                instruction = ('需要短信认证；输入 send 发送/重发短信，或输入六位验证码'
+                               '（Ctrl+C 停止）：')
+                if sms_hint:
+                    instruction = sms_hint + '\n' + instruction
+                answer = self.prompt(instruction).strip()
+                sms_hint = ''
                 if answer == 'send':
                     now = time.monotonic()
                     if now < send_retry_at:
                         wait = max(1, math.ceil(send_retry_at - now))
-                        self.prompt(f'短信发送被学校拒绝或过于频繁，请等待约 {wait} 秒后再输入 send'
-                                    '（Ctrl+C 停止）：')
+                        sms_hint = f'短信发送被学校拒绝或过于频繁，请等待约 {wait} 秒后再输入 send。'
                         continue
                     sent = self.cas('sendStage2Code', {'userId': username})
                     if not has_code(sent, 200):
                         self.notify('sms_send_failed')
                         send_retry_at = time.monotonic() + SMS_RESEND_DELAY
-                        self.prompt('短信发送失败，可能请求过于频繁；请稍后输入 send 重试（Ctrl+C 停止）：')
+                        sms_hint = '短信发送失败，可能请求过于频繁；请稍后重试，或直接输入六位验证码。'
                 elif re.fullmatch(r'\d{6}', answer):
                     code = answer
                     break

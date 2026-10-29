@@ -125,14 +125,17 @@ class CampusSmsSendFails(CampusSchool):
         return super().request(method, url, **kwargs)
 
 
-def test_sms_send_failure_limits_immediate_resends():
+@pytest.mark.parametrize('answers', [['send', '654321'], ['send', 'send', '654321']])
+def test_sms_send_failure_does_not_swallow_input(answers):
     school = CampusSmsSendFails()
-    answers = iter(['send', '', 'send', '', '654321'])
+    pending = list(answers)
     labels = []
 
     def prompt(label):
         labels.append(label)
-        return next(answers, '654321')
+        if not pending:
+            raise AssertionError('unexpected extra prompt call')
+        return pending.pop(0)
 
     events = []
     client = Client(school, {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
@@ -140,8 +143,11 @@ def test_sms_send_failure_limits_immediate_resends():
     client.authenticate()
     assert school.send_attempts == 1
     assert any('短信发送失败' in label for label in labels)
-    assert any('等待约' in label for label in labels)
     assert 'sms_send_failed' in events
+    # Every displayed prompt consumed exactly one user input; no discarded answer.
+    assert not pending and len(labels) == len(answers)
+    if 'send' in answers[1:]:
+        assert any('等待约' in label for label in labels)
 
 
 def test_new_background_history_replaces_a_still_cached_history(tmp_path, monkeypatch):

@@ -17,8 +17,8 @@ import requests
 
 from .client import AuthenticationExpired, AuthenticationRejected, Client, RemoteError, has_code
 from .model import (COFFEE_CATEGORY, GOAL_CATEGORIES, Lecture, Progress, REQUIRED_CATEGORIES, SHANGHAI,
-                    activity_id, category_name, interval, moment, progress, reserved,
-                    test_notice)
+                    activity_id, category_name, conflicting_records, interval, moment, progress,
+                    reserved, test_notice)
 from .mail import Mailer, mail_failure_reason, mail_history
 from .poller import ActivityPoller, WaitGate
 from .state import Task, open_nofollow
@@ -947,6 +947,13 @@ def run(settings: Settings, *, session: Any = None,
             checkpoint.data['retry_at'] = 0
             checkpoint.data.pop('retry_server', None)
             checkpoint.save()
+
+        def reset_pending_checks() -> None:
+            """A scan-level abort restarts the consecutive-valid pending-check count."""
+            if (task is not None and task.data.get('status') == 'pending'
+                    and task.data.pop('pending_checks', None) is not None):
+                task.save()
+
         remaining = task.data.get('retry_at', 0) - clock()
         if remaining > 0:
             # Older snapshots could hold a generic 20-300 s wait; only a server-directed
@@ -1485,10 +1492,23 @@ def run(settings: Settings, *, session: Any = None,
                     # unfilled counter toward automatic release.
                     source_complete = True
                     pending_since = float(task.data.get('pending_since', 0) or 0)
+
+                    def abandon_check(error: BaseException) -> None:
+                        # A failed, aborted or unusable check is not valid absence evidence:
+                        # persist the restart of the consecutive-valid count before the
+                        # scan-level backoff (or server-directed wait) retries it.
+                        task.data.pop('pending_checks', None)
+                        task.save()
+                        raise error
+
                     poller_snapshot = (activity_poller.snapshot()
                                        if activity_poller is not None else None)
                     if (poller_snapshot is not None and poller_snapshot.error is None
                             and poller_snapshot.at >= pending_since and poller_snapshot.rows):
+                        # Contradictory duplicate rows cannot confirm the submission, nor can
+                        # they prove absence: pause instead of trusting either row.
+                        if conflicting_records(poller_snapshot.rows):
+                            abandon_check(RemoteError('activity_schema_unknown'))
                         for row in poller_snapshot.rows:
                             try:
                                 row_wid = activity_id(row)
@@ -1512,14 +1532,6 @@ def run(settings: Settings, *, session: Any = None,
                                            age_seconds=round(clock() - poller_snapshot.at, 3))
                             break
 
-                    def abandon_check(error: BaseException) -> None:
-                        # A failed, aborted or unusable check is not valid absence evidence:
-                        # persist the restart of the consecutive-valid count before the
-                        # scan-level backoff (or server-directed wait) retries it.
-                        task.data.pop('pending_checks', None)
-                        task.save()
-                        raise error
-
                     if not confirmed:
                         health(phase='my_activities', next_check_at=0)
                         mine_started = clock()
@@ -1536,6 +1548,10 @@ def run(settings: Settings, *, session: Any = None,
                             if server_wait_error(exc):
                                 abandon_check(exc)
                             pending_error = exc
+                    if pending_history is not None and conflicting_records(pending_history):
+                        # A conflicting "my activities" record is neither success nor absence
+                        # evidence, and it must not advance the automatic-release count.
+                        abandon_check(ValueError('attendance_record_conflict'))
                     booked = set()
                     if pending_history is not None:
                         try:
@@ -1551,6 +1567,9 @@ def run(settings: Settings, *, session: Any = None,
                                 abandon_check(exc)
                             pending_error = pending_error or exc
                             source_complete = False
+                        if rows is not None and conflicting_records(rows):
+                            # The activity list cannot rule the pending activity in or out.
+                            abandon_check(RemoteError('activity_schema_unknown'))
                         if rows is not None:
                             for row in rows:
                                 try:
@@ -2023,6 +2042,7 @@ def run(settings: Settings, *, session: Any = None,
                 history = None
                 authenticated = False
                 unconfirmed_checks = 0
+                reset_pending_checks()
                 failures += 1
                 query_failed(scan_started)
                 health(last_error='authentication_expired', last_error_at=clock(), failure_count=failures)
@@ -2033,6 +2053,7 @@ def run(settings: Settings, *, session: Any = None,
                     # A structurally invalid history is not a cache we can keep using.
                     history = None
                 unconfirmed_checks = 0
+                reset_pending_checks()
                 reason = str(exc)
                 safe_reason = reason if isinstance(exc, RemoteError) or reason in (
                     'attendance_result_pending', 'attendance_category_unknown',

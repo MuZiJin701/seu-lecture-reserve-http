@@ -3030,3 +3030,149 @@ def test_candidate_selection_uses_newer_list_snapshot_after_a_long_history_wait(
     started = [line for line in diagnostics_rows(tmp_path)
                if line['event'] == 'submission_started']
     assert started and started[0]['wid'] == 'new'
+
+
+def test_conflicting_history_does_not_confirm_a_pending_submission(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+    saved['retry_at'] = 0
+    saved.pop('step_failure_since', None)
+    saved.pop('query_failure_since', None)
+    state_path.write_text(json.dumps(saved))
+
+    # The school returned the same activity ID twice with contradictory reservation states:
+    # one row reserves it and one row cancels it. Neither success nor absence can be derived.
+    school.submit_timeout = False
+    school.mine = [{**lecture(), 'HD_WID': 'one', 'YYZT': '已预约'},
+                   {**lecture(), 'HD_WID': 'one', 'YYZT': '已取消'}]
+    school.activities = [lecture('two')]
+    assert execute(school, tmp_path) == 130
+
+    saved = json.loads(state_path.read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+    assert saved.get('pending_checks', 0) == 0
+    assert 'event=reservation_succeeded' not in (tmp_path / 'events.log').read_text()
+    lines = diagnostics_rows(tmp_path)
+    assert not any(line['event'] == 'reservation_confirmed' for line in lines)
+
+
+def test_conflicting_history_for_another_activity_does_not_advance_pending_checks(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+    saved['retry_at'] = 0
+    saved.pop('step_failure_since', None)
+    saved.pop('query_failure_since', None)
+    state_path.write_text(json.dumps(saved))
+
+    other = {'WID': 'reservation-row', 'HD_WID': 'other', 'JZXL_DISPLAY': '人文与科学素养系列讲座_心理健康',
+             'JZSJ': '2030-01-01 09:00:00', 'HDJSSJ': '2030-01-01 10:00:00', 'SFDK': '0', 'SFWY': '0'}
+    school.submit_timeout = False
+    school.mine = [{**other, 'YYZT': '已预约'}, {**other, 'YYZT': '已取消'}]
+    school.activities = [lecture('two')]
+    assert execute(school, tmp_path) == 130
+
+    saved = json.loads(state_path.read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+    assert saved.get('pending_checks', 0) == 0
+    events = (tmp_path / 'events.log').read_text()
+    assert 'event=reservation_unconfirmed_released' not in events
+    assert not any(line['event'] == 'reservation_checked'
+                   for line in diagnostics_rows(tmp_path))
+
+
+def test_conflicting_activity_list_does_not_confirm_a_pending_submission(tmp_path):
+    from test_activities import activity
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+    saved['retry_at'] = 0
+    saved.pop('step_failure_since', None)
+    saved.pop('query_failure_since', None)
+    state_path.write_text(json.dumps(saved))
+
+    # The same activity appears twice in the list, once showing a reservation and once not.
+    school.submit_timeout = False
+    school.mine = []
+    window = dict(YYKSSJ='2026-10-18 12:00:00', YYJSSJ='2026-10-18 13:00:00')
+    school.activities = [activity('one', YY_WID='reservation-id', **window),
+                         activity('one', **window)]
+    assert execute(school, tmp_path) == 130
+
+    saved = json.loads(state_path.read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+    assert saved.get('pending_checks', 0) == 0
+    assert 'event=reservation_succeeded' not in (tmp_path / 'events.log').read_text()
+
+
+def test_scan_level_server_wait_restarts_the_saved_pending_check_count(tmp_path, monkeypatch):
+    import seu_reserve.app as app_module
+
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    state_path = tmp_path / 'task.json'
+    saved = json.loads(state_path.read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+    saved['retry_at'] = 0
+    saved.pop('step_failure_since', None)
+    saved.pop('query_failure_since', None)
+    state_path.write_text(json.dumps(saved))
+
+    seed_opening_selection(tmp_path, start='2026-10-18T12:00:10+08:00')
+    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
+    monkeypatch.setattr(app_module, 'new_history_poller', FakeHistoryPoller)
+    FakePoller.instances.clear()
+    FakePoller.rows_override = None
+    FakePoller.at_offset = 0.0
+    FakePoller.next_error = None
+    FakePoller.next_wake_once = False
+    FakePoller.error_retry_after = 0.0
+    FakePoller.error_server_directed = False
+    FakeHistoryPoller.rows = []
+    FakeHistoryPoller.error = None
+    FakeHistoryPoller.retry_after = 0.0
+    FakeHistoryPoller.server_directed = False
+    activities = [native_activity('two', opens='2026-10-18 12:00:10')]
+    school = School()
+    school.activities = list(activities)
+    school.mine = []
+    FakePoller.next_rows = list(activities)
+    now = [moment('2026-10-18 12:00:00').timestamp()]
+    def clock():
+        return now[0]
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        now[0] += max(seconds, 0.0)
+        if len(waits) == 2:
+            # Two valid checks are persisted; while the scan pauses the background list
+            # reader learns a server-directed wait.
+            FakePoller.instances[-1].error = 'RemoteError'
+            FakePoller.error_retry_after = 120.0
+            FakePoller.error_server_directed = True
+            return
+        if len(waits) >= 3:
+            raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=clock, sleep=stop, background_poller=True,
+                   settings=Settings(state_dir=tmp_path, prewarm=False,
+                                     captcha_prefetch=False)) == 130
+
+    saved = json.loads(state_path.read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+    assert saved.get('pending_checks', 0) == 0
+    assert 'event=reservation_unconfirmed_released' not in (tmp_path / 'events.log').read_text()

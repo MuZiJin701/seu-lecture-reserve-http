@@ -102,6 +102,25 @@ def progress(rows: list[dict[str, Any]], now: float) -> Progress:
     return result
 
 
+def conflicting_records(rows: list[dict[str, Any]]) -> bool:
+    """Whether one activity ID appears in two different records.
+
+    ``progress`` raises ``attendance_record_conflict`` for this condition. Callers that read
+    rows without going through ``progress`` (a pending-submission check, for example) must
+    apply the same rule: contradictory records cannot be success or absence evidence.
+    """
+    seen: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        try:
+            wid = activity_id(row)
+        except ValueError:
+            continue
+        if wid in seen and seen[wid] != row:
+            return True
+        seen[wid] = row
+    return False
+
+
 def activity_id(row: dict[str, Any]) -> str:
     value = row.get('HD_WID', row.get('WID'))
     if not isinstance(value, str) or not value or len(value) > 512:

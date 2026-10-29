@@ -64,6 +64,86 @@ def test_campus_rejected_credentials_do_not_fall_back_to_vpn():
                    for _, url, _ in school.requests)
 
 
+class CampusDirectUnavailable(CampusSchool):
+    def __init__(self):
+        super().__init__()
+        self.login_redirects = 0
+
+    def request(self, method, url, **kwargs):
+        if urlsplit(url).path.endswith('loginRedirect'):
+            self.login_redirects += 1
+            if self.login_redirects == 1:
+                self.requests.append((method, url, kwargs))
+                response = requests.Response()
+                response.url = url
+                response.status_code = 200
+                response._content = b'<html>not the application</html>'
+                return response
+        return super().request(method, url, **kwargs)
+
+
+def test_campus_direct_failure_falls_back_to_gateway(tmp_path):
+    school = CampusDirectUnavailable()
+    assert execute(school, tmp_path, check_only=True) == 0
+    assert school.login_redirects >= 2
+    assert any(urlsplit(url).hostname == 'vpn.seu.edu.cn'
+               for _, url, _ in school.requests)
+
+
+class CampusNoService(School):
+    def request(self, method, url, **kwargs):
+        if method == 'GET' and urlsplit(url).path.endswith('index.do') and not self.authenticated:
+            self.requests.append((method, url, kwargs))
+            response = requests.Response()
+            response.url = url
+            response.status_code = 302
+            response.headers['Location'] = 'https://auth.seu.edu.cn/dist/#/dist/main/login'
+            return response
+        return super().request(method, url, **kwargs)
+
+
+def test_campus_missing_service_falls_back_to_gateway(tmp_path):
+    school = CampusNoService()
+    assert execute(school, tmp_path, check_only=True) == 0
+    assert any(urlsplit(url).hostname == 'vpn.seu.edu.cn'
+               for _, url, _ in school.requests)
+
+
+class CampusSmsSendFails(CampusSchool):
+    def __init__(self):
+        super().__init__(sms=True)
+        self.send_attempts = 0
+
+    def request(self, method, url, **kwargs):
+        if urlsplit(url).path.endswith('sendStage2Code'):
+            self.send_attempts += 1
+            response = requests.Response()
+            response.url = url
+            response.status_code = 200
+            response._content = json.dumps({'code': 500}).encode()
+            return response
+        return super().request(method, url, **kwargs)
+
+
+def test_sms_send_failure_limits_immediate_resends():
+    school = CampusSmsSendFails()
+    answers = iter(['send', '', 'send', '', '654321'])
+    labels = []
+
+    def prompt(label):
+        labels.append(label)
+        return next(answers, '654321')
+
+    events = []
+    client = Client(school, {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
+                    prompt, events.append)
+    client.authenticate()
+    assert school.send_attempts == 1
+    assert any('短信发送失败' in label for label in labels)
+    assert any('等待约' in label for label in labels)
+    assert 'sms_send_failed' in events
+
+
 def test_new_background_history_replaces_a_still_cached_history(tmp_path, monkeypatch):
     seed_opening_selection(tmp_path)
     monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)

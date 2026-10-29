@@ -35,6 +35,8 @@ HOSTS = {'auth.seu.edu.cn', 'vpn.seu.edu.cn', 'ehall.seu.edu.cn'}
 # Read bodies in large chunks and bound each blocking read by the remaining request budget:
 # one-byte iteration made every response byte pass through Python code and timing checks.
 RESPONSE_CHUNK_SIZE = 65536
+# The school rejects too-frequent SMS sends; after a failure, block local resends for this long.
+SMS_RESEND_DELAY = 60.0
 
 
 class _DeadlineSocket:
@@ -596,6 +598,7 @@ class Client:
         if not username or not password:
             raise AuthenticationRejected('credentials_missing')
         code = ''
+        send_retry_at = 0.0
         while True:
             captcha = self.payload(self.request('GET', CAS + 'needCaptcha'))
             if not has_code(captcha, 200):
@@ -631,9 +634,17 @@ class Client:
             while True:
                 answer = self.prompt('需要短信认证；输入 send 发送/重发短信，或输入六位验证码（Ctrl+C 停止）：').strip()
                 if answer == 'send':
+                    now = time.monotonic()
+                    if now < send_retry_at:
+                        wait = max(1, math.ceil(send_retry_at - now))
+                        self.prompt(f'短信发送被学校拒绝或过于频繁，请等待约 {wait} 秒后再输入 send'
+                                    '（Ctrl+C 停止）：')
+                        continue
                     sent = self.cas('sendStage2Code', {'userId': username})
                     if not has_code(sent, 200):
                         self.notify('sms_send_failed')
+                        send_retry_at = time.monotonic() + SMS_RESEND_DELAY
+                        self.prompt('短信发送失败，可能请求过于频繁；请稍后输入 send 重试（Ctrl+C 停止）：')
                 elif re.fullmatch(r'\d{6}', answer):
                     code = answer
                     break
@@ -657,14 +668,29 @@ class Client:
         if urlsplit(app.url).hostname == 'ehall.seu.edu.cn' and 'indexjsp.js' in app.text:
             return
         if urlsplit(app.url).hostname == 'auth.seu.edu.cn':
-            service = self.service(app.url)
-            if urlsplit(service).hostname == 'ehall.seu.edu.cn':
+            service: str | None = None
+            try:
+                service = self.service(app.url)
+            except RemoteError as exc:
+                if str(exc) != 'cas_service_missing':
+                    raise
+            if service is not None and urlsplit(service).hostname == 'ehall.seu.edu.cn':
                 # Campus access goes straight to the application's CAS service, without VPN.
-                result = self.login(service)
-                app = self.get(CAS + 'loginRedirect?redirectUrl=' + result['redirectUrl'])
-                if urlsplit(app.url).hostname == 'ehall.seu.edu.cn' and 'indexjsp.js' in app.text:
-                    return
-                raise RemoteError('application_unavailable')
+                try:
+                    result = self.login(service)
+                    app = self.get(CAS + 'loginRedirect?redirectUrl=' + result['redirectUrl'])
+                    if urlsplit(app.url).hostname == 'ehall.seu.edu.cn' and 'indexjsp.js' in app.text:
+                        return
+                    raise RemoteError('application_unavailable')
+                except RemoteError as exc:
+                    if str(exc) != 'application_unavailable':
+                        raise
+                    # The campus route is unavailable (for example after a network change):
+                    # fall back to the existing gateway flow. Credential and challenge failures
+                    # are not routing failures, so they still propagate.
+                    self.notify('campus_login_fallback')
+            elif service is None:
+                self.notify('campus_login_fallback')
         config_url = GATEWAY + '/passport/v1/public/authConfig'
         self.payload(self.request('GET', config_url, params={**API_PARAMS, 'mod': 1, 'needTicket': 1}))
         auth_page = self.get(GATEWAY + '/passport/v1/public/casLogin?sfDomain=CAS-auth')

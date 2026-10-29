@@ -3176,3 +3176,54 @@ def test_scan_level_server_wait_restarts_the_saved_pending_check_count(tmp_path,
     assert saved['status'] == 'pending' and saved['activity'] == 'one'
     assert saved.get('pending_checks', 0) == 0
     assert 'event=reservation_unconfirmed_released' not in (tmp_path / 'events.log').read_text()
+
+
+def test_resolve_pending_refuses_conflicting_history(tmp_path):
+    school = School()
+    assert execute(school, tmp_path) == 130
+    path = tmp_path / 'task.json'
+    saved = json.loads(path.read_text())
+    now = moment('2026-10-18 12:00:00').timestamp()
+    hold = dict(start=now + 3600, end=now + 7200, since=now, until=now + 600,
+                attempts=0, confirmed=False)
+    saved.update(status='pending', activity='one', holds={'one': hold},
+                 pending_start=now + 3600, pending_end=now + 7200,
+                 pending_since=now, pending_checks=2)
+    path.write_text(json.dumps(saved))
+
+    school.mine = [{**lecture(), 'HD_WID': 'one', 'YYZT': '已预约'},
+                   {**lecture(), 'HD_WID': 'one', 'YYZT': '已取消'}]
+    asked = []
+    def prompt(question):
+        asked.append(question)
+        return 'confirm'
+    assert resolve_pending(Settings(state_dir=tmp_path), session=school,
+                           environ={'SEU_USERNAME': 'test-user'}, prompt=prompt) == 1
+
+    saved = json.loads(path.read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+    assert saved['holds']['one'] == hold
+    assert asked == []
+    events = (tmp_path / 'events.log').read_text()
+    assert 'event=pending_confirmed' not in events
+    assert 'event=pending_check_failed' in events
+
+
+def test_conflicting_history_does_not_confirm_an_unconfirmed_hold(tmp_path):
+    school = School()
+    assert execute(school, tmp_path) == 130
+    path = tmp_path / 'task.json'
+    saved = json.loads(path.read_text())
+    now = moment('2026-10-18 12:00:00').timestamp()
+    hold = dict(start=now + 3600, end=now + 7200, since=now, until=now + 600,
+                attempts=1, confirmed=False)
+    saved['holds'] = {'one': hold}
+    path.write_text(json.dumps(saved))
+
+    school.mine = [{**lecture(), 'HD_WID': 'one', 'YYZT': '已预约'},
+                   {**lecture(), 'HD_WID': 'one', 'YYZT': '已取消'}]
+    assert execute(school, tmp_path) == 130
+
+    saved = json.loads(path.read_text())
+    assert saved['holds']['one'] == hold
+    assert 'event=reservation_succeeded' not in (tmp_path / 'events.log').read_text()

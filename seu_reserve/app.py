@@ -423,6 +423,11 @@ def resolve_pending(settings: Settings, *, session: Any = None,
         try:
             client.authenticate()
             history = client.mine()
+            if conflicting_records(history):
+                # Contradictory records cannot confirm the submission; keep the pending state
+                # and make the operator inspect the school record again.
+                _state_event(settings, 'pending_check_failed')
+                return 1
             booked = {activity_id(row) for row in history if reserved(row)}
         except (RemoteError, ValueError):
             _state_event(settings, 'pending_check_failed')
@@ -1747,6 +1752,10 @@ def run(settings: Settings, *, session: Any = None,
                     mine_seconds = max(0, clock() - mine_started)
                     refresh_mine = True
                 assert history is not None
+                if conflicting_records(history):
+                    # Contradictory duplicates must not confirm an unconfirmed hold before the
+                    # normal progress validation runs; abort instead of acting on either row.
+                    raise ValueError('attendance_record_conflict')
                 if hold_entries():
                     booked_wids: set[str] = set()
                     for row in history:

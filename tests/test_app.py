@@ -3227,3 +3227,29 @@ def test_conflicting_history_does_not_confirm_an_unconfirmed_hold(tmp_path):
     saved = json.loads(path.read_text())
     assert saved['holds']['one'] == hold
     assert 'event=reservation_succeeded' not in (tmp_path / 'events.log').read_text()
+
+
+def test_conflicting_activity_list_does_not_confirm_an_unconfirmed_hold(tmp_path):
+    from test_activities import activity
+    school = School()
+    assert execute(school, tmp_path) == 130
+    path = tmp_path / 'task.json'
+    saved = json.loads(path.read_text())
+    now = moment('2026-10-18 12:00:00').timestamp()
+    hold = dict(start=now + 3600, end=now + 7200, since=now, until=now + 600,
+                attempts=1, confirmed=False)
+    saved['holds'] = {'one': hold}
+    path.write_text(json.dumps(saved))
+
+    # The list shows the held activity as both reserved and open: neither row is evidence.
+    school.mine = []
+    window = dict(YYKSSJ='2026-10-18 12:00:00', YYJSSJ='2026-10-18 13:00:00')
+    school.activities = [activity('one', YY_WID='reservation-id', **window),
+                         activity('one', **window)]
+    assert execute(school, tmp_path) == 130
+
+    saved = json.loads(path.read_text())
+    assert saved['holds']['one'] == hold
+    events = (tmp_path / 'events.log').read_text()
+    assert 'event=reservation_succeeded' not in events
+    assert 'event=reservation_hold_confirmed' not in events

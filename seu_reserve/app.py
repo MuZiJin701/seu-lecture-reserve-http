@@ -1704,6 +1704,10 @@ def run(settings: Settings, *, session: Any = None,
                         task.data['cooldowns'] = fresh
                         task.save()
                 if task.data['status'] != 'pending' and hold_entries():
+                    if conflicting_records(rows):
+                        # A contradictory list cannot confirm a hold before the normal
+                        # candidate validation runs; abort instead of trusting either row.
+                        raise RemoteError('activity_schema_unknown')
                     for held_wid, held_entry in list(hold_entries().items()):
                         for row in rows:
                             try:

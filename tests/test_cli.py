@@ -170,12 +170,15 @@ def test_opening_speed_switches_default_on_and_can_be_disabled(tmp_path):
     assert defaults.prewarm is True
     assert defaults.captcha_prefetch is True
     assert defaults.poller_align is False
+    assert defaults.history_background is True
     config = tmp_path / '.env'
-    config.write_text('SEU_PREWARM=false\nSEU_CAPTCHA_PREFETCH=false\nSEU_POLLER_ALIGN=true\n')
+    config.write_text('SEU_PREWARM=false\nSEU_CAPTCHA_PREFETCH=false\n'
+                      'SEU_POLLER_ALIGN=true\nSEU_HISTORY_BACKGROUND=false\n')
     settings, _ = configuration_from(config, {})
     assert settings.prewarm is False
     assert settings.captcha_prefetch is False
     assert settings.poller_align is True
+    assert settings.history_background is False
     assert configuration_from(config, {'SEU_PREWARM': 'true'})[0].prewarm is True
 
 

@@ -51,7 +51,7 @@ def instant_poller(error, retry_after, *, server_directed):
     """Deterministic stand-in for a poller whose first query already failed."""
 
     class Instant:
-        def __init__(self, query, *, interval, clock):
+        def __init__(self, query, *, interval, clock, **_kwargs):
             self._snapshot = Snapshot(rows=[], at=clock(), error=error,
                                       retry_after=retry_after, failed_at=clock(),
                                       server_directed=server_directed)
@@ -148,7 +148,7 @@ def test_poller_wait_is_rechecked_before_captcha_and_submit(tmp_path, monkeypatc
     class FirstFailsThenSucceeds:
         running = False
 
-        def __init__(self, query, *, interval, clock):
+        def __init__(self, query, *, interval, clock, **_kwargs):
             self._failed = not poller_instances
             poller_instances.append(self)
             self._failed_at = now[0]

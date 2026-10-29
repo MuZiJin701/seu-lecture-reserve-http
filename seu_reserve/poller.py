@@ -24,6 +24,10 @@ class Snapshot:
     # back to a synchronous query.
     failed_at: float = 0.0
     server_directed: bool = False
+    # When the query that produced this snapshot started, and how long it took. Callers can then
+    # tell data age (from request start) apart from snapshot age (from response completion).
+    started: float = 0.0
+    seconds: float = 0.0
 
 
 def server_directed_error(exc: BaseException) -> bool:
@@ -33,12 +37,52 @@ def server_directed_error(exc: BaseException) -> bool:
             or getattr(exc, 'args', ())[:1] == ('server_backoff',))
 
 
+# A server-directed error without an explicit Retry-After still asks for a pause: the scan loop
+# starts its bounded short backoff at one second, so reader threads use the same floor.
+SERVER_WAIT_FLOOR = 1.0
+
+
+class WaitGate:
+    """Shared server-directed wait deadline for the read-only query threads.
+
+    Only the deadline is protected by the lock; network requests never hold it. A thread that
+    receives a 429/Retry-After updates the gate immediately, so every other thread checks the
+    same deadline before its next request instead of waiting for the scan loop to notice.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._until = 0.0
+
+    def remaining(self) -> float:
+        with self._lock:
+            return max(0.0, self._until - self._clock())
+
+    def deadline(self) -> float:
+        with self._lock:
+            return self._until
+
+    def record(self, seconds: float, *, since: float | None = None) -> None:
+        """Extend the shared wait by ``seconds`` counted from ``since`` (default: now)."""
+        if seconds <= 0:
+            return
+        based_at = self._clock() if since is None else since
+        self.record_until(based_at + seconds)
+
+    def record_until(self, until: float) -> None:
+        with self._lock:
+            self._until = max(self._until, until)
+
+
 class ActivityPoller:
     def __init__(self, query: Callable[[], list[dict[str, Any]]], *,
-                 interval: float, clock: Callable[[], float] = time.monotonic):
+                 interval: float, clock: Callable[[], float] = time.monotonic,
+                 gate: WaitGate | None = None):
         self._query = query
         self._interval = interval
         self._clock = clock
+        self._gate = gate
         self._lock = threading.Lock()
         self._snapshot: Snapshot | None = None
         self._stop = threading.Event()
@@ -114,6 +158,12 @@ class ActivityPoller:
             rows = self._query()
         except Exception as exc:
             retry_after = float(getattr(exc, 'retry_after', 0) or 0)
+            failed_at = self._clock()
+            server_directed = server_directed_error(exc)
+            if self._gate is not None and server_directed:
+                # Tell every reader immediately, not only after the scan loop reads this snapshot.
+                self._gate.record(retry_after if retry_after > 0 else SERVER_WAIT_FLOOR,
+                                  since=failed_at)
             with self._lock:
                 previous = self._snapshot
                 self._snapshot = Snapshot(
@@ -121,13 +171,15 @@ class ActivityPoller:
                     at=previous.at if previous is not None else started,
                     error=type(exc).__name__,
                     retry_after=retry_after,
-                    failed_at=self._clock(),
-                    server_directed=server_directed_error(exc))
+                    failed_at=failed_at,
+                    server_directed=server_directed)
                 self._polls += 1
             self._updated.set()
             return False
         with self._lock:
-            self._snapshot = Snapshot(rows=rows, at=self._clock())
+            finished = self._clock()
+            self._snapshot = Snapshot(rows=rows, at=finished, started=started,
+                                      seconds=max(0.0, finished - started))
             self._polls += 1
         self._updated.set()
         return True
@@ -150,6 +202,11 @@ class ActivityPoller:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            # Check the shared deadline immediately before each request. The gate is updated by
+            # whichever thread received the 429, so the other reader stops even while the scan
+            # loop is blocked in a captcha or submission request.
+            if self._gate is not None and self._gate.remaining() > 0:
+                return
             started = self._clock()
             if not self.poll_once():
                 return

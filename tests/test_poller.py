@@ -1,7 +1,7 @@
 import threading
 import time
 
-from seu_reserve.poller import ActivityPoller
+from seu_reserve.poller import ActivityPoller, WaitGate
 
 
 def test_poll_once_stores_rows_and_timestamp():
@@ -253,3 +253,60 @@ def test_snapshot_with_version_returns_a_consistent_pair():
     # Rows from poll N and version N are published under the same lock, so a reader can never
     # mark a version consumed while holding older rows.
     assert all(row == version for row, version in pairs)
+
+def test_wait_gate_is_updated_by_the_limited_thread_immediately():
+    class Limited(Exception):
+        retry_after = 120.0
+        http_status = 429
+
+    gate = WaitGate(time.monotonic)
+    poller = ActivityPoller(lambda: (_ for _ in ()).throw(Limited()), interval=0.01,
+                            clock=time.monotonic, gate=gate)
+    started = time.monotonic()
+    assert poller.poll_once() is False
+    assert gate.remaining() > 100.0
+    assert time.monotonic() - started < 1.0
+
+
+def test_wait_gate_stops_the_sibling_thread_before_its_next_request():
+    first_started = threading.Event()
+    sibling_calls = []
+
+    class Limited(Exception):
+        retry_after = 120.0
+        http_status = 429
+
+    def limited():
+        first_started.set()
+        raise Limited('slow down')
+
+    gate = WaitGate(time.monotonic)
+    limited_poller = ActivityPoller(limited, interval=0.01, clock=time.monotonic, gate=gate)
+    limited_poller.start()
+    assert first_started.wait(2.0)
+    deadline = time.monotonic() + 2.0
+    while gate.remaining() <= 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert gate.remaining() > 100.0
+
+    sibling = ActivityPoller(lambda: sibling_calls.append('one') or [], interval=0.01,
+                             clock=time.monotonic, gate=gate)
+    sibling.start()
+    time.sleep(0.1)
+    try:
+        assert not sibling.running
+        assert sibling_calls == []
+    finally:
+        limited_poller.stop()
+        sibling.stop()
+
+
+def test_rate_limit_without_retry_after_also_updates_the_gate():
+    class Limited(Exception):
+        http_status = 429
+
+    gate = WaitGate(lambda: 50.0)
+    poller = ActivityPoller(lambda: (_ for _ in ()).throw(Limited()), interval=0.01,
+                            clock=lambda: 50.0, gate=gate)
+    assert poller.poll_once() is False
+    assert gate.remaining() > 0.5

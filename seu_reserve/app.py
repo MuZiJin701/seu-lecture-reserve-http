@@ -19,7 +19,7 @@ from .model import (COFFEE_CATEGORY, GOAL_CATEGORIES, Lecture, Progress, REQUIRE
                     activity_id, category_name, interval, moment, progress, reserved,
                     test_notice)
 from .mail import Mailer, mail_failure_reason, mail_history
-from .poller import ActivityPoller
+from .poller import ActivityPoller, WaitGate
 from .state import Task, open_nofollow
 
 DEFAULT_CATEGORIES = GOAL_CATEGORIES + (COFFEE_CATEGORY,)
@@ -57,6 +57,18 @@ OPENING_HISTORY_TTL = 60.0
 # A background read-only activity list fetched by the poller is used only while this fresh; a
 # stale snapshot falls back to a normal synchronous query.
 POLLER_SNAPSHOT_MAX_AGE = 0.75
+# A stale snapshot with a poll in flight is usually about to be replaced: wait briefly for that
+# poll instead of racing it with a duplicate synchronous list query.
+POLLER_FALLBACK_WAIT = 0.3
+# Background refresh of "my activities" during opening windows: keeps the history cache fresh so a
+# slow history query never sits between a candidate appearing and its submission. The main loop
+# only consumes a snapshot that is recent and error-free; a failed refresh simply ages out and the
+# existing synchronous path (with its pause-on-unreliable rule) takes over.
+HISTORY_REFRESH_INTERVAL = 20.0
+HISTORY_BACKGROUND_FRESH = 30.0
+# When the school-clock estimate is this uncertain, prewarm/prefetch are skipped: timing them from
+# an early/deadline guess is not safe, and the normal in-scan captcha fetch still works.
+PREPARATION_MAX_UNCERTAINTY = 2.0
 # After a poller failure, do not recreate it for at least this long (server Retry-After wins).
 POLLER_RETRY_MIN_SECONDS = 5.0
 # 502/503/504 mean the server is overloaded, not that a rate limit is in force; recover in seconds.
@@ -102,6 +114,13 @@ def short_backoff(failures: int) -> float:
     return min(OVERLOAD_RETRY_CAP, 2.0 ** min(max(failures - 1, 0), 3))
 
 
+def new_history_poller(query: Callable[[], list[dict[str, Any]]], *,
+                       interval: float, clock: Callable[[], float],
+                       gate: WaitGate | None = None) -> ActivityPoller:
+    """Build the background "my activities" refresher (injectable for offline tests)."""
+    return ActivityPoller(query, interval=interval, clock=clock, gate=gate)
+
+
 def terminal_prompt(label: str) -> str:
     if not sys.stdin.isatty():
         print('event=interactive_terminal_required', flush=True)
@@ -125,6 +144,9 @@ class Settings:
     # Aligning a poller poll to the exact opening instant depends on the school-clock offset, which
     # carries up to a second of truncation/request-latency error; off by default until measured.
     poller_align: bool = False
+    # Background "my activities" refresh during opening windows; can be disabled to keep the
+    # request count minimal and fall back to the older synchronous history refresh.
+    history_background: bool = True
 
 def server_wait_error(exc: BaseException) -> bool:
     """True when the school explicitly asked us to wait before another request."""
@@ -162,6 +184,40 @@ def progress_rows(history: list[dict[str, Any]], holds: Mapping[str, Any] | None
                      'JSSJ': end.strftime('%Y-%m-%d %H:%M:%S'),
                      'SFDK': '0', 'SFWY': '0'})
     return rows
+
+
+# Structural errors that make a background "my activities" snapshot unusable. Semantic states
+# (attendance pending/unknown, record conflict, unknown category) are not format errors: the
+# synchronous query reports the same condition and pausing is the correct behaviour there.
+HISTORY_ROW_FORMAT_ERRORS = frozenset({
+    'activity_id_missing', 'publication_status_unknown', 'reservation_status_unknown',
+    'time_missing', 'time_invalid', 'interval_invalid'})
+
+
+def background_history_usable(rows: list[dict[str, Any]], now: float) -> str | None:
+    """Return the structural error reason when the background snapshot must be retried.
+
+    A malformed background snapshot used to be accepted and only fail later in ``progress`` or
+    in the conflict check, which turned one bad row into a scan-level backoff. Validate it the
+    same way the scan will use it, and fall back to the synchronous history query in the same
+    scan instead.
+    """
+    # Conflict protection needs a parseable interval for every existing reservation, including
+    # salons and notices that progress() skips when counting goal progress.
+    for row in rows:
+        try:
+            activity_id(row)
+            if reserved(row):
+                interval(row)
+        except ValueError as exc:
+            return str(exc)
+    try:
+        progress(rows, now)
+    except ValueError as exc:
+        reason = str(exc)
+        if reason in HISTORY_ROW_FORMAT_ERRORS:
+            return reason
+    return None
 
 
 def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: Progress,
@@ -309,6 +365,25 @@ def school_clock_known(rows: list[dict[str, Any]], now: float) -> bool:
     return _school_offset(rows, now) is not None
 
 
+def school_clock_uncertainty(snapshot_age: float, request_seconds: float = 0.0) -> float:
+    """Conservative lateness of a school-clock based local opening estimate.
+
+    The school timestamp is second-truncated (up to one second), the snapshot is consumed later
+    than it was produced, and a slow list request delays when the reading takes effect, so the
+    naive ``start - offset`` can be later than the true opening by the truncation fraction plus
+    the snapshot age plus the request duration. There is deliberately no small hard cap here: the
+    caller skips preparation when the uncertainty is too large to time it safely.
+    """
+    return 1.1 + max(0.0, snapshot_age) + max(0.0, request_seconds)
+
+
+def earliest_opening_local(start: float, offset: float, margin: float,
+                           previous: float | None = None) -> float:
+    """Earliest plausible local opening time; recomputation may only move it earlier."""
+    candidate = start - offset - margin
+    return candidate if previous is None else min(previous, candidate)
+
+
 def _state_event(settings: Settings, event: str) -> None:
     print('event=' + event, flush=True)
     try:
@@ -402,10 +477,21 @@ def run(settings: Settings, *, session: Any = None,
     # Completed-poll version consumed by the last list read: the opening wait only wakes for
     # polls newer than this.
     consumed_polls = 0
+    # Local time the last consumed list request started, for candidate data-age metrics.
+    last_rows_started = 0.0
     # An absolute deadline copied from a server-directed poller error. The scan loop checks it
     # before falling back to a synchronous query, so the background and foreground requests
     # share one server-requested pause.
     poller_wait_until = 0.0
+    # Shared server-directed wait deadline for both read-only query threads and the scan loop.
+    # A thread that gets 429/Retry-After updates it immediately, so the other thread stops before
+    # its next request even when the main thread is blocked in captcha/submission.
+    wait_gate = WaitGate(clock)
+    # Optional background "my activities" refresher; separate thread and session so a slow history
+    # query never blocks the candidate-to-submit path during an opening.
+    history_poller: ActivityPoller | None = None
+    history_client: Client | None = None
+    history_retry_at = 0.0
 
     def stop_poller() -> None:
         nonlocal activity_poller, poller_client
@@ -419,9 +505,22 @@ def run(settings: Settings, *, session: Any = None,
                 close()
             poller_client = None
 
+    def stop_history_poller() -> None:
+        """Stop the background history refresher and close its own session."""
+        nonlocal history_poller, history_client
+        poller = history_poller
+        if poller is not None:
+            poller.stop()
+        history_poller = None
+        if history_client is not None:
+            close = getattr(getattr(history_client, 'session', None), 'close', None)
+            if callable(close):
+                close()
+            history_client = None
+
     def absorb_poller_wait() -> None:
         """Copy a server-directed wait from a failed poller into the scan loop's deadline."""
-        nonlocal poller_wait_until
+        nonlocal poller_wait_until, poller_retry_at
         poller = activity_poller
         snapshot = poller.snapshot() if poller is not None else None
         if snapshot is None or snapshot.error is None or not snapshot.server_directed:
@@ -429,11 +528,43 @@ def run(settings: Settings, *, session: Any = None,
         wait = snapshot.retry_after if snapshot.retry_after > 0 else short_backoff(1)
         based_at = snapshot.failed_at if snapshot.failed_at > 0 else clock()
         poller_wait_until = max(poller_wait_until, based_at + wait)
+        poller_retry_at = max(poller_retry_at, poller_wait_until)
+        # Mirror the wait into the thread-shared gate as well (real pollers already record it
+        # from their own error path; this also covers injected/test pollers and older snapshots).
+        wait_gate.record_until(poller_wait_until)
+
+    def absorb_history_wait() -> None:
+        """A server-directed wait from the history refresher constrains all requests too."""
+        nonlocal poller_wait_until, history_retry_at
+        poller = history_poller
+        snapshot = poller.snapshot() if poller is not None else None
+        if snapshot is None or snapshot.error is None or not snapshot.server_directed:
+            return
+        wait = snapshot.retry_after if snapshot.retry_after > 0 else short_backoff(1)
+        based_at = snapshot.failed_at if snapshot.failed_at > 0 else clock()
+        poller_wait_until = max(poller_wait_until, based_at + wait)
+        history_retry_at = max(history_retry_at, poller_wait_until)
+        wait_gate.record_until(poller_wait_until)
+
+    def shared_wait_pending() -> bool:
+        """Absorb both readers' waits and report whether a server-directed pause is active."""
+        absorb_poller_wait()
+        absorb_history_wait()
+        return wait_gate.remaining() > 0
 
     def poller_wait_error() -> None:
-        """Abort before a new request while the background poller's server wait is pending."""
-        absorb_poller_wait()
-        remaining = poller_wait_until - clock()
+        """Abort before a new request while any background reader's server wait is pending.
+
+        Both read-only threads share one server-requested pause: a 429/Retry-After seen by the
+        history refresher must stop captcha/submission just like one seen by the list poller.
+        Checking at the call site also stops both readers, because a wait learned after the last
+        scan checkpoint would otherwise let the other thread keep polling inside the pause.
+        """
+        if not shared_wait_pending():
+            return
+        stop_poller()
+        stop_history_poller()
+        remaining = max(wait_gate.remaining(), poller_wait_until - clock())
         if remaining > 0:
             raise RemoteError('server_backoff', remaining, http_status=429)
 
@@ -472,7 +603,10 @@ def run(settings: Settings, *, session: Any = None,
         health_dirty = True
         urgent = ('last_error' in changes or 'last_error_at' in changes
                   or 'mail_status' in changes or 'last_mail_status' in changes
-                  or snapshot['phase'] in HEALTH_URGENT_PHASES)
+                  # A phase is urgent when first entered, not on every repeated call in it:
+                  # the candidate path calls it several times before submitting.
+                  or (snapshot['phase'] in HEALTH_URGENT_PHASES
+                      and snapshot['phase'] != health_written_phase))
         if urgent or clock() - health_written_at >= HEALTH_WRITE_INTERVAL:
             write_health()
     def flush_health(force: bool = False) -> None:
@@ -482,6 +616,13 @@ def run(settings: Settings, *, session: Any = None,
         if (force or snapshot['phase'] != health_written_phase
                 or clock() - health_written_at >= HEALTH_WRITE_INTERVAL):
             write_health()
+    def set_health(**changes: Any) -> None:
+        """Update the in-memory snapshot without a write; the next explicit save persists it."""
+        nonlocal health_dirty
+        snapshot.update(changes, updated_at=clock())
+        if task is not None:
+            task.data['health'] = dict(snapshot)
+            health_dirty = True
     def record(event: str) -> None:
         print(('' if check_only else f'{clock():.0f} ') + 'event=' + event, flush=True)
         if check_only:
@@ -802,15 +943,24 @@ def run(settings: Settings, *, session: Any = None,
         last_timing_at = 0.0
         server_offset = 0.0
         offset_known = False
+        # Conservative error of the school-clock estimate: the school timestamp is truncated to a
+        # whole second and is computed after the response arrives, so the true opening can be up
+        # to this much earlier than ``start - server_offset``. Preparation uses the earliest
+        # plausible time, never a later one.
+        school_clock_margin = 0.0
         history: list[dict[str, Any]] | None = None
         mine_at = 0.0
         mine_seconds = 0.0
         refresh_mine = False
         progress_probe_attempted = False
 
-        def pause_poller() -> None:
-            """Stop background polling after an error and keep a short restart cooldown."""
-            nonlocal poller_retry_at, poller_allowed
+        def pause_query_threads() -> None:
+            """Stop both background readers after an error and keep a shared restart cooldown.
+
+            The history refresher must not keep querying while the scan loop honours a backoff or
+            a server-directed wait; both threads restart only after their own cooldown.
+            """
+            nonlocal poller_retry_at, poller_allowed, history_retry_at
             poller_allowed = False
             poller = activity_poller
             if poller is not None:
@@ -821,12 +971,26 @@ def run(settings: Settings, *, session: Any = None,
                         clock() + max(POLLER_RETRY_MIN_SECONDS, snapshot.retry_after))
                     absorb_poller_wait()
             stop_poller()
+            history = history_poller
+            cooldown = POLLER_RETRY_MIN_SECONDS
+            if history is not None:
+                snapshot = history.snapshot()
+                if snapshot is not None and snapshot.error is not None:
+                    cooldown = max(cooldown, snapshot.retry_after)
+                    absorb_history_wait()
+            history_retry_at = max(history_retry_at, clock() + cooldown)
+            # Neither reader may restart before the longest server-directed wait expires.
+            poller_retry_at = max(poller_retry_at, poller_wait_until)
+            history_retry_at = max(history_retry_at, poller_wait_until)
+            stop_history_poller()
 
         # Preparation state is keyed by the school opening timestamp (stable across scans), not by
         # the locally adjusted time: the school-clock offset is re-estimated from a second-
         # truncated field and jitters, so a local key would repeat preparation for one opening.
         scheduled_openings: dict[float, float] = {}
+        scheduled_margins: dict[float, float] = {}
         calibrated_openings: set[float] = set()
+        preparation_skipped: set[float] = set()
 
         def next_opening() -> tuple[float, float] | None:
             """Earliest opening that has not started yet (school clock basis).
@@ -840,21 +1004,25 @@ def run(settings: Settings, *, session: Any = None,
             return min(future) if future else None
 
         def opening_local_estimate(start: float) -> float:
-            """Local-clock estimate of one opening, fixed on first sight so it cannot drift.
+            """Earliest plausible local time of one opening, fixed on first sight.
 
-            The one allowed correction is the first time the school clock becomes known: an
-            estimate made before calibration may be off by the whole local/school offset.
+            The school timestamp is second-truncated and read after the response arrives, so
+            ``start - server_offset`` can be later than the true opening; subtracting a margin
+            turns that systematic error into an earlier (safe) preparation deadline. The
+            estimate may be recomputed only when the school clock first becomes known or when
+            the measured margin grows, never later than a prior estimate.
             """
-            local = scheduled_openings.get(start)
-            if local is None:
-                local = start - server_offset
-                scheduled_openings[start] = local
-            elif offset_known and start not in calibrated_openings:
-                local = start - server_offset
-                scheduled_openings[start] = local
+            margin = school_clock_margin if offset_known else 0.0
+            previous = scheduled_openings.get(start)
+            previous_margin = scheduled_margins.get(start, -1.0)
+            if previous is None or (offset_known and (
+                    start not in calibrated_openings or margin > previous_margin + 0.05)):
+                previous = earliest_opening_local(start, server_offset, margin, previous)
+                scheduled_openings[start] = previous
+                scheduled_margins[start] = margin
             if offset_known:
                 calibrated_openings.add(start)
-            return local
+            return previous
 
         def align_poller() -> None:
             """Ask the poller to place one poll right on the next opening instant.
@@ -865,6 +1033,8 @@ def run(settings: Settings, *, session: Any = None,
             """
             if not settings.poller_align:
                 return
+            if offset_known and school_clock_margin > PREPARATION_MAX_UNCERTAINTY:
+                return
             poller = activity_poller
             align = getattr(poller, 'align_at', None)
             if poller is None or align is None:
@@ -872,9 +1042,23 @@ def run(settings: Settings, *, session: Any = None,
             opening = next_opening()
             align(None if opening is None else opening_local_estimate(opening[0]))
 
+        def background_client() -> Client:
+            """Clone the main session for a read-only thread with the opening query budget.
+
+            The main session may already be on the 8 s submit budget when the list poller first
+            starts; copying that would leave the background reader with a slower timeout forever.
+            """
+            clone = client.clone_readonly()
+            clone.timeout = OPENING_QUERY_TIMEOUT
+            return clone
+
         def sync_poller(active: bool) -> None:
             """Run the read-only poller only while the opening window is active."""
             nonlocal activity_poller, poller_client, poller_retry_at, poller_allowed
+            if shared_wait_pending():
+                stop_poller()
+                stop_history_poller()
+                return
             if (not background_poller or check_only or not active or not authenticated
                     or not poller_allowed):
                 absorb_poller_wait()
@@ -894,43 +1078,112 @@ def run(settings: Settings, *, session: Any = None,
             if clock() < poller_retry_at:
                 return
             if poller_client is None:
-                poller_client = client.clone_readonly()
+                poller_client = background_client()
             activity_poller = ActivityPoller(poller_client.activities,
-                                             interval=FAST_INTERVAL, clock=clock)
+                                             interval=FAST_INTERVAL, clock=clock,
+                                             gate=wait_gate)
             activity_poller.start()
             align_poller()
 
-        def list_rows() -> tuple[list[dict[str, Any]], float, str, float]:
+        def sync_history_poller(active: bool) -> None:
+            """Refresh "my activities" in a background thread only during opening windows."""
+            nonlocal history_poller, history_client, history_retry_at
+            if shared_wait_pending():
+                stop_poller()
+                stop_history_poller()
+                return
+            if (not background_poller or not settings.history_background or check_only
+                    or not active or not authenticated):
+                absorb_history_wait()
+                stop_history_poller()
+                return
+            if history_poller is not None and history_poller.running:
+                absorb_history_wait()
+                return
+            if history_poller is not None:
+                snapshot = history_poller.snapshot()
+                if snapshot is not None and snapshot.error is not None:
+                    history_retry_at = max(
+                        history_retry_at,
+                        clock() + max(POLLER_RETRY_MIN_SECONDS, snapshot.retry_after))
+                    absorb_history_wait()
+                stop_history_poller()
+            if shared_wait_pending():
+                # The refresher may have learned the pause after the scan-start check: stop the
+                # list poller too instead of letting it keep querying inside the wait.
+                stop_poller()
+                stop_history_poller()
+                return
+            if clock() < history_retry_at:
+                return
+            if history_client is None:
+                history_client = background_client()
+            query = getattr(history_client, 'mine', None)
+            if query is None:
+                stop_history_poller()
+                return
+            history_poller = new_history_poller(query, interval=HISTORY_REFRESH_INTERVAL,
+                                                clock=clock, gate=wait_gate)
+            history_poller.start()
+
+        def list_rows() -> tuple[list[dict[str, Any]], float, str, float, float, float]:
             """Prefer a fresh poller snapshot; fall back to a synchronous query.
 
-            The fourth value is the snapshot age at consumption (0.0 for a sync query), so a
-            candidate can be attributed to stale list evidence.
+            Returns ``(rows, query_seconds, source, snapshot_age, fetch_seconds, data_age)``:
+            snapshot age counts from the poller response, fetch seconds is the query duration and
+            data age counts from the request start, which is what a candidate's staleness means.
             """
-            nonlocal poller_allowed, consumed_polls
+            nonlocal poller_allowed, consumed_polls, last_rows_started
             poller = activity_poller
-            versioned = getattr(poller, 'snapshot_with_version', None)
-            snapshot: Any = None
-            if poller is not None and versioned is not None:
-                # Snapshot and version must come from the same lock: otherwise a poll landing
-                # between the two reads is marked consumed although its rows were never seen.
-                snapshot, version = versioned()
-            else:
-                snapshot = poller.snapshot() if poller is not None else None
-                version = getattr(poller, 'polls', 0)
+
+            def current_pair() -> tuple[Any, Any]:
+                versioned = getattr(poller, 'snapshot_with_version', None)
+                if poller is not None and versioned is not None:
+                    # Snapshot and version must come from the same lock: otherwise a poll landing
+                    # between the two reads is marked consumed although its rows were never seen.
+                    return versioned()
+                return (poller.snapshot() if poller is not None else None,
+                        getattr(poller, 'polls', 0))
+
+            snapshot, version = current_pair()
             if (poller is not None and snapshot is not None and snapshot.error is None
                     and 0 <= clock() - snapshot.at <= POLLER_SNAPSHOT_MAX_AGE):
                 poller_allowed = True
                 consumed_polls = version
-                return snapshot.rows, 0.0, 'poller', max(0.0, clock() - snapshot.at)
+                started = getattr(snapshot, 'started', 0.0) or snapshot.at
+                last_rows_started = started
+                return (snapshot.rows, 0.0, 'poller', max(0.0, clock() - snapshot.at),
+                        getattr(snapshot, 'seconds', 0.0) or 0.0, max(0.0, clock() - started))
             if snapshot is not None and snapshot.error is not None:
                 absorb_poller_wait()
+            else:
+                # A request is likely in flight; wait briefly for it instead of racing it with a
+                # duplicate synchronous query. Bounded, and only for the normal (non-error) case.
+                waiter = getattr(poller, 'wait_update', None)
+                if poller is not None and poller.running and waiter is not None:
+                    if waiter(POLLER_FALLBACK_WAIT, version):
+                        snapshot, version = current_pair()
+                        if (snapshot is not None and snapshot.error is None
+                                and 0 <= clock() - snapshot.at <= POLLER_SNAPSHOT_MAX_AGE):
+                            poller_allowed = True
+                            consumed_polls = version
+                            started = getattr(snapshot, 'started', 0.0) or snapshot.at
+                            last_rows_started = started
+                            return (snapshot.rows, 0.0, 'poller',
+                                    max(0.0, clock() - snapshot.at),
+                                    getattr(snapshot, 'seconds', 0.0) or 0.0,
+                                    max(0.0, clock() - started))
+                        if snapshot is not None and snapshot.error is not None:
+                            absorb_poller_wait()
             # The server already told the background poller to wait; do not send another
             # list request inside that window just because the background thread stopped.
             poller_wait_error()
             started = clock()
             rows = client.activities()
+            duration = max(0, clock() - started)
             poller_allowed = True
-            return rows, max(0, clock() - started), 'query', 0.0
+            last_rows_started = started
+            return rows, duration, 'query', 0.0, duration, duration
 
         # Opening preparation: one warmed history refresh and one prefetched captcha per opening.
         prewarmed: set[float] = set()
@@ -954,6 +1207,12 @@ def run(settings: Settings, *, session: Any = None,
             if opening is None:
                 return None
             start = opening[0]
+            if offset_known and school_clock_margin > PREPARATION_MAX_UNCERTAINTY:
+                if start not in preparation_skipped:
+                    preparation_skipped.add(start)
+                    diagnostic('preparation_skipped', reason='clock_uncertainty',
+                               uncertainty=round(school_clock_margin, 3))
+                return None
             open_local = opening_local_estimate(start)
             if open_local < clock() - 1.0:
                 return None
@@ -1054,10 +1313,13 @@ def run(settings: Settings, *, session: Any = None,
                 client.timeout = OPENING_QUERY_TIMEOUT if opening_scan else 10
                 mail_blocked = opening_scan
                 activities_source = 'query'
-                sync_poller(opening_scan)
-                # A server-directed wait reported by the background poller applies to every
-                # foreground request too, including re-authentication and history probes.
+                # Establish any shared server-directed wait before either read-only thread is
+                # (re)started: a thread must never issue a request inside another thread's wait.
+                absorb_poller_wait()
+                absorb_history_wait()
                 poller_wait_error()
+                sync_poller(opening_scan)
+                sync_history_poller(opening_scan and task.data['status'] != 'pending')
                 if not authenticated:
                     health(phase='authentication', next_check_at=0)
                     client.authenticate()
@@ -1073,6 +1335,8 @@ def run(settings: Settings, *, session: Any = None,
                             diagnostic('ocr_unavailable', reason=type(exc).__name__)
                     stop_poller()
                     sync_poller(opening_scan)
+                    stop_history_poller()
+                    sync_history_poller(opening_scan and task.data['status'] != 'pending')
                 if task.data['status'] != 'pending':
                     holds_now = hold_entries()
                     expired = [wid for wid, entry in holds_now.items()
@@ -1141,6 +1405,9 @@ def run(settings: Settings, *, session: Any = None,
                         health(phase='my_activities', next_check_at=0)
                         mine_started = clock()
                         try:
+                            # The wait may have been learned after the scan-start check; abort
+                            # before the history request instead of querying inside it.
+                            poller_wait_error()
                             pending_history = client.mine()
                             history = pending_history
                             mine_at = clock()
@@ -1159,7 +1426,7 @@ def run(settings: Settings, *, session: Any = None,
                     if pending_wid not in booked and not confirmed:
                         health(phase='activities', next_check_at=0)
                         try:
-                            rows, _, activities_source, _ = list_rows()
+                            rows, _, activities_source, _, _, _ = list_rows()
                         except (RemoteError, ValueError) as exc:
                             if server_wait_error(exc):
                                 abandon_check(exc)
@@ -1170,7 +1437,11 @@ def run(settings: Settings, *, session: Any = None,
                                 try:
                                     row_wid = activity_id(row)
                                 except ValueError:
-                                    continue
+                                    # Without an activity ID this row cannot be ruled out as
+                                    # the pending activity: the activity list cannot provide
+                                    # absence evidence, so the check must not advance.
+                                    source_complete = False
+                                    break
                                 if row_wid != pending_wid:
                                     continue
                                 try:
@@ -1265,10 +1536,14 @@ def run(settings: Settings, *, session: Any = None,
                 # Query the opening-critical list before the slower history refresh: a slow or
                 # failing my-activities endpoint must not hide the next reservation opening.
                 health(phase='activities')
-                rows, activities_seconds, activities_source, rows_age = list_rows()
+                rows, activities_seconds, activities_source, rows_age, rows_fetch_seconds, \
+                    rows_data_age = list_rows()
                 if school_clock_known(rows, clock()):
                     server_offset = school_clock_offset(rows, clock())
                     offset_known = True
+                    # The truncation fraction plus the query round trip can make the estimate
+                    # late by up to ~1s + request time; treat that much as uncertainty.
+                    school_clock_margin = school_clock_uncertainty(rows_age, rows_fetch_seconds)
                 # Prune cooldowns only after the school clock is known: on restart the stored
                 # deadlines are in school time, and pruning them against an uncalibrated local
                 # clock would delete still-valid cooldowns when the school clock runs behind.
@@ -1298,8 +1573,36 @@ def run(settings: Settings, *, session: Any = None,
                                             judged.end.timestamp(), confirmed=True,
                                             source='activity_list', category=judged.category)
                             break
-                if not refresh_mine and not (
-                        history is not None and opening_scan and 0 <= clock() - mine_at < OPENING_HISTORY_TTL):
+                background_history = (history_poller.snapshot()
+                                      if history_poller is not None else None)
+                background_fresh = (
+                    opening_scan and background_history is not None
+                    and background_history.error is None
+                    and 0 <= clock() - background_history.at <= HISTORY_BACKGROUND_FRESH)
+                history_still_fresh = (
+                    history is not None and opening_scan
+                    and 0 <= clock() - mine_at < OPENING_HISTORY_TTL)
+                used_background_history = False
+                if background_fresh and not refresh_mine and not history_still_fresh:
+                    # The background refresher already paid for this query; never let it sit
+                    # between a candidate and its submission. Validate it first: a structurally
+                    # malformed cache must fall back to the synchronous query, not fail the scan.
+                    assert background_history is not None
+                    background_rows = list(background_history.rows)
+                    invalid_reason = background_history_usable(
+                        background_rows, clock() + server_offset)
+                    if invalid_reason is not None:
+                        diagnostic('history_background_invalid', reason=invalid_reason)
+                    else:
+                        history = background_rows
+                        mine_at = background_history.at
+                        mine_seconds = getattr(background_history, 'seconds', 0.0) or 0.0
+                        refresh_mine = True
+                        used_background_history = True
+                        diagnostic('history_background_used',
+                                   age_seconds=round(clock() - mine_at, 3))
+                if not used_background_history and not refresh_mine and not history_still_fresh:
+                    poller_wait_error()
                     health(phase='my_activities', next_check_at=0,
                            activity_count=None, candidate_count=None)
                     mine_started = clock()
@@ -1393,7 +1696,6 @@ def run(settings: Settings, *, session: Any = None,
                         # The poller may have failed after the scan start; do not fetch a
                         # captcha for a submission the server asked us to postpone.
                         poller_wait_error()
-                        health(phase='captcha')
                         captcha_source = 'fresh'
                         captcha_connect: float | None = None
                         attempt_prefetch_age: float | None = None
@@ -1443,9 +1745,13 @@ def run(settings: Settings, *, session: Any = None,
                                          pending_start=lecture.start.timestamp(),
                                          pending_end=lecture.end.timestamp(),
                                          pending_category=lecture.category)
+                        # One atomic save persists both the crash-recovery checkpoint and the
+                        # 'submitting' health phase; a separate health write would fsync again.
+                        set_health(phase='submitting')
+                        persist_started = clock()
                         task.save()
+                        persist_seconds = max(0, clock() - persist_started)
                         unconfirmed_checks = 0
-                        health(phase='submitting')
                         submission_started = clock()
                         diagnostic('submission_started', wid=lecture.wid, attempt=attempt + 1,
                                    captcha_seconds=round(captcha_seconds, 3),
@@ -1455,7 +1761,10 @@ def run(settings: Settings, *, session: Any = None,
                                                  if attempt_prefetch_age is not None else None),
                                    connect_seconds=(round(captcha_connect, 3)
                                                     if captcha_connect is not None else None),
-                                   rows_age=round(rows_age, 3))
+                                   rows_age=round(rows_age, 3),
+                                   rows_data_age=(round(clock() - last_rows_started, 3)
+                                                  if last_rows_started else None),
+                                   precommit_save_seconds=round(persist_seconds, 3))
                         try:
                             reply = client.submit(lecture.wid, code)
                         except RemoteError as exc:
@@ -1479,7 +1788,7 @@ def run(settings: Settings, *, session: Any = None,
                                 authenticated = False
                             wait = exc.retry_after if exc.retry_after > 0 else (
                                 FAST_INTERVAL if opening_scan else short_backoff(1))
-                            pause_poller()
+                            pause_query_threads()
                             defer(wait, server_directed=exc.retry_after > 0)
                             break
                         step_recovered()
@@ -1550,6 +1859,8 @@ def run(settings: Settings, *, session: Any = None,
                                    history_reused=not refresh_mine,
                                    mine_seconds=mine_seconds, activities_seconds=activities_seconds,
                                    rows_source=activities_source, rows_age=round(rows_age, 3),
+                                   rows_fetch_seconds=round(rows_fetch_seconds, 3),
+                                   rows_data_age=round(rows_data_age, 3),
                                    main_requests=client.requests_made,
                                    poller_polls=getattr(poller, 'polls', 0))
                         last_timing_at = clock()
@@ -1581,7 +1892,7 @@ def run(settings: Settings, *, session: Any = None,
                 failures += 1
                 query_failed(scan_started)
                 health(last_error='authentication_expired', last_error_at=clock(), failure_count=failures)
-                pause_poller()
+                pause_query_threads()
                 defer(short_backoff(failures))
             except (RemoteError, ValueError) as exc:
                 if isinstance(exc, ValueError):
@@ -1599,7 +1910,7 @@ def run(settings: Settings, *, session: Any = None,
                 server_directed_wait = (isinstance(exc, RemoteError)
                                         and (exc.retry_after > 0 or str(exc) == 'server_backoff'))
                 if (authenticated and not progress_probe_attempted and latest_progress is None
-                        and not server_directed_wait):
+                        and not server_directed_wait and not shared_wait_pending()):
                     # One best-effort history read so a sustained query-failure alert can still
                     # report confirmed progress; never submit from this probe.
                     progress_probe_attempted = True
@@ -1629,7 +1940,7 @@ def run(settings: Settings, *, session: Any = None,
                     failures += 1
                     health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
                     delay = retry if retry > 0 else short_backoff(failures)
-                pause_poller()
+                pause_query_threads()
                 defer(delay, server_directed=retry > 0)
     except (KeyboardInterrupt, EOFError):
         return 130
@@ -1671,6 +1982,7 @@ def run(settings: Settings, *, session: Any = None,
         return 1
     finally:
         stop_poller()
+        stop_history_poller()
         if task:
             health(phase='manual_required' if snapshot['phase'] == 'manual_required' and final_phase == 'stopped'
                    else final_phase, next_check_at=0)

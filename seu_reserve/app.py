@@ -1058,9 +1058,10 @@ def run(settings: Settings, *, session: Any = None,
         def align_poller() -> None:
             """Ask the poller to place one poll right on the next opening instant.
 
-            Off by default: the school-clock offset is derived from a second-truncated timestamp
-            and the list snapshot, so the target carries up to ~1s of error and may land after the
-            opening instead of on it. Enable with SEU_POLLER_ALIGN only after real-run measurement.
+            Off by default: after the school clock is calibrated the target is the earliest
+            plausible opening (start - offset - margin), so it errs earlier; before calibration
+            the raw school timestamp may still be off. Enable with SEU_POLLER_ALIGN only after
+            real-run measurement.
             """
             if not settings.poller_align:
                 return

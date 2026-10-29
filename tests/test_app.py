@@ -2968,3 +2968,65 @@ def test_stale_background_history_waits_for_its_refresh_instead_of_a_sync_query(
     assert not any(url.endswith('queryMyActivityList.do') for _, url, _ in school.requests)
     lines = diagnostics_rows(tmp_path)
     assert any(line['event'] == 'history_background_used' for line in lines)
+
+def test_candidate_selection_uses_newer_list_snapshot_after_a_long_history_wait(
+        tmp_path, monkeypatch):
+    import seu_reserve.app as app_module
+    from test_activities import activity
+    seed_opening_selection(tmp_path, start='2026-10-18T12:00:10+08:00')
+    now = [moment('2026-10-18 12:00:10').timestamp()]
+    old_available = activity('old', YYKSSJ='2026-10-18 12:00:10',
+                             YYJSSJ='2026-10-18 13:00:00', HDZRS=10)
+    new_later = activity('new', YYKSSJ='2026-10-18 12:00:20',
+                         YYJSSJ='2026-10-18 13:00:00', HDZRS=10)
+
+    class SlowHistory(FakeHistoryPoller):
+        waits = []
+
+        def snapshot(self):
+            from seu_reserve.poller import Snapshot
+            age = 0.0 if SlowHistory.waits else 60.0
+            return Snapshot(rows=[], at=self.clock() - age)
+
+        def request_refresh(self):
+            pass
+
+        def wait_update(self, timeout, since=None):
+            SlowHistory.waits.append(timeout)
+            now[0] += 2.0
+            # During the wait the old lecture fills and the new one opens.
+            FakePoller.rows_override = [
+                activity('old', YYKSSJ='2026-10-18 12:00:10',
+                         YYJSSJ='2026-10-18 13:00:00', HDZRS=10, YYRS=10),
+                activity('new', YYKSSJ='2026-10-18 12:00:10',
+                         YYJSSJ='2026-10-18 13:00:00', HDZRS=10),
+            ]
+            return True
+
+    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
+    monkeypatch.setattr(app_module, 'new_history_poller', SlowHistory)
+    SlowHistory.waits = []
+    FakePoller.instances.clear()
+    FakePoller.rows_override = [old_available, new_later]
+    FakePoller.at_offset = 0.0
+    FakePoller.next_error = None
+    FakePoller.next_wake_once = False
+    school = School()
+    school.activities = [old_available, new_later]
+    FakePoller.next_rows = [old_available, new_later]
+    def clock(): return now[0]
+    def stop(seconds):
+        now[0] += max(seconds, 0.0)
+        raise KeyboardInterrupt
+    FakePoller.on_timeout = stop
+    try:
+        assert execute(school, tmp_path, clock=clock, sleep=stop, background_poller=True,
+                       settings=Settings(state_dir=tmp_path, prewarm=False,
+                                         captcha_prefetch=False)) == 130
+    finally:
+        FakePoller.on_timeout = None
+    assert SlowHistory.waits and SlowHistory.waits[0] == 6
+    assert school.submitted == ['new']
+    started = [line for line in diagnostics_rows(tmp_path)
+               if line['event'] == 'submission_started']
+    assert started and started[0]['wid'] == 'new'

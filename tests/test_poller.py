@@ -362,3 +362,49 @@ def test_exit_callback_runs_once_for_a_finished_thread():
     finally:
         poller.stop()
     assert exits == ['closed']
+
+def test_refresh_request_during_an_in_flight_query_is_coalesced():
+    calls = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def query():
+        calls.append(time.monotonic())
+        started.set()
+        release.wait(3.0)
+        return []
+
+    poller = ActivityPoller(query, interval=10.0, clock=time.monotonic)
+    poller.start()
+    assert started.wait(2.0)
+    poller.request_refresh()   # the in-flight query should satisfy this request
+    release.set()
+    time.sleep(0.2)
+    try:
+        assert len(calls) == 1
+    finally:
+        poller.stop()
+
+def test_stop_during_in_flight_refresh_query_exits_without_the_interval_wait():
+    started = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    calls = []
+
+    def query():
+        calls.append(time.monotonic())
+        started.set()
+        release.wait(3.0)
+        return []
+
+    poller = ActivityPoller(query, interval=20.0, clock=time.monotonic,
+                            on_exit=exited.set)
+    poller.start()
+    assert started.wait(2.0)
+    poller.request_refresh()
+    poller.stop(join=False)
+    release.set()
+    # The refresh clear must not swallow the stop wake: without the stop re-check this would
+    # wait the full 20 s interval before the worker closes its session.
+    assert exited.wait(2.0)
+    assert len(calls) == 1

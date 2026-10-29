@@ -58,6 +58,10 @@ OPENING_HISTORY_TTL = 60.0
 # A background read-only activity list fetched by the poller is used only while this fresh; a
 # stale snapshot falls back to a normal synchronous query.
 POLLER_SNAPSHOT_MAX_AGE = 0.75
+# After history resolution (a long background wait or a slow synchronous read), the list rows
+# fetched before it may already be stale. Re-consume a newer poller snapshot above this age
+# difference before selecting candidates.
+HISTORY_LIST_REFRESH_AFTER = 0.5
 # A stale snapshot with a poll in flight is usually about to be replaced: wait briefly for that
 # poll instead of racing it with a duplicate synchronous list query.
 POLLER_FALLBACK_WAIT = 0.3
@@ -487,6 +491,8 @@ def run(settings: Settings, *, session: Any = None,
     consumed_polls = 0
     # Local time the last consumed list request started, for candidate data-age metrics.
     last_rows_started = 0.0
+    # When the consumed list rows were published/fetched, for detecting a newer poller snapshot.
+    rows_snapshot_at = 0.0
     # An absolute deadline copied from a server-directed poller error. The scan loop checks it
     # before falling back to a synchronous query, so the background and foreground requests
     # share one server-requested pause.
@@ -1190,7 +1196,7 @@ def run(settings: Settings, *, session: Any = None,
             snapshot age counts from the poller response, fetch seconds is the query duration and
             data age counts from the request start, which is what a candidate's staleness means.
             """
-            nonlocal poller_allowed, consumed_polls, last_rows_started
+            nonlocal poller_allowed, consumed_polls, last_rows_started, rows_snapshot_at
             poller = activity_poller
 
             def current_pair() -> tuple[Any, Any]:
@@ -1209,6 +1215,7 @@ def run(settings: Settings, *, session: Any = None,
                 consumed_polls = version
                 started = getattr(snapshot, 'started', 0.0) or snapshot.at
                 last_rows_started = started
+                rows_snapshot_at = snapshot.at
                 return (snapshot.rows, 0.0, 'poller', max(0.0, clock() - snapshot.at),
                         getattr(snapshot, 'seconds', 0.0) or 0.0, max(0.0, clock() - started))
             if snapshot is not None and snapshot.error is not None:
@@ -1226,6 +1233,7 @@ def run(settings: Settings, *, session: Any = None,
                             consumed_polls = version
                             started = getattr(snapshot, 'started', 0.0) or snapshot.at
                             last_rows_started = started
+                            rows_snapshot_at = snapshot.at
                             return (snapshot.rows, 0.0, 'poller',
                                     max(0.0, clock() - snapshot.at),
                                     getattr(snapshot, 'seconds', 0.0) or 0.0,
@@ -1243,6 +1251,7 @@ def run(settings: Settings, *, session: Any = None,
                                 consumed_polls = version
                                 started = getattr(snapshot, 'started', 0.0) or snapshot.at
                                 last_rows_started = started
+                                rows_snapshot_at = snapshot.at
                                 return (snapshot.rows, 0.0, 'poller',
                                         max(0.0, clock() - snapshot.at),
                                         getattr(snapshot, 'seconds', 0.0) or 0.0,
@@ -1257,7 +1266,31 @@ def run(settings: Settings, *, session: Any = None,
             duration = max(0, clock() - started)
             poller_allowed = True
             last_rows_started = started
+            rows_snapshot_at = clock()
             return rows, duration, 'query', 0.0, duration, duration
+
+        def newer_poller_rows() -> tuple[
+                list[dict[str, Any]], str, float, float, float, int, float, float] | None:
+            """Newest fresh poller rows if they are newer than the rows already in hand."""
+            poller = activity_poller
+            if poller is None:
+                return None
+            versioned = getattr(poller, 'snapshot_with_version', None)
+            if versioned is not None:
+                snapshot, version = versioned()
+            else:
+                snapshot, version = poller.snapshot(), getattr(poller, 'polls', 0)
+            if snapshot is None or snapshot.error is not None:
+                return None
+            age = clock() - snapshot.at
+            if not (0 <= age <= POLLER_SNAPSHOT_MAX_AGE):
+                return None
+            if version <= consumed_polls and snapshot.at <= rows_snapshot_at:
+                return None
+            started = getattr(snapshot, 'started', 0.0) or snapshot.at
+            return (snapshot.rows, 'poller', max(0.0, age),
+                    getattr(snapshot, 'seconds', 0.0) or 0.0,
+                    max(0.0, clock() - started), version, snapshot.at, started)
 
         # Opening preparation: one warmed history refresh and one prefetched captcha per opening.
         prewarmed: set[float] = set()
@@ -1624,6 +1657,12 @@ def run(settings: Settings, *, session: Any = None,
                 health(phase='activities')
                 rows, activities_seconds, activities_source, rows_age, rows_fetch_seconds, \
                     rows_data_age = list_rows()
+                rows_fetched_at = clock()
+                # Start the list reader before the history step: if resolving history takes
+                # seconds, the scan can then consume a newer list snapshot instead of submitting
+                # a candidate from the pre-wait rows.
+                if opening_scan:
+                    sync_poller(True)
                 if school_clock_known(rows, clock()):
                     server_offset = school_clock_offset(rows, clock())
                     offset_known = True
@@ -1734,6 +1773,20 @@ def run(settings: Settings, *, session: Any = None,
                     clear_alert('task_failed')
                     pause(10)
                     continue
+                if clock() - rows_fetched_at > HISTORY_LIST_REFRESH_AFTER:
+                    # Resolving history may have taken seconds; do not submit a candidate that the
+                    # newer background list snapshot has already shown as full or superseded.
+                    fresher = newer_poller_rows()
+                    if fresher is not None:
+                        (rows, activities_source, rows_age, rows_fetch_seconds, rows_data_age,
+                         consumed_polls, rows_snapshot_at, last_rows_started) = fresher
+                        activities_seconds = 0.0
+                        poller_allowed = True
+                        if school_clock_known(rows, clock()):
+                            server_offset = school_clock_offset(rows, clock())
+                            offset_known = True
+                            school_clock_margin = school_clock_uncertainty(
+                                rows_age, rows_fetch_seconds)
                 candidates, details = select_candidates(rows, settings, current, history,
                     task.data['cooldowns'], clock() + server_offset,
                     cooldown_clock_known=offset_known, holds=hold_views())

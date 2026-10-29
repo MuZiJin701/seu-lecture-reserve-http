@@ -92,8 +92,11 @@ class ActivityPoller:
         # Set after every completed poll (success or failure) so the scan loop can sleep
         # until the next read instead of re-checking wall-clock freshness.
         self._updated = threading.Event()
-        # Wakes the interval wait early for an on-demand refresh (and for stop).
+        # Wakes the interval wait early for an on-demand refresh (and for stop). A refresh
+        # requested while a query is already in flight is satisfied by that query: the target
+        # version records which completed poll makes the request redundant.
         self._wake = threading.Event()
+        self._refresh_target = 0
         # One-shot start-of-poll target, consumed by the next wait computation. Targets
         # already in the past are dropped so alignment can never rewind or busy-wait.
         self._align: float | None = None
@@ -157,8 +160,12 @@ class ActivityPoller:
             self._align = when
 
     def request_refresh(self) -> None:
-        """Ask the running poller to make its next query now, and then resume the interval."""
-        self._wake.set()
+        """Ask the running poller to run a query now; an in-flight query satisfies the request."""
+        if not self.running:
+            return
+        with self._lock:
+            self._refresh_target = max(self._refresh_target, self._polls + 1)
+            self._wake.set()
 
     def _call_exit(self) -> None:
         if self._exit_called:
@@ -205,6 +212,7 @@ class ActivityPoller:
             return
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._refresh_target = 0
         self._thread = threading.Thread(target=self._run, name='activity-poller', daemon=True)
         self._thread.start()
 
@@ -234,6 +242,17 @@ class ActivityPoller:
                     return
                 started = self._clock()
                 if not self.poll_once():
+                    return
+                with self._lock:
+                    if (self._refresh_target > 0
+                            and self._polls >= self._refresh_target):
+                        # The query we just completed satisfies the pending refresh request.
+                        self._refresh_target = 0
+                        if not self._stop.is_set():
+                            self._wake.clear()
+                # A stop may have arrived while the query was in flight and the refresh clear
+                # above could otherwise discard its wake: never enter the interval after a stop.
+                if self._stop.is_set():
                     return
                 wait = self._interval - (self._clock() - started)
                 target = self._take_align()

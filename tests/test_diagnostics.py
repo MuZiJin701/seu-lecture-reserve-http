@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from seu_reserve.app import Settings
+from seu_reserve.app import Settings, rotate_diagnostics
 from seu_reserve.cli import show_status
 from seu_reserve.model import SERIES_CATEGORIES
 from test_activities import ActivitySchool, CLOSE, OPEN, activity
@@ -176,6 +176,55 @@ def test_invalid_alert_metadata_does_not_overwrite_original_or_contact_school(tm
 
 def diagnostics(tmp_path):
     return [json.loads(line) for line in (tmp_path / 'diagnostics.jsonl').read_text().splitlines()]
+
+
+def test_rotate_diagnostics_archives_an_oversized_log_without_losing_content(tmp_path):
+    active = tmp_path / 'diagnostics.jsonl'
+    first = '{"event":"old"}\n' * 4
+    active.write_text(first)
+    rotate_diagnostics(tmp_path, limit=10)
+    archived = sorted(tmp_path.glob('diagnostics-*.jsonl'))
+    assert len(archived) == 1 and archived[0].read_text() == first
+    assert not active.exists()      # the next diagnostic write starts a new, empty active file
+
+    second = '{"event":"older"}\n' * 4
+    active.write_text(second)
+    rotate_diagnostics(tmp_path, limit=10)
+    # A same-second rotation reaches the collision suffix; both files are kept.
+    archived = sorted(tmp_path.glob('diagnostics-*.jsonl'))
+    assert len(archived) == 2
+    assert {path.read_text() for path in archived} == {first, second}
+
+
+def test_rotate_diagnostics_keeps_a_small_or_missing_log(tmp_path):
+    active = tmp_path / 'diagnostics.jsonl'
+    active.write_text('small')
+    rotate_diagnostics(tmp_path, limit=10)
+    assert active.read_text() == 'small'
+    assert not list(tmp_path.glob('diagnostics-*'))
+    assert rotate_diagnostics(tmp_path / 'missing', limit=10) is None
+
+
+def test_run_rotates_diagnostics_once_at_start_but_not_in_check_only(tmp_path, monkeypatch):
+    import seu_reserve.app as app_module
+    active = tmp_path / 'diagnostics.jsonl'
+    active.write_text('x' * 100)
+    calls = []
+    original = app_module.rotate_diagnostics
+    def rotate(directory):
+        calls.append(directory)
+        original(directory, limit=10)
+    monkeypatch.setattr(app_module, 'rotate_diagnostics', rotate)
+    school = School()
+    school.activities = [lecture(YYZT='未开放')]
+    assert execute(school, tmp_path) == 130
+    assert calls == [tmp_path]
+    archived = list(tmp_path.glob('diagnostics-*.jsonl'))
+    assert len(archived) == 1 and archived[0].read_text() == 'x' * 100
+    # The oversized file moved before the scan wrote: the active file only has new diagnostics.
+    assert diagnostics(tmp_path)
+    assert execute(school, tmp_path, check_only=True) == 0
+    assert calls == [tmp_path]
 
 
 def test_scan_timing_is_logged_periodically_after_the_first_scan(tmp_path):

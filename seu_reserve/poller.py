@@ -7,10 +7,13 @@ owns every decision and every write. Snapshot freshness is judged by the caller.
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
+
+from .client import RemoteError
 
 
 @dataclass(frozen=True)
@@ -18,6 +21,9 @@ class Snapshot:
     rows: list[dict[str, Any]]
     at: float
     error: str | None = None
+    # The fixed, log-safe reason code when the client exposed one (``network_timeout``, ...);
+    # ``None`` on success and for errors that only have a class name.
+    reason: str | None = None
     retry_after: float = 0.0
     # When the error carried a usable server-directed wait (429/Retry-After or the
     # server_backoff code), the scan loop must observe the same pause instead of falling
@@ -35,6 +41,19 @@ def server_directed_error(exc: BaseException) -> bool:
     retry_after = float(getattr(exc, 'retry_after', 0) or 0)
     return (retry_after > 0 or getattr(exc, 'http_status', None) == 429
             or getattr(exc, 'args', ())[:1] == ('server_backoff',))
+
+
+def error_reason(exc: BaseException) -> str:
+    """Fixed, log-safe error code for diagnostics; never the exception message text.
+
+    The client only lets fixed reason codes cross its boundary, so a plain ``[a-z_]+`` code is
+    reported as-is; anything else (a localized message, a wrapped failure) is reduced to the
+    exception class name so no server or response text can leak into the local log.
+    """
+    reason = str(exc)
+    if isinstance(exc, RemoteError) and re.fullmatch('[a-z_]+', reason):
+        return reason
+    return type(exc).__name__
 
 
 # A server-directed error without an explicit Retry-After still asks for a pause: the scan loop
@@ -202,6 +221,7 @@ class ActivityPoller:
                     rows=previous.rows if previous is not None else [],
                     at=previous.at if previous is not None else started,
                     error=type(exc).__name__,
+                    reason=error_reason(exc),
                     retry_after=retry_after,
                     failed_at=failed_at,
                     server_directed=server_directed)

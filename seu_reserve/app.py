@@ -31,6 +31,9 @@ MAJOR_MAIL_EVENTS = {'authentication_required', 'query_failure', 'task_failed', 
 SCAN_INTERVAL = 10
 FAST_INTERVAL = 0.10
 FAST_RETRY_INTERVAL = 0.25
+# When the background reader is down, the 0.10 s fast loop would otherwise issue one synchronous
+# list query per scan (~10 requests/s). Successive opening-window fallbacks keep this spacing.
+FAST_SYNC_MIN_INTERVAL = 0.25
 FAST_RETRY_REASONS = {'network_timeout', 'connect_timeout', 'network_failure', 'connection_failure',
                       'proxy_failure', 'invalid_json', 'invalid_response', 'http_failure',
                       'business_response_invalid', 'business_rows_invalid', 'business_rows_incomplete'}
@@ -114,6 +117,9 @@ CAPTCHA_PREFETCH_TIMEOUT = 0.6
 # forced a minimum request budget that would run past the opening instant.
 PREWARM_MIN_REMAINING = 0.4
 CAPTCHA_PREFETCH_MIN_REMAINING = 0.45
+# Local diagnostics are append-only and never deleted: an oversized log is renamed once at startup
+# so old evidence stays on disk while the active file restarts empty.
+DIAGNOSTICS_MAX_BYTES = 8 * 1024 * 1024
 
 
 def short_backoff(failures: int) -> float:
@@ -407,6 +413,34 @@ def _state_event(settings: Settings, event: str) -> None:
         pass
 
 
+def rotate_diagnostics(directory: Path, limit: int = DIAGNOSTICS_MAX_BYTES) -> None:
+    """Rename an oversized local diagnostics log once at startup; old files are never deleted.
+
+    Diagnostics are append-only, so a long-running process can grow the file without bound. The
+    operator's cleanup becomes a per-start guarantee instead: the oversized file is renamed to
+    ``diagnostics-<stamp>.jsonl`` (numeric suffix on collision) and the next scan starts a new,
+    empty active file. Rotation only happens before the scan starts, so nothing appends to a file
+    while it moves, and a failed rename must never stop the scan.
+    """
+    active = directory / 'diagnostics.jsonl'
+    try:
+        # lstat keeps a symlink from being followed into a file outside the state directory.
+        if active.lstat().st_size <= limit:
+            return
+    except OSError:
+        return
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    archived = directory / f'diagnostics-{stamp}.jsonl'
+    suffix = 1
+    while archived.exists():
+        archived = directory / f'diagnostics-{stamp}-{suffix}.jsonl'
+        suffix += 1
+    try:
+        active.rename(archived)
+    except OSError:
+        pass
+
+
 def resolve_pending(settings: Settings, *, session: Any = None,
                     environ: Mapping[str, str] | None = None,
                     prompt: Callable[[str], str] = terminal_prompt) -> int:
@@ -497,6 +531,9 @@ def run(settings: Settings, *, session: Any = None,
     consumed_polls = 0
     # Local time the last consumed list request started, for candidate data-age metrics.
     last_rows_started = 0.0
+    # Local time the last synchronous list request started. Opening-window fallbacks are spaced by
+    # FAST_SYNC_MIN_INTERVAL from it so a dead reader cannot turn the fast loop into a request burst.
+    last_sync_query_at = 0.0
     # When the consumed list rows were published/fetched, for detecting a newer poller snapshot.
     rows_snapshot_at = 0.0
     # An absolute deadline copied from a server-directed poller error. The scan loop checks it
@@ -923,6 +960,8 @@ def run(settings: Settings, *, session: Any = None,
             print('event=read_only_complete', flush=True)
             return 0
         task = Task(settings.state_dir, environ.get('SEU_USERNAME', ''))
+        # One startup rotation, before the scan writes any diagnostic: never while running.
+        rotate_diagnostics(settings.state_dir)
         alerts = task.data.setdefault('alerts', {})
         if notify:
             announced.update(alerts)
@@ -1144,6 +1183,18 @@ def run(settings: Settings, *, session: Any = None,
             diagnostic('history_background_used', age_seconds=round(clock() - mine_at, 3))
             return True
 
+        def reader_stopped(reader: str, snapshot: Any) -> None:
+            """Diagnose one failed background reader just before it is recycled.
+
+            Local-only: a recycled reader is not an event or mail-worthy condition, but without
+            this it is invisible (``poller_polls`` resets and the scan falls back silently). The
+            fixed reason code keeps server text, titles and IDs out of the log.
+            """
+            diagnostic('background_reader_stopped', reader=reader,
+                       reason=getattr(snapshot, 'reason', None) or snapshot.error,
+                       server_directed=snapshot.server_directed,
+                       retry_seconds=round(snapshot.retry_after, 3))
+
         def sync_poller(active: bool) -> None:
             """Run the read-only poller only while the opening window is active."""
             nonlocal activity_poller, poller_client, poller_retry_at, poller_allowed
@@ -1162,6 +1213,7 @@ def run(settings: Settings, *, session: Any = None,
             if activity_poller is not None:
                 snapshot = activity_poller.snapshot()
                 if snapshot is not None and snapshot.error is not None:
+                    reader_stopped('activities', snapshot)
                     poller_retry_at = max(
                         poller_retry_at,
                         clock() + max(POLLER_RETRY_MIN_SECONDS, snapshot.retry_after))
@@ -1197,6 +1249,7 @@ def run(settings: Settings, *, session: Any = None,
             if history_poller is not None:
                 snapshot = history_poller.snapshot()
                 if snapshot is not None and snapshot.error is not None:
+                    reader_stopped('history', snapshot)
                     history_retry_at = max(
                         history_retry_at,
                         clock() + max(POLLER_RETRY_MIN_SECONDS, snapshot.retry_after))
@@ -1230,6 +1283,7 @@ def run(settings: Settings, *, session: Any = None,
             data age counts from the request start, which is what a candidate's staleness means.
             """
             nonlocal poller_allowed, consumed_polls, last_rows_started, rows_snapshot_at
+            nonlocal last_sync_query_at
             poller = activity_poller
 
             def current_pair() -> tuple[Any, Any]:
@@ -1294,7 +1348,18 @@ def run(settings: Settings, *, session: Any = None,
             # The server already told the background poller to wait; do not send another
             # list request inside that window just because the background thread stopped.
             poller_wait_error()
+            now = clock()
+            if (background_poller and opening_scan and last_sync_query_at
+                    and 0 < now - last_sync_query_at < FAST_SYNC_MIN_INTERVAL):
+                # The reader is unavailable, so the fast loop is on its synchronous fallback:
+                # space those requests instead of issuing one per 0.10 s scan. The first fallback
+                # of a window is never delayed, and rows are still fetched fresh, never reused.
+                # Sleep through the injected clock rather than pause(): a throttle inside a scan
+                # must not add extra wait-boundary health flushes.
+                sleep(FAST_SYNC_MIN_INTERVAL - (now - last_sync_query_at))
+                poller_wait_error()
             started = clock()
+            last_sync_query_at = started
             rows = client.activities()
             duration = max(0, clock() - started)
             poller_allowed = True

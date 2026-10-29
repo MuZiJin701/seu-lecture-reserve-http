@@ -1,6 +1,9 @@
 import threading
 import time
 
+import pytest
+
+from seu_reserve.client import RemoteError
 from seu_reserve.poller import ActivityPoller, WaitGate
 
 
@@ -63,6 +66,33 @@ def test_rate_limited_failure_without_retry_after_is_server_directed():
     assert snapshot is not None
     assert snapshot.retry_after == 0.0
     assert snapshot.server_directed is True
+
+
+@pytest.mark.parametrize('error, reason', [
+    (RemoteError('network_timeout'), 'network_timeout'),
+    (RemoteError('business_authentication_expired'), 'business_authentication_expired'),
+    # Only a fixed lowercase code may be copied; anything else stays a class name so response
+    # or exception text can never leak into the local diagnostics.
+    (RemoteError('PRIVATE server text'), 'RemoteError'),
+    (ValueError('boom'), 'ValueError'),
+])
+def test_error_snapshot_records_a_fixed_log_safe_reason(error, reason):
+    def query():
+        raise error
+
+    poller = ActivityPoller(query, interval=0.25, clock=lambda: 55.0)
+    assert poller.poll_once() is False
+    snapshot = poller.snapshot()
+    assert snapshot is not None
+    assert snapshot.error == type(error).__name__
+    assert snapshot.reason == reason
+
+
+def test_successful_snapshot_has_no_error_reason():
+    poller = ActivityPoller(lambda: [], interval=0.25, clock=lambda: 55.0)
+    assert poller.poll_once() is True
+    snapshot = poller.snapshot()
+    assert snapshot is not None and snapshot.reason is None
 
 
 def test_thread_polls_until_stopped():

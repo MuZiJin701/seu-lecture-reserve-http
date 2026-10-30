@@ -383,13 +383,13 @@ class Client:
         file yields no cookies and the normal password/SMS login continues unchanged.
         """
         self._trust_cookies_loaded = False
-        if not self.trust_device or self.fingerprint_dir is None:
+        if not self.trust_device or self.fingerprint_dir is None or not self.environ.get('SEU_USERNAME'):
             return
         jar = getattr(self.session, 'cookies', None)
         if jar is None or not hasattr(jar, 'set_cookie'):
             return
         try:
-            stored = load_trust_cookies(self.fingerprint_dir)
+            stored = load_trust_cookies(self.fingerprint_dir, account=self.environ.get('SEU_USERNAME', ''))
         except OSError:
             return
         loaded = 0
@@ -426,7 +426,7 @@ class Client:
 
     def _save_trust_cookies(self) -> None:
         """Persist the school's CAS cookies after a successful login (opt-in only)."""
-        if not self.trust_device or self.fingerprint_dir is None:
+        if not self.trust_device or self.fingerprint_dir is None or not self.environ.get('SEU_USERNAME'):
             return
         jar = getattr(self.session, 'cookies', None)
         if jar is None:
@@ -437,7 +437,7 @@ class Client:
         except TypeError:
             return
         try:
-            save_trust_cookies(self.fingerprint_dir, cookies)
+            save_trust_cookies(self.fingerprint_dir, cookies, account=self.environ.get('SEU_USERNAME', ''))
         except OSError:
             pass
 

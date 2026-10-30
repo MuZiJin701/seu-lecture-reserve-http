@@ -1,141 +1,71 @@
-# SEU Lecture Reservation · HTTPS
+# SEU Lecture Reservation · HTTP console
 
 [中文](README.md)
 
-A browser-free lecture reservation client for Linux servers, with foreground support on Windows. It polls for lectures, reads CAPTCHAs, submits reservations and checks the results.
+A multi-account lecture reservation tool with a Chinese console and the existing CLI. The console uses plain HTTP, has no administrator login and must run only on a trusted LAN or VPN; the owner or a few trusted operators manage school accounts from it. Each account independently authenticates, reserves, verifies results and tracks attendance progress. Requests to the university still use certificate-validated HTTPS.
 
-The fixed goal is **8 attended humanities and scientific literacy series lectures, including at least one each in law, art and mental health**. Once series lecture reservations cover the goal, it waits for attendance; it exits when attendance meets the goal. “SEU Coffee Room” salons can still be booked when enabled, but do not count toward the goal. Test activities and ticket notices are not reserved or counted. The university makes the final assessment.
+The goal remains **8 attended humanities and scientific literacy lectures, including law, art and mental health**. Enabled salons can be reserved but do not count. Test activities and ticket notices are excluded. The university makes the final assessment.
 
-After upgrading, all history is recalculated: 7 series lectures plus 1 salon do not complete the goal. Salon reservations do not cover pending lecture requirements, but still block conflicting bookings. Salons are enabled by default and remain subject to existing filters and task pause/completion rules; see [configuration and migration](docs/usage.md#配置) (Chinese).
+![Web console offline demo (pre-simplification version)](docs/images/web-console.png)
 
-## 1. Install
+The screenshot uses offline synthetic accounts and state, not live school records.
 
-Ubuntu 24.04: connect over SSH and install the tools. Skip tools already installed; omit `sudo` when running as root.
+## Install
 
-```bash
-sudo apt update
-sudo apt install -y git curl ca-certificates
-curl -LsSf https://astral.sh/uv/install.sh | sh
-. "$HOME/.local/bin/env"
-```
-
-Windows: install [Git](https://git-scm.com/) and [uv](https://docs.astral.sh/uv/getting-started/installation/), then open Git Bash for the project commands below. Ubuntu system installation and systemd commands apply only to Linux.
-
-Download the project and install locked dependencies. uv prepares Python 3.12:
+Production deployment targets Linux with Python 3.12 and uv. Windows supports the CLI and offline checks.
 
 ```bash
 git clone https://github.com/MuZiJin701/seu-lecture-reserve-http.git
 cd seu-lecture-reserve-http
 uv sync --locked
-```
-
-Run all subsequent commands from the project directory, using the same account for installation and operation. Keep the original directory and configuration of an existing checkout.
-
-## 2. Configure
-
-Copy the example on first use. If `.env` already exists, skip copying and edit it directly.
-
-```bash
 cp -n .env.example .env
-chmod 600 .env
 ```
 
-Open `.env` in a text editor and enter your university credentials:
+Keep an existing configuration and add the Web fields from [.env.example](.env.example). The program loads `.env` from the working directory; do not source it. Process environment variables take precedence.
+
+## Configure and start the console
+
+The console uses the settings below; no administrator password or TLS certificate is needed:
 
 ```dotenv
-SEU_CARD_NUMBER="your-card-number"
-SEU_PASSWORD='your-password'
-SEU_PREFERRED_CAMPUS='["九龙湖校区","四牌楼校区","丁家桥校区","无锡校区","苏州校区"]'
+SEU_WEB_HOST=0.0.0.0
+SEU_WEB_PORT=8080
+SEU_DATA_DIR=state
 ```
 
-The sample config lists all university campuses; the built-in default is an empty campus list, so offline lectures are not booked unless configured. An empty campus list allows online lectures only; you can also keep just some campuses. Online lectures remain enabled. See [all settings](docs/usage.md#配置) (Chinese) for other filters.
-
-Email is optional: leave its fields empty to disable it. To enable it, enter your own mailbox and its SMTP authorization code:
-
-```dotenv
-SMTP_USERNAME=your-address@qq.com
-SMTP_PASSWORD='your-authorization-code'
-```
-
-QQ, 163 and 126 use authorization codes generated after enabling SMTP; Gmail uses an app password. Messages go to yourself by default. Follow [password setup](docs/usage.md#获取发信密码) before continuing. See [email settings](docs/usage.md#邮件配置) for changing providers or recipients (Chinese).
-
-Save `.env` and restart the program to apply changes. The program reads the file directly; do not run `source .env`. Process environment variables take precedence. Keep credentials and state files private.
-
-## 3. Check first
+Use `--config /absolute/path/.env` to select another configuration file. There is no administrator login; deploy only on a trusted LAN or VPN. Any reachable host on the same network can operate the console and access plaintext school credentials, so never expose the port publicly.
 
 ```bash
-uv run --locked main.py --check
+uv run --locked seu-reserve-web
 ```
 
-`event=read_only_complete` means login, current data and CAPTCHA image checks finished. This command does not book, change task state or send email. See [troubleshooting](docs/usage.md#排错) (Chinese) if it fails.
+Open `http://127.0.0.1:8080` (or the server address). Add a school account, configure filters and its recipient, then explicitly start it. Send SMS and enter its code in that account's authentication panel; other accounts continue. Closing the page does not stop reservations.
 
-If email is configured, run the following command and confirm receipt in your inbox. Otherwise skip it.
+See the [Web console, systemd and risk notes](docs/web.md) (Chinese). A new deployment starts from an empty data root and does not detect or import old single-account task files.
+
+## Mail and account data
+
+Keep the shared SMTP sender in the server `.env`, using `SMTP_USERNAME` and `SMTP_PASSWORD`. Set one recipient per school account in the console. An empty recipient disables its mail; the sender is never a fallback recipient. Enabling mail with invalid shared configuration blocks that account's startup. Delivery failure does not change reservation results. Only major alerts and optional success notices are sent; the console can send a test email.
+
+As explicitly chosen, school passwords and cookies are stored **locally in plaintext**, used only on the server, and never returned to the page. Keep `.env` and the data directory outside version control. Because storage is plaintext and file permissions are not restricted, anyone who can access the data directory can read the credentials. Stop an account before deletion; unresolved submissions or interval holds must be checked first. Deleting local data does not cancel school reservations.
+
+Each school account has its own process, and the console allows only one worker per account. The identity lock has been removed, so one school account may use concurrent sessions (single account, single machine, roughly 4 minutes of read-only evidence; see the [concurrent login record](docs/acceptance/2026-10-30-concurrent-login.md)); avoid extra diagnostic logins during the opening period. Ten accounts is an acceptance target, not a hard cap; actual capacity depends on the machine. Two task sets in different data roots cannot discover or coordinate with each other.
+
+## Existing CLI
 
 ```bash
-uv run --locked main.py --test-mail
+# Managed accounts use their unified state. The selector accepts a card number or internal ID.
+uv run --locked main.py --account YOUR_CARD_NUMBER --status
+uv run --locked main.py --account YOUR_CARD_NUMBER --check
+uv run --locked main.py --account YOUR_CARD_NUMBER
 ```
 
-## 4. Start reservations
+The old single-account `.env` mode without `--account` is retained: `uv run --locked main.py` still works. Use `--account` for managed accounts. See the [CLI usage guide](docs/usage.md) (Chinese).
 
-These commands submit real reservations. **Run only one instance per university account across all machines and both projects.** If upgrading from `nohup`, follow the [migration steps](docs/usage.md#从-nohup-迁移) first and keep your state.
+## Validation boundaries
 
-Run in the foreground locally; press `Ctrl+C` to stop:
+Existing single-account live reservations are recorded for [2026-10-26](docs/acceptance/2026-10-26-live-run.md), [2026-10-28](docs/acceptance/2026-10-28-live-run.md) and [2026-10-29](docs/acceptance/2026-10-29-live-run.md). Evidence for the HTTP console simplification and concurrent sessions is in the [current HTTP simplification record](docs/acceptance/2026-10-30-http-console.md) and the [concurrent login record](docs/acceptance/2026-10-30-concurrent-login.md); the earlier HTTPS-version offline evidence is kept in the [2026-10-30 Web offline acceptance](docs/acceptance/2026-10-30-web-offline.md). Real multi-account operation, Linux systemd and long runs require separate acceptance.
 
-```bash
-uv run --locked main.py
-```
+Existing 429/`Retry-After`, short backoff and fallback handling is retained. The earlier claim that the school actively throttles requests was an unsupported assumption and has been withdrawn. [Existing measurements](docs/acceptance/2026-10-29-read-only-probe.md) observed no business-API throttling; that assumption must not explain failures or set polling rates. Single-account samples do not establish multi-account capacity.
 
-For Ubuntu background operation, first run `uv run --locked main.py --status`, check `process_running=false`, and confirm no other machine is using the same account. Then start the service:
-
-```bash
-mkdir -p state
-chmod 700 state
-touch state/runner.log
-chmod 600 state/runner.log
-sudo systemd-run --unit=seu-lecture-reserve-http --collect --service-type=exec \
-  --uid="$(id -un)" --working-directory="$PWD" --expand-environment=no \
-  --property=Restart=no --property=UMask=0077 --property=TimeoutStopSec=60 \
-  --property="StandardOutput=append:$PWD/state/runner.log" \
-  --property=StandardError=inherit \
-  "$(command -v uv)" run --locked main.py
-```
-
-It continues after SSH disconnects. Run these startup commands again after the program exits or the server reboots. The service reads the project's `.env`; it does not automatically inherit temporary SSH settings or proxy variables. See [service environment](docs/usage.md#服务环境) before using a proxy. Adjust log paths if you changed the state directory.
-
-## 5. View, stop and resume
-
-On either Windows or Ubuntu, open another terminal in the project directory:
-
-```bash
-uv run --locked main.py --status
-```
-
-Read `process_running`, `phase` and `last_query_at` together. `status=scanning` describes the task; it does not prove process health or reservation success. See [status and logs](docs/usage.md#状态与日志) for selection reasons and more fields (Chinese).
-
-On Ubuntu, inspect the service and recent output:
-
-```bash
-sudo systemctl status seu-lecture-reserve-http.service --no-pager
-tail -n 20 state/runner.log
-```
-
-Stop the background service, then confirm `process_running=false`:
-
-```bash
-sudo systemctl stop seu-lecture-reserve-http.service
-uv run --locked main.py --status
-```
-
-The stopped service may be collected and reported as not found; task state and logs remain. Running the startup commands again resumes the task without cancelling reservations. If SMS authentication requires input, background operation saves the task and exits. Confirm it has exited before handling the prompt in the foreground. Stopping that foreground process and starting a new background process creates a new login session and may require SMS again; authenticate early in the final process and keep it running through the opening.
-
-An uncertain reservation is checked through both my activities and the activity list while other submissions pause. A failed, contradictory or unreadable check is not a valid check and does not advance automatic release. After 3 valid checks without the record, scanning resumes only when a separate time hold can protect each unresolved reservation. Conflicting candidates are skipped, each original activity may be submitted at most twice more, and explicit success evidence immediately counts toward conflicts and planned progress. Holds expire after about ten minutes or at the activity's start; server-directed waits take priority. Missing time or category data in old state preserves protection and pauses new submissions. `uv run --locked main.py --resolve-pending` is a manual fallback that clears only the matching activity and never submits. See [recovery](docs/usage.md#入口与恢复) and [opening and congestion recovery](docs/usage.md#开抢与拥塞恢复) (Chinese).
-
-Stop the old instance before updating, keeping `.env` and the state directory. Run `uv sync --locked` after updating, then start the program as before. An existing process does not load fixes automatically.
-
-As of 2026-10-30, **607 offline tests pass and 5 are skipped for platform limitations**; mypy passes. The main thread makes decisions and submits reservations serially. During openings, one read-only thread polls the activity list at a **0.10-second** target interval; another refreshes my activities about every **5 seconds**. New history replaces the main-loop cache promptly, with a 10-second cache limit while background refresh is enabled. Normal scans remain 10 seconds and opening network-error retries remain 0.25 seconds; 429/`Retry-After` and 502–504 overload handling is defensive—measurements observed no school throttling, and it does not set request rates. See the [usage guide](docs/usage.md) for configuration and recovery.
-
-Campus application CAS login is preferred when the entry supplies that service. The program does not change Clash/TUN, DNS or routes; users control the network path. A 2026-10-29 local test confirmed that campus direct login still requires SMS, and a second login shortly after was refused by the school's SMS sender. A failed SMS send, or a network/429 failure of the send request itself, now asks the user to retry later and blocks further send requests for about a minute (longer when `Retry-After` says so), and that cooldown survives the campus-to-gateway re-login; a campus direct login that lacks service information, or fails to reach the application with a network/HTTP/TLS error, falls back once to the gateway route, while credential errors and manual challenges do not fall back. `--check` and normal operation are separate processes; without `SEU_TRUST_DEVICE` they do not share login sessions, and with it enabled a local cookie file may allow a silent login. Complete authentication early in the process that will make reservations, and keep it running through the opening. To skip SMS on later logins from the same device, opt in with `SEU_TRUST_DEVICE` (off by default; it keeps a local fingerprint and a credential-equivalent school cookie file—never enable it on a shared or public computer, and deleting that cookie file ends silent re-login). A single-sample test on 2026-10-30 confirmed a fresh-process re-login without SMS; an invalid cookie falls back to password + SMS, and session expiry still requires re-login.
-
-Real reservations were confirmed by activity ID on [2026-10-26](docs/acceptance/2026-10-26-live-run.md), [2026-10-28 at 19:00](docs/acceptance/2026-10-28-live-run.md) and [2026-10-29 at 19:00](docs/acceptance/2026-10-29-live-run.md). Today's [read-only comparison](docs/acceptance/2026-10-29-read-only-probe.md) completed 592 activity-list queries without observing rate limiting or an obvious slowdown at higher polling rates. This short test does not establish opening success rates. The same-day campus direct re-test has verified a real campus CAS login and a 30-second two-reader concurrent read-only query; hit-rate statistics across repeated openings, long runs, CAPTCHA prefetch accuracy and SMS recovery after session expiry still require separate acceptance. See the [acceptance boundaries](docs/usage.md#验收记录) and [business rules](docs/requirements.md) (Chinese).
-
-Maintainer: [MuZiJin701](https://github.com/MuZiJin701) · [Browser version](https://github.com/MuZiJin701/seu_lecture_reserve) · [Historical promotional assets](docs/promo/usage.md)
+Maintainer: [MuZiJin701](https://github.com/MuZiJin701) · [Requirements](docs/requirements.md) · [Glossary](GLOSSARY.md) · [Historical promotional assets](docs/promo/usage.md)

@@ -86,7 +86,7 @@ HISTORY_REFRESH_MIN_INTERVAL = 2.0
 PREPARATION_MAX_UNCERTAINTY = 2.0
 # After a poller failure, do not recreate it for at least this long (server Retry-After wins).
 POLLER_RETRY_MIN_SECONDS = 5.0
-# 502/503/504 mean the server is overloaded, not that a rate limit is in force; recover in seconds.
+# Treat 502/503/504 as temporary service failures; they do not establish overload or rate limiting.
 # Explicit Retry-After still wins.
 OVERLOAD_RETRY_CAP = 5.0
 # A concurrent local reader can briefly block the Windows state replace; report such a transient
@@ -517,7 +517,8 @@ def run(settings: Settings, *, session: Any = None,
         clock: Callable[[], float] = time.time,
         recognize: Callable[[bytes], str] | None = None,
         check_only: bool = False, new_task: bool = False,
-        background_poller: bool = True) -> int:
+        background_poller: bool = True,
+        stop: Callable[[], bool] | None = None) -> int:
     environ = os.environ if environ is None else environ
     announced: set[str] = set()
     alerts: dict[str, float] = {}
@@ -566,6 +567,10 @@ def run(settings: Settings, *, session: Any = None,
         close = getattr(session, 'close', None)
         if callable(close):
             close()
+
+    def check_stopped() -> None:
+        if stop is not None and stop():
+            raise KeyboardInterrupt
 
     def stop_poller() -> None:
         nonlocal activity_poller, poller_client
@@ -631,6 +636,7 @@ def run(settings: Settings, *, session: Any = None,
         Checking at the call site also stops both readers, because a wait learned after the last
         scan checkpoint would otherwise let the other thread keep polling inside the pause.
         """
+        check_stopped()
         if not shared_wait_pending():
             return
         stop_poller()
@@ -908,6 +914,7 @@ def run(settings: Settings, *, session: Any = None,
 
     def pause(seconds: float, wake: Callable[[float], bool] | None = None) -> None:
         while True:
+            check_stopped()
             duration = seconds
             for event, since, limit in (
                     ('query_failure', task.data.get('query_failure_since') if task else None,
@@ -922,6 +929,8 @@ def run(settings: Settings, *, session: Any = None,
                         duration = min(duration, remaining)
             if seconds <= 0:
                 return
+            if stop is not None:
+                duration = min(duration, 0.2)
             # Persist the latest coalesced snapshot at each wait boundary so --status and an
             # outside observer always see the state the scan is about to wait in.
             flush_health()
@@ -1523,6 +1532,7 @@ def run(settings: Settings, *, session: Any = None,
         known_openings: list[tuple[float, float]] = opening_windows(details)
         while True:
             try:
+                check_stopped()
                 scan_started = clock()
                 school_now = clock() + server_offset
                 known_openings = [window for window in known_openings if window[1] >= school_now - 1]
@@ -1894,6 +1904,8 @@ def run(settings: Settings, *, session: Any = None,
                 current = progress(progress_rows(history, hold_entries(), clock() + server_offset),
                                    clock() + server_offset)
                 latest_progress, progress_at = current, mine_at
+                snapshot['progress'] = dict(completed=dict(current.completed), planned=dict(current.planned),
+                                            missing=sorted(current.missing), at=mine_at)
                 if current.done:
                     newly_completed = task.data['status'] != 'done'
                     task.data.update(status='done', activity='')

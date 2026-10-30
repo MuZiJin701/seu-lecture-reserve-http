@@ -975,7 +975,7 @@ def test_trusted_authenticate_persists_only_school_cookies(tmp_path):
     assert session.authenticated
     assert session.verify_calls == 0          # nothing persisted yet: normal login only
     assert session.cas_login_calls == 1
-    stored = load_trust_cookies(tmp_path)
+    stored = load_trust_cookies(tmp_path, account=TRUST_CREDENTIALS['SEU_USERNAME'])
     assert [item['name'] for item in stored] == ['TGT', 'JSESSIONID']
     assert stored[0]['domain'] == 'auth.seu.edu.cn' and stored[0]['secure'] is True
     assert stored[0]['expires'] is None
@@ -985,17 +985,17 @@ def test_trusted_authenticate_persists_only_school_cookies(tmp_path):
 
 
 def test_trust_device_disabled_persists_and_loads_nothing(tmp_path):
-    save_trust_cookies(tmp_path, school_trust_cookies())
+    save_trust_cookies(tmp_path, school_trust_cookies(), account=TRUST_CREDENTIALS['SEU_USERNAME'])
     client, session = campus_client(tmp_path, trust_device=False)
     client.authenticate()
     assert session.authenticated
     assert session.verify_calls == 0
     # The file was not used and not rewritten with the fake session's unrelated cookie.
-    assert [item['name'] for item in load_trust_cookies(tmp_path)] == ['TGT', 'JSESSIONID']
+    assert [item['name'] for item in load_trust_cookies(tmp_path, account=TRUST_CREDENTIALS['SEU_USERNAME'])] == ['TGT', 'JSESSIONID']
 
 
 def test_persisted_cookies_are_loaded_into_a_fresh_session_and_would_be_sent(tmp_path):
-    save_trust_cookies(tmp_path, school_trust_cookies())
+    save_trust_cookies(tmp_path, school_trust_cookies(), account=TRUST_CREDENTIALS['SEU_USERNAME'])
     session = requests.Session()
     client = Client(session, TRUST_CREDENTIALS, input, lambda _: None,
                     trust_device=True, fingerprint_dir=tmp_path)
@@ -1014,7 +1014,7 @@ def test_persisted_cookies_are_loaded_into_a_fresh_session_and_would_be_sent(tmp
 
 def test_expired_persisted_cookie_is_not_loaded(tmp_path):
     save_trust_cookies(tmp_path, [dict(name='TGT', value='stale', domain='auth.seu.edu.cn',
-                                       path='/', secure=True, expires=time.time() - 60)])
+                                       path='/', secure=True, expires=time.time() - 60)], account=TRUST_CREDENTIALS['SEU_USERNAME'])
     client, session = campus_client(tmp_path, verify=VERIFY_REDIRECT)
     client.authenticate()
     assert session.verify_calls == 0          # an expired cookie must not trigger verifyTgt
@@ -1041,7 +1041,7 @@ def test_unwritable_trust_state_directory_does_not_break_login(tmp_path):
 
 
 def test_verify_tgt_201_redirect_completes_login_without_password_or_sms(tmp_path):
-    save_trust_cookies(tmp_path, school_trust_cookies())
+    save_trust_cookies(tmp_path, school_trust_cookies(), account=TRUST_CREDENTIALS['SEU_USERNAME'])
     client, session = campus_client(tmp_path, verify=VERIFY_REDIRECT)
     client.authenticate()
     assert session.verify_calls == 1
@@ -1053,7 +1053,7 @@ def test_verify_tgt_201_redirect_completes_login_without_password_or_sms(tmp_pat
 
 
 def test_verify_tgt_200_rechecks_the_entry_page(tmp_path):
-    save_trust_cookies(tmp_path, school_trust_cookies())
+    save_trust_cookies(tmp_path, school_trust_cookies(), account=TRUST_CREDENTIALS['SEU_USERNAME'])
     client, session = campus_client(tmp_path, verify=VERIFY_ALREADY)
     client.authenticate()
     assert session.verify_calls == 1
@@ -1063,7 +1063,7 @@ def test_verify_tgt_200_rechecks_the_entry_page(tmp_path):
 
 @pytest.mark.parametrize('verify', [VERIFY_REJECTED, RemoteError('service_unavailable')])
 def test_verify_tgt_failure_or_error_falls_back_to_password_login(tmp_path, verify):
-    save_trust_cookies(tmp_path, school_trust_cookies())
+    save_trust_cookies(tmp_path, school_trust_cookies(), account=TRUST_CREDENTIALS['SEU_USERNAME'])
     client, session = campus_client(tmp_path, verify=verify)
     client.authenticate()
     assert session.verify_calls == 1
@@ -1072,7 +1072,7 @@ def test_verify_tgt_failure_or_error_falls_back_to_password_login(tmp_path, veri
 
 
 def test_verify_tgt_non_app_redirect_falls_back_to_password_login(tmp_path):
-    save_trust_cookies(tmp_path, school_trust_cookies())
+    save_trust_cookies(tmp_path, school_trust_cookies(), account=TRUST_CREDENTIALS['SEU_USERNAME'])
     client, session = campus_client(tmp_path, verify=VERIFY_REDIRECT,
                                     broken_trust_redirect=True)
     client.authenticate()
@@ -1088,10 +1088,10 @@ def test_verify_tgt_non_app_redirect_falls_back_to_password_login(tmp_path):
 def test_verify_tgt_runs_only_when_persisted_cookies_were_loaded(tmp_path, trust_device,
                                                                  cookie_file):
     if cookie_file == 'valid':
-        save_trust_cookies(tmp_path, school_trust_cookies())
+        save_trust_cookies(tmp_path, school_trust_cookies(), account=TRUST_CREDENTIALS['SEU_USERNAME'])
     elif cookie_file == 'expired':
         save_trust_cookies(tmp_path, [dict(name='TGT', value='stale', domain='auth.seu.edu.cn',
-                                           path='/', secure=True, expires=time.time() - 60)])
+                                           path='/', secure=True, expires=time.time() - 60)], account=TRUST_CREDENTIALS['SEU_USERNAME'])
     client, session = campus_client(tmp_path, trust_device=trust_device, verify=VERIFY_REDIRECT)
     client.authenticate()
     assert session.verify_calls == 0

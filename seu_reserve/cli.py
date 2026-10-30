@@ -5,6 +5,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import sys
 import time
 from collections.abc import Mapping
@@ -109,7 +110,8 @@ def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[S
                'SEU_ENABLE_OFFLINE', 'SEU_STATE_DIR', 'SEU_MAIL_SUCCESS', 'SMTP_HOST', 'SMTP_PORT',
                'SMTP_USERNAME', 'SMTP_PASSWORD', 'MAIL_FROM', 'MAIL_TO', 'SEU_VPN_IP',
                'SEU_CAPTCHA_PREFETCH', 'SEU_PREWARM', 'SEU_POLLER_ALIGN',
-               'SEU_HISTORY_BACKGROUND', 'SEU_TRUST_DEVICE'}
+               'SEU_HISTORY_BACKGROUND', 'SEU_TRUST_DEVICE', 'SEU_DATA_DIR',
+               'SEU_WEB_HOST', 'SEU_WEB_PORT'}
     if set(values) - allowed:
         raise ValueError('unknown_configuration_key')
     environ = {**values, **process}
@@ -147,6 +149,14 @@ def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[S
     return Settings(**data), environ
 
 
+def data_root_from(source: Path, environ: Mapping[str, str]) -> Path:
+    """Resolve the shared data root used by the web catalogue and `--account` CLI."""
+    value = environ.get('SEU_DATA_DIR', environ.get('SEU_STATE_DIR', 'state')).strip()
+    if not value:
+        raise ValueError('invalid_data_directory')
+    return source.parent / value
+
+
 def load_recognizer() -> Any:
     """Load OCR before any opening window; a first-candidate import would spend opening seconds."""
     import ddddocr
@@ -156,6 +166,7 @@ def load_recognizer() -> Any:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='SEU lecture goal: 8 attended, including law, art and mental health')
     parser.add_argument('--config', type=Path, help='dotenv file (default: .env in the current directory)')
+    parser.add_argument('--account', help='managed school account (card number or internal ID)')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--check', action='store_true', help='authenticate, explain lecture selection and fetch captcha without submitting or saving a task')
     mode.add_argument('--new-task', action='store_true', help='compatibility: recheck a completed goal (normal startup also rechecks)')
@@ -172,6 +183,22 @@ def main(argv: list[str] | None = None) -> int:
     previous = signal.signal(signal.SIGTERM, stop)
     try:
         settings, environ = configuration_from(args.config, os.environ)
+        from .accounts import Accounts, account_environ, account_settings
+        source = args.config or Path('.env')
+        data_root = data_root_from(source, environ)
+        if args.account:
+            catalogue = Accounts(data_root)
+            entries = catalogue.list()
+            # Prefer the internal ID so a card number that happens to look like another account's
+            # ID can never select the wrong account.
+            account = next((entry for entry in entries if entry['id'] == args.account), None)
+            if account is None:
+                account = next((entry for entry in entries if entry['username'] == args.account), None)
+            if account is None or account['deleting']:
+                raise ValueError('account_not_found')
+            settings = account_settings(account, catalogue.state_dir(account['id']))
+            if not args.status:
+                environ = account_environ(account, environ)
         if args.status:
             show_status(settings.state_dir)
             return 0
@@ -200,6 +227,14 @@ def main(argv: list[str] | None = None) -> int:
         for key, label in (('SEU_USERNAME', '一卡通号：'), ('SEU_PASSWORD', '密码：')):
             if not environ.get(key):
                 environ[key] = getpass(label)
+        if not args.account and (data_root / 'accounts.sqlite3').exists():
+            if any(entry['username'] == environ['SEU_USERNAME'] for entry in Accounts(data_root).list()):
+                print('event=account_managed_use_account', flush=True)
+                return 1
+        if not args.check and task_running(settings.state_dir):
+            # Another reservation loop owns this checkpoint; never start a second writer.
+            print('event=state_in_use', flush=True)
+            return 1
         if args.resolve_pending:
             return resolve_pending(settings, environ=environ)
         recognize = None
@@ -213,8 +248,11 @@ def main(argv: list[str] | None = None) -> int:
                    recognize=recognize)
     except (KeyboardInterrupt, EOFError):
         return 130
-    except (ValueError, OSError, TypeError, AttributeError):
-        print('event=configuration_or_state_invalid', flush=True)
+    except (ValueError, OSError, TypeError, AttributeError, sqlite3.Error) as exc:
+        reason = str(exc) if isinstance(exc, ValueError) else ''
+        events = {'account_not_found', 'state_in_use', 'mail_configuration_invalid',
+                  'unknown_configuration_key', 'invalid_data_directory', 'invalid_state'}
+        print('event=' + (reason if reason in events else 'configuration_or_state_invalid'), flush=True)
         return 1
     finally:
         signal.signal(signal.SIGTERM, previous)

@@ -1,141 +1,71 @@
-# 东南大学讲座预约 · HTTPS 版
+# 东南大学讲座预约 · HTTP 管理台
 
 [English](README.en.md)
 
-无需浏览器的讲座预约工具，主要用于 Linux 服务器，也可在 Windows 前台运行。它持续查询讲座、识别验证码、提交预约并核对结果。
+支持多学校账号的讲座预约工具，提供中文管理台和原有 CLI。管理台使用明文 HTTP、没有管理员登录，只部署在可信局域网或 VPN，由本人或少数可信操作者集中配置账号；每个学校账号独立运行、认证、核对预约结果和统计选听进度。访问学校系统的请求仍使用通过证书校验的 HTTPS。
 
-目标固定为实际选听 **8 场人文与科学素养系列讲座，法律、艺术、心理健康各至少 1 场**。正式讲座预约够了会等待参加，打卡达标后结束；“SEU咖啡间”沙龙可按配置预约，但不计入目标；测试活动与购票公告不预约、不计数，最终认定以学校为准。
+目标仍为实际选听 **8 场人文与科学素养系列讲座，法律、艺术、心理健康各至少 1 场**。沙龙可按配置预约但不计入目标；测试活动与购票公告不预约。最终认定以学校为准。
 
-升级后会按新口径重算全部历史，7 场正式讲座加 1 场沙龙不算达标；沙龙不占正式讲座的待参加缺口，已有沙龙预约仍参与时间冲突检查。沙龙默认启用，仍受原有筛选和任务暂停／结束规则约束，配置说明见[使用指南](docs/usage.md#配置)。
+![Web 管理台离线演示（HTTP 简化前的版本）](docs/images/web-console.png)
 
-## 1. 安装
+截图使用构造账号与状态，不是真实学校运行记录。
 
-Ubuntu 24.04：通过 SSH 登录，安装工具。已有工具可跳过；root 用户省略 `sudo`。
+## 安装
 
-```bash
-sudo apt update
-sudo apt install -y git curl ca-certificates
-curl -LsSf https://astral.sh/uv/install.sh | sh
-. "$HOME/.local/bin/env"
-```
-
-Windows：安装 [Git](https://git-scm.com/) 和 [uv](https://docs.astral.sh/uv/getting-started/installation/)，打开 Git Bash，执行下面的项目命令。Ubuntu 系统安装和 systemd 命令只用于 Linux。
-
-下载项目并安装锁定的依赖，uv 会准备 Python 3.12：
+生产部署使用 Linux、Python 3.12 和 uv；Windows 可运行 CLI 和离线检查。已有工具可直接使用。
 
 ```bash
 git clone https://github.com/MuZiJin701/seu-lecture-reserve-http.git
 cd seu-lecture-reserve-http
 uv sync --locked
-```
-
-后续命令都在项目目录执行；安装和运行使用同一账号。已有项目保留原文件夹和配置。
-
-## 2. 填写配置
-
-首次使用时复制样例；已有 `.env` 就跳过复制，直接编辑。
-
-```bash
 cp -n .env.example .env
-chmod 600 .env
 ```
 
-用编辑器打开 `.env`，填写学校账号和密码：
+已有配置保留原文件，按 [.env.example](.env.example) 补充 Web 字段。程序自动读取当前目录 `.env`，不要 `source .env`；进程环境变量优先。
+
+## 配置并启动管理台
+
+管理台默认使用以下配置，不需要管理员密码或 TLS 证书：
 
 ```dotenv
-SEU_CARD_NUMBER="你的一卡通号"
-SEU_PASSWORD='你的密码'
-SEU_PREFERRED_CAMPUS='["九龙湖校区","四牌楼校区","丁家桥校区","无锡校区","苏州校区"]'
+SEU_WEB_HOST=0.0.0.0
+SEU_WEB_PORT=8080
+SEU_DATA_DIR=state
 ```
 
-样例配置列出学校全部校区；程序内置默认为空校区列表，未配置时不约线下。校区为 `[]` 时只约线上，也可按需只保留部分校区。线上仍可预约。其他筛选见[完整配置](docs/usage.md#配置)。
-
-邮件可选，不需要就保留空值。需要时填写自己的邮箱和发信授权码：
-
-```dotenv
-SMTP_USERNAME=your-address@qq.com
-SMTP_PASSWORD='your-authorization-code'
-```
-
-QQ、163、126 使用开启 SMTP 后生成的授权码，Gmail 使用应用专用密码；默认发给自己。先按[获取发信密码](docs/usage.md#获取发信密码)完成设置，再继续。更换邮箱或指定收件人见[邮件配置](docs/usage.md#邮件配置)。
-
-保存 `.env`，重启程序后生效。程序直接读取文件，不要执行 `source .env`；进程环境变量优先。凭据和状态文件只留在自己的设备上。
-
-## 3. 先检查
+可用 `--config /绝对路径/.env` 指定其他配置文件。管理台没有管理员登录，只应部署在可信局域网或 VPN；同网段任何可达机器都能操作管理台并接触明文保存的学校凭据，不要把端口暴露到公网。
 
 ```bash
-uv run --locked main.py --check
+uv run --locked seu-reserve-web
 ```
 
-看到 `event=read_only_complete` 表示登录、当前数据和验证码图片检查完成；不会预约、修改任务或发邮件。失败时看[排错说明](docs/usage.md#排错)。
+打开 `http://127.0.0.1:8080`（服务器部署换成实际地址）。添加学校账号、设置筛选和收信邮箱，保存后手动点击“启动预约”。需要短信时，在对应账号卡片里发送短信并输入验证码；其他账号继续运行。关闭网页不会停止后台任务。
 
-配置了邮件，再执行下面的命令，并确认收件箱收到；不用邮件就跳过。
+[完整 Web 使用、systemd 部署与风险说明](docs/web.md)。新部署从空数据根目录开始，不检测也不导入旧的单账号任务文件。
+
+## 邮件与账号数据
+
+SMTP 发信账号仍在服务器 `.env` 中配置，例如 `SMTP_USERNAME`、`SMTP_PASSWORD`；每学校账号在网页指定一个收信邮箱。留空关闭该账号邮件，绝不默认发给公共发信邮箱。启用邮件而公共配置无效时阻止该账号启动；发送失败不改变预约结果。只发重大告警及可选成功通知，可在网页发送测试邮件。
+
+学校密码和 Cookie 按已确认方案**本地明文保存**，仅服务器使用，网页不回显密码；数据目录与 `.env` 不进入仓库。明文保存且不限制文件权限，能访问数据目录的人即可取得凭据。删除账号前先停止，存在待确认或时间占位时先核对；删除本地数据不会取消学校已有预约。
+
+每学校账号使用独立进程，Web 内同账号只允许一个工作进程。账号身份锁已移除，同一学校账号允许并发登录（单账号单机约 4 分钟只读实测，见[并发登录记录](docs/acceptance/2026-10-30-concurrent-login.md)）；开抢期仍建议避免额外的诊断登录。10 账号仅为验收目标，不设硬上限；实际容量取决于设备。不同数据根目录的两套任务无法互相发现，也不能互相协调。
+
+## 保留的 CLI
 
 ```bash
-uv run --locked main.py --test-mail
+# 已纳管账号使用其统一状态；账号参数可为一卡通号或内部 ID。
+uv run --locked main.py --account 你的一卡通号 --status
+uv run --locked main.py --account 你的一卡通号 --check
+uv run --locked main.py --account 你的一卡通号
 ```
 
-## 4. 启动预约
+不带 `--account` 的旧单账号 `.env` 运行方式仍保留，可用 `uv run --locked main.py` 启动。已纳管账号使用 `--account`。入口、恢复和诊断字段见[CLI 使用指南](docs/usage.md)。
 
-以下命令会提交真实预约。**同账号在所有机器及两个项目之间只运行一个实例。** 旧 `nohup` 用户先按[迁移步骤](docs/usage.md#从-nohup-迁移)停止旧实例，保留状态。
+## 验证边界
 
-本地前台运行，按 `Ctrl+C` 停止：
+已有单账号真实预约记录见 [2026-10-26](docs/acceptance/2026-10-26-live-run.md)、[2026-10-28](docs/acceptance/2026-10-28-live-run.md)及 [2026-10-29](docs/acceptance/2026-10-29-live-run.md)。管理台 HTTP 简化与同账号并发登录的证据见[本轮 HTTP 简化验收](docs/acceptance/2026-10-30-http-console.md)与[并发登录记录](docs/acceptance/2026-10-30-concurrent-login.md)；HTTPS 版本的离线记录保留在[2026-10-30 Web 离线验收](docs/acceptance/2026-10-30-web-offline.md)。真实多账号、Linux systemd 和长期运行仍需分别验收。
 
-```bash
-uv run --locked main.py
-```
+保留现有 429／`Retry-After`、短退避与故障回退逻辑。此前“学校会主动限流”的判断属于无实测支持的主观猜测，已撤回；[既有实测](docs/acceptance/2026-10-29-read-only-probe.md)未观察到业务接口限流，不以该猜测解释故障或选择请求频率。多账号负载不能由单账号样本推定。
 
-Ubuntu 后台运行：先执行 `uv run --locked main.py --status`，确认 `process_running=false`，并确认其他机器没有同账号实例，再启动服务。
-
-```bash
-mkdir -p state
-chmod 700 state
-touch state/runner.log
-chmod 600 state/runner.log
-sudo systemd-run --unit=seu-lecture-reserve-http --collect --service-type=exec \
-  --uid="$(id -un)" --working-directory="$PWD" --expand-environment=no \
-  --property=Restart=no --property=UMask=0077 --property=TimeoutStopSec=60 \
-  --property="StandardOutput=append:$PWD/state/runner.log" \
-  --property=StandardError=inherit \
-  "$(command -v uv)" run --locked main.py
-```
-
-SSH 断开后继续运行；程序退出或服务器重启后，需手动执行这段启动命令。服务使用项目 `.env`，不自动继承 SSH 临时配置或代理变量；需要代理时先看[服务环境](docs/usage.md#服务环境)。自定义状态目录时同步调整日志路径。
-
-## 5. 查看、停止与恢复
-
-Windows 或 Ubuntu 都可另开终端，进入项目目录查看：
-
-```bash
-uv run --locked main.py --status
-```
-
-结合 `process_running`、`phase` 和 `last_query_at` 判断进展。`status=scanning` 只表示任务状态，不能证明进程健康或预约成功。筛选原因和更多字段见[状态与日志](docs/usage.md#状态与日志)。
-
-Ubuntu 查看服务及最近输出：
-
-```bash
-sudo systemctl status seu-lecture-reserve-http.service --no-pager
-tail -n 20 state/runner.log
-```
-
-停止后台服务，再用项目状态命令确认 `process_running=false`：
-
-```bash
-sudo systemctl stop seu-lecture-reserve-http.service
-uv run --locked main.py --status
-```
-
-停止后服务可能被回收，显示“未找到”；任务和日志仍保留。重新执行启动命令会接着原任务，不取消已有预约。遇短信认证时后台会保留任务并退出；确认后台已退出后，在前台按提示处理。停止前台再启动后台会重新建立登录会话，可能再次要求短信；预约前应在最终运行进程中完成认证，并保持该进程运行。
-
-预约结果待确认时，先通过“我的活动”和活动列表核对原活动，暂停其他提交。查询失败、记录矛盾或结构不可读的核对不算有效查询，不推进自动解除。连续 3 次有效查询仍未显示且能建立时间占位时，保留每笔预约的独立占位再恢复扫描：跳过冲突候选，原活动最多再提交 2 次；明确成功证据立即计入冲突检查和计划进度。占位约十分钟或到活动开始前失效；服务端要求等待时优先遵守。旧状态缺少时间或类别时保留保护并暂停新增。`uv run --locked main.py --resolve-pending` 是人工兜底，只清理对应活动，不提交预约。详见[恢复说明](docs/usage.md#入口与恢复)和[开抢与拥塞恢复](docs/usage.md#开抢与拥塞恢复)。
-
-更新代码前先停止旧实例，保留 `.env` 和状态目录；更新后执行 `uv sync --locked`，再按原方式启动。运行中的旧进程不会自动加载修复。
-
-截至 2026-10-30，完整离线测试 **607 项通过、5 项平台限制跳过**，mypy 通过。主线程串行决策和提交；开抢期活动列表由只读线程按 **0.10 秒**目标间隔查询，“我的活动”由另一只读线程约 **5 秒**刷新，新历史及时替换主线程缓存，启用后台刷新时缓存最多保留 10 秒。普通扫描仍为 10 秒，网络错误快重试仍为 0.25 秒；429／`Retry-After` 与 502–504 过载处理属防御性措施，实测未观察到学校限流，也不作为选择请求频率的依据。配置和恢复细节见[使用指南](docs/usage.md)。
-
-校园网入口直接返回应用 CAS 时优先校内登录；程序不修改 Clash/TUN、DNS 或路由，网络路径由用户自行管理。2026-10-29 本机实测校园直连仍需短信验证，且短时间重复登录会被学校拒绝发送短信；短信发送失败或发送请求本身遇到网络／429 错误会提示稍后重试，冷却约一分钟（有 `Retry-After` 时取更长）且在校园→网关回退的二次登录后仍生效；校园直连缺少服务信息，或登录后进入应用阶段遇到网络／HTTP／TLS 失败时回退一次原网关认证，凭据错误与人工挑战不回退。`--check` 与正式运行是独立进程，未开启 `SEU_TRUST_DEVICE` 时不共享登录会话，开启后可由本地 Cookie 尝试静默登录；正式运行应提前在最终进程中完成认证并保持运行到开抢结束。如需同一设备后续登录免短信，可开启 `SEU_TRUST_DEVICE`（默认关闭；会在本地保存指纹与等效登录凭据的学校 Cookie 文件，勿在共享或公用电脑启用，删除 Cookie 文件即结束静默登录）；2026-10-30 单样本已验证新进程再登录可免短信，Cookie 失效时回退密码＋短信，且会话过期仍需重新登录。
-
-真实预约已在[2026-10-26](docs/acceptance/2026-10-26-live-run.md)、[2026-10-28 19:00](docs/acceptance/2026-10-28-live-run.md)和[2026-10-29 19:00](docs/acceptance/2026-10-29-live-run.md)按活动 ID 确认。今天的[只读对照测试](docs/acceptance/2026-10-29-read-only-probe.md)共 592 次活动列表查询成功，短测中未观察到高频引起限流或明显响应变慢；它不能证明开抢成功率。同日校园直连复测已验证新版校内 CAS 真实登录和 30 秒双只读线程并发查询；多次开抢的命中率统计、长期运行、验证码预取准确率及运行中短信恢复仍需分别验收，见[验收边界](docs/usage.md#验收记录)和[业务规则](docs/requirements.md)。
-
-维护者：[MuZiJin701](https://github.com/MuZiJin701) · [浏览器版](https://github.com/MuZiJin701/seu_lecture_reserve) · [历史宣传素材](docs/promo/usage.md)
+维护者：[MuZiJin701](https://github.com/MuZiJin701) · [需求](docs/requirements.md) · [术语](GLOSSARY.md) · [历史宣传素材](docs/promo/usage.md)

@@ -1,0 +1,195 @@
+"""Plain-HTTP administration console. Account credentials are never response fields."""
+
+import argparse
+import os
+import sqlite3
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Mapping
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
+
+from .accounts import AccountInput, Accounts, public_account
+from .app import DEFAULT_CATEGORIES
+from .cli import configuration_from, data_root_from
+from .manager import Manager
+
+ASSETS = Path(__file__).parent / 'web_assets'
+CAMPUSES = ['九龙湖校区', '四牌楼校区', '丁家桥校区', '无锡校区', '苏州校区']
+MAX_BODY_BYTES = 65536
+
+# Every response, including middleware early exits, carries the same browser hardening. Plain HTTP
+# has no TLS to rely on for these, so they are always set; HSTS is deliberately absent.
+SECURITY_HEADERS = {
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'same-origin',
+    'Content-Security-Policy': (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+        "connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; "
+        "form-action 'self'"),
+}
+
+SAFE_ERRORS = {
+    'invalid_port', 'invalid_data_directory', 'unknown_configuration_key', 'manager_already_running',
+    'account_not_found', 'account_exists', 'account_already_running', 'account_stopping',
+    'account_identity_immutable', 'account_deleting', 'reservation_protected',
+    'mail_configuration_invalid', 'mail_disabled', 'challenge_expired', 'invalid_answer',
+    'password_required', 'stop_timeout', 'service_stopping', 'state_in_use',
+}
+
+MAIL_FAILURE_REASONS = {
+    'dns_failed', 'tls_failed', 'timeout', 'authentication_failed', 'sender_refused',
+    'recipient_refused', 'message_rejected', 'connection_failed', 'smtp_failed',
+    'network_failed', 'unknown',
+}
+
+
+class AnswerInput(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    challenge: str = Field(min_length=32, max_length=32)
+    answer: str = Field(max_length=16)
+
+
+def rejected(detail: str, status_code: int) -> JSONResponse:
+    return JSONResponse({'detail': detail}, status_code=status_code, headers=SECURITY_HEADERS)
+
+
+def create_app(accounts: Accounts, shared: Mapping[str, str], *, manager: Manager | None = None) -> FastAPI:
+    supervisor = manager or Manager(accounts, shared)
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        try:
+            await run_in_threadpool(supervisor.open)
+        except BaseException as exc:
+            # uvicorn exits the process (SystemExit) on a lifespan startup failure; keep the reason
+            # so main() can report a stable event instead of losing it in the server log.
+            application.state.startup_error = str(exc) if isinstance(exc, ValueError) else ''
+            raise
+        try:
+            yield
+        finally:
+            await run_in_threadpool(supervisor.close)
+
+    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.manager = supervisor
+    app.state.startup_error = ''
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError):
+        # FastAPI's default error includes the rejected input, including passwords/SMS codes.
+        return JSONResponse({'detail': 'invalid_request'}, status_code=422)
+
+    @app.exception_handler(ValueError)
+    async def business_error(request: Request, exc: ValueError):
+        reason = str(exc)
+        safe = SAFE_ERRORS | {'mail_' + item for item in MAIL_FAILURE_REASONS}
+        return JSONResponse({'detail': reason if reason in safe else 'configuration_or_state_invalid'},
+                            status_code=404 if reason == 'account_not_found' else 409)
+
+    @app.middleware('http')
+    async def protect(request: Request, call_next):
+        if request.method not in ('GET', 'HEAD') and request.url.path.startswith('/api/'):
+            origin = request.headers.get('origin')
+            if origin and origin != str(request.base_url).rstrip('/'):
+                return rejected('origin_rejected', 403)
+            media_type = request.headers.get('content-type', '').split(';')[0].strip().lower()
+            if media_type != 'application/json':
+                return rejected('json_required', 415)
+            length = request.headers.get('content-length')
+            if length is None:
+                return rejected('content_length_required', 411)
+            if not length.isdigit() or int(length) > MAX_BODY_BYTES:
+                return rejected('request_too_large', 413)
+        response = await call_next(request)
+        response.headers.update(SECURITY_HEADERS)
+        return response
+
+    @app.get('/api/meta')
+    def meta():
+        return {'categories': list(DEFAULT_CATEGORIES), 'campuses': list(CAMPUSES)}
+
+    @app.get('/api/accounts')
+    def account_list():
+        return [supervisor.snapshot(account) for account in accounts.list()]
+
+    @app.post('/api/accounts', status_code=201)
+    def create_account(data: AccountInput):
+        return public_account(accounts.create(data))
+
+    @app.put('/api/accounts/{identifier}')
+    def edit_account(identifier: str, data: AccountInput):
+        return public_account(supervisor.update(identifier, data))
+
+    @app.delete('/api/accounts/{identifier}')
+    def delete_account(identifier: str):
+        supervisor.delete(identifier)
+        return {'ok': True}
+
+    @app.post('/api/accounts/{identifier}/start')
+    def start_account(identifier: str):
+        supervisor.start(identifier)
+        return {'ok': True}
+
+    @app.post('/api/accounts/{identifier}/stop')
+    def stop_account(identifier: str):
+        supervisor.stop(identifier)
+        return {'ok': True}
+
+    @app.post('/api/accounts/{identifier}/answer')
+    def answer_challenge(identifier: str, data: AnswerInput):
+        supervisor.answer(identifier, data.challenge, data.answer)
+        return {'ok': True}
+
+    @app.post('/api/accounts/{identifier}/test-mail')
+    def test_mail(identifier: str):
+        supervisor.test_mail(identifier)
+        return {'ok': True, 'status': 'smtp_accepted'}
+
+    @app.get('/')
+    def index():
+        return FileResponse(ASSETS / 'index.html', media_type='text/html')
+
+    app.mount('/assets', StaticFiles(directory=ASSETS), name='assets')
+    return app
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description='SEU multi-account HTTP administration console')
+    parser.add_argument('--config', type=Path, help='dotenv file (default: .env)')
+    args = parser.parse_args(argv)
+    try:
+        _, shared = configuration_from(args.config, os.environ)
+        source = args.config or Path('.env')
+        root = data_root_from(source, shared)
+        try:
+            port = int(shared.get('SEU_WEB_PORT') or '8080')
+        except ValueError:
+            raise ValueError('invalid_port') from None
+        if not 1 <= port <= 65535:
+            raise ValueError('invalid_port')
+        host = (shared.get('SEU_WEB_HOST') or '').strip() or '0.0.0.0'
+        app = create_app(Accounts(root), shared)
+        import uvicorn
+        try:
+            uvicorn.run(app, host=host, port=port, workers=1, proxy_headers=False,
+                        access_log=False, server_header=False, timeout_graceful_shutdown=15)
+        except SystemExit:
+            raise ValueError(str(getattr(app.state, 'startup_error', '') or 'startup_failed')) from None
+        return 0
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        reason = str(exc) if isinstance(exc, ValueError) and str(exc) in SAFE_ERRORS else 'configuration_or_state_invalid'
+        print('event=web_configuration_or_state_invalid reason=' + reason)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -115,18 +115,19 @@ def test_process_account_aliases_override_file_and_resume_the_correct_account(tm
     assert (state / 'task.json').read_text() == before
 
 
-@pytest.mark.parametrize('text', [
-    'SEU_PASSWORD="SIMULATED_SECRET\n',
-    'SEU_PREFERRED_LECTURES=SIMULATED_SECRET\n',
-    'SEU_REQUIRED_CATEGORIES=\'[]\'\n',
-    'SEU_ENABLE_ONLNE=SIMULATED_SECRET\n',
-    'SEU_CARD_NUMBER=test-user\nSEU_PASSWORD=test-password\nSEU_VPN_IP=SIMULATED_SECRET\n',
+@pytest.mark.parametrize('text, expected', [
+    ('SEU_PASSWORD="SIMULATED_SECRET\n', 'event=configuration_or_state_invalid'),
+    ('SEU_PREFERRED_LECTURES=SIMULATED_SECRET\n', 'event=configuration_or_state_invalid'),
+    ('SEU_REQUIRED_CATEGORIES=\'[]\'\n', 'event=configuration_or_state_invalid'),
+    ('SEU_ENABLE_ONLNE=SIMULATED_SECRET\n', 'event=unknown_configuration_key'),
+    ('SEU_CARD_NUMBER=test-user\nSEU_PASSWORD=test-password\nSEU_VPN_IP=SIMULATED_SECRET\n',
+     'event=configuration_or_state_invalid'),
 ])
-def test_invalid_dotenv_never_echoes_values_or_starts_authentication(tmp_path, text):
+def test_invalid_dotenv_never_echoes_values_or_starts_authentication(tmp_path, text, expected):
     (tmp_path / '.env').write_text(text)
     result = cli(tmp_path, '--check')
     assert result.returncode == 1
-    assert result.stdout.splitlines()[-1] == 'event=configuration_or_state_invalid'
+    assert result.stdout.splitlines()[-1] == expected
     assert 'SIMULATED_SECRET' not in result.stdout + result.stderr
 
 
@@ -314,3 +315,41 @@ def test_resolve_pending_requires_an_interactive_terminal(tmp_path, monkeypatch,
     monkeypatch.setattr('os.environ', {})
     assert main(['--resolve-pending']) == 1
     assert 'event=interactive_terminal_required' in capsys.readouterr().out
+
+
+def test_account_mode_reads_managed_status_and_unknown_account_reports_event(tmp_path):
+    from seu_reserve.accounts import AccountInput, Accounts
+    (tmp_path / '.env').write_text('SEU_DATA_DIR=data\nSEU_CARD_NUMBER=99999\nSEU_PASSWORD=synthetic\n')
+    accounts = Accounts(tmp_path / 'data')
+    accounts.create(AccountInput(username='10001', name='测试账号', password='synthetic'))
+    result = cli(tmp_path, '--account', '10001', '--status')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0] == 'status=not_started'
+    created = accounts.list()[0]
+    by_id = cli(tmp_path, '--account', created['id'], '--status')
+    assert by_id.returncode == 0, by_id.stderr
+    assert by_id.stdout.splitlines()[0] == 'status=not_started'
+    missing = cli(tmp_path, '--account', 'missing', '--status')
+    assert missing.returncode == 1
+    assert missing.stdout.splitlines()[-1] == 'event=account_not_found'
+
+
+def test_empty_data_directory_is_rejected(tmp_path):
+    (tmp_path / '.env').write_text('SEU_CARD_NUMBER=1\nSEU_PASSWORD=x\nSEU_DATA_DIR=\n')
+    result = cli(tmp_path, '--status')
+    assert result.returncode == 1
+    assert result.stdout.splitlines()[-1] == 'event=invalid_data_directory'
+
+
+def test_running_checkpoint_blocks_a_second_reservation_loop(tmp_path):
+    from seu_reserve.state import Task
+    (tmp_path / '.env').write_text('SEU_CARD_NUMBER=1\nSEU_PASSWORD=synthetic\n')
+    task = Task(tmp_path / 'state', '1')
+    try:
+        task.data['status'] = 'scanning'
+        task.save()
+        result = cli(tmp_path)
+        assert result.returncode == 1
+        assert result.stdout.splitlines()[-1] == 'event=state_in_use'
+    finally:
+        task.close()

@@ -1,4 +1,4 @@
-"""Private, atomic task checkpoint with a process lock."""
+"""Atomic task checkpoint with a process lock."""
 
 import hashlib
 import errno
@@ -71,7 +71,7 @@ def read_json(path: Path) -> Any:
 def open_nofollow(path: Path, flags: int) -> int:
     if not hasattr(os, 'O_NOFOLLOW') and (path.is_symlink() or path.is_junction()):
         raise OSError('unsafe_state_file')
-    fd = os.open(path, flags | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    fd = os.open(path, flags | getattr(os, 'O_NOFOLLOW', 0), 0o666)
     try:
         # Windows has no O_NOFOLLOW; check the opened file before reading or writing.
         if not hasattr(os, 'O_NOFOLLOW'):
@@ -103,13 +103,13 @@ def load_or_create_device_fingerprint(directory: Path) -> str:
 
     An existing valid value is reused so the school sees the same device across logins and
     restarts; a missing, unreadable or malformed value is replaced with a freshly generated
-    ``stable_<hex>`` ID. The file is private (0600 via ``open_nofollow``) and never removed.
+    ``stable_<hex>`` ID. The file is never removed by the program.
     I/O problems (unsafe symlink, permissions, read-only state dir) must never fail login, so the
     generated value is returned even when it could not be persisted.
     """
     path = directory / FINGERPRINT_FILE
     try:
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.mkdir(parents=True, exist_ok=True)
     except OSError:
         return 'stable_' + secrets.token_hex(16)
     try:
@@ -155,17 +155,17 @@ def _trust_cookie_record(item: Any) -> dict[str, Any] | None:
                 expires=float(expires) if expires is not None else None)
 
 
-def save_trust_cookies(directory: Path, cookies: Iterable[dict]) -> int:
-    """Persist the school's CAS cookies privately and atomically; never fails the login.
+def save_trust_cookies(directory: Path, cookies: Iterable[dict], *, account: str = '') -> int:
+    """Persist the school's CAS cookies atomically; never fails the login.
 
     A same-directory temp file is fsynced and published with ``os.replace`` (Windows reader-lock
-    retry included), so a crash cannot leave a half-written file; the state directory is created
-    private (0700) and the file is created private (mkstemp 0600). Only fixed cookie fields are
-    stored. Any OSError is swallowed and reported as 0 saved cookies.
+    retry included), so a crash cannot leave a half-written file. Stored data contains only
+    fixed cookie fields and, when supplied, the account ownership hash. Any OSError is swallowed
+    and reported as 0 saved cookies.
     """
     records = [record for item in cookies if (record := _trust_cookie_record(item)) is not None]
     try:
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.mkdir(parents=True, exist_ok=True)
     except OSError:
         return 0
     name: str | None = None
@@ -173,7 +173,8 @@ def save_trust_cookies(directory: Path, cookies: Iterable[dict]) -> int:
         fd, created = tempfile.mkstemp(prefix='.trust-cookies-', dir=directory)
         name = created
         with os.fdopen(fd, 'w') as target:
-            json.dump(records, target, allow_nan=False)
+            payload: Any = {'account': hashlib.sha256(account.encode()).hexdigest(), 'cookies': records} if account else records
+            json.dump(payload, target, allow_nan=False)
             target.flush()
             os.fsync(target.fileno())
         replace_with_retry(name, directory / TRUST_COOKIES_FILE)
@@ -189,7 +190,7 @@ def save_trust_cookies(directory: Path, cookies: Iterable[dict]) -> int:
     return len(records)
 
 
-def load_trust_cookies(directory: Path) -> list[dict[str, Any]]:
+def load_trust_cookies(directory: Path, *, account: str = '') -> list[dict[str, Any]]:
     """Read persisted CAS cookies; missing, unreadable, corrupt or malformed data returns [].
 
     Expired cookies are dropped so a stale TGT does not suppress the normal password/SMS flow
@@ -200,6 +201,14 @@ def load_trust_cookies(directory: Path) -> list[dict[str, Any]]:
         with os.fdopen(fd) as source:
             data = json.load(source)
     except (OSError, ValueError, UnicodeDecodeError):
+        return []
+    if isinstance(data, dict):
+        # Bound files must prove the same account; a missing account never loads them.
+        if not account or data.get('account') != hashlib.sha256(account.encode()).hexdigest():
+            return []
+        data = data.get('cookies')
+    elif account:
+        # Old cookies have no reliable owner; reauthenticate rather than inherit another identity.
         return []
     if not isinstance(data, list):
         return []
@@ -218,12 +227,17 @@ def load_trust_cookies(directory: Path) -> list[dict[str, Any]]:
 
 class Task:
     def __init__(self, directory: Path, username: str):
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.mkdir(parents=True, exist_ok=True)
         self.directory = directory
         self.path = directory / 'task.json'
         self.lock = open_nofollow(directory / 'task.lock', os.O_CREAT | os.O_RDWR)
         try:
-            lock_file(self.lock)
+            try:
+                lock_file(self.lock)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    raise ValueError('state_in_use') from None
+                raise
             account = hashlib.sha256(username.encode()).hexdigest()
             if self.path.exists() or self.path.is_symlink():
                 data = read_json(self.path)

@@ -3686,7 +3686,7 @@ def test_check_reuses_persisted_cas_cookies_without_a_second_sms(tmp_path):
     assert execute(first, tmp_path, settings=settings, check_only=True) == 0
     assert first.verify_tgt_calls == 0          # no cookie was persisted yet
     assert cas_login_payloads(first)
-    stored = load_trust_cookies(tmp_path)
+    stored = load_trust_cookies(tmp_path, account='test-user')
     assert [item['name'] for item in stored] == ['TGT', 'JSESSIONID']
     assert stored[0]['domain'] == 'auth.seu.edu.cn' and stored[0]['secure'] is True
     assert stored[1]['domain'] == 'ehall.seu.edu.cn'

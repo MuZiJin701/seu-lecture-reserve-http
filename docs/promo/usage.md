@@ -1,6 +1,6 @@
 # 历史宣传素材
 
-本目录保留 2026-10-16 的联合海报及原始截图，包含浏览器版和 HTTPS 版的旧行为。图中的 `nohup`、单场退出等说明不是当前使用步骤，`scanning` 也不代表进程健康或预约成功。当前 HTTPS 版采用选听目标、systemd 运行说明及按活动 ID 的恢复保护，操作以 [README](../../README.md) 和[使用指南](../usage.md)为准；历史图像保持原样。
+本目录保留 2026-10-16 的联合海报及原始截图，包含浏览器版和当时 HTTPS 版的旧行为。图中的 `nohup`、单场退出等说明不是当前使用步骤，`scanning` 也不代表进程健康或预约成功。当时的 HTTPS 版采用选听目标、systemd 运行说明及按活动 ID 的恢复保护，操作以 [README](../../README.md) 和[使用指南](../usage.md)为准；历史图像保持原样。
 
 [高清 PNG](seu-lecture-poster.png) · [生成脚本](render_poster.py)
 

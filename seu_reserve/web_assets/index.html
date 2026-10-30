@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>听序 · 讲座预约</title>
+  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+<div class="landscape" aria-hidden="true"></div>
+<svg class="sprite" aria-hidden="true"><defs>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3M16 5a3 3 0 0 1 0 6M18 15a5 5 0 0 1 3 5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v6l4 2"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="m9 3-1 3-3 1-2 3 2 2-1 4 3 2 3-1 2 3 3-1 1-3 3-1 2-3-2-2 1-4-3-2-3 1-2-3Z"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+</defs></svg>
+
+<div id="dashboard" class="dashboard">
+  <aside class="sidebar glass" aria-label="主导航">
+    <a href="#overview" class="brand-mark" aria-label="听序首页">听</a>
+    <nav>
+      <a class="nav-item active" href="#overview" aria-label="总览" title="总览"><svg><use href="#i-grid"/></svg></a>
+      <a class="nav-item" href="#accounts" aria-label="学校账号" title="学校账号"><svg><use href="#i-users"/></svg></a>
+      <a class="nav-item" href="#events" aria-label="运行记录" title="运行记录"><svg><use href="#i-clock"/></svg></a>
+      <button class="nav-item" id="settings-button" aria-label="配置选中账号" title="配置选中账号"><svg><use href="#i-gear"/></svg></button>
+    </nav>
+  </aside>
+
+  <main>
+    <header class="topbar"><div><p class="muted small">本地管理台</p><strong>管理台</strong></div>
+      <div class="header-tools"><span id="today" class="date"></span><button class="tool add-account" aria-label="新增学校账号"><svg><use href="#i-plus"/></svg></button><span class="avatar" aria-hidden="true">管</span></div>
+    </header>
+
+    <section class="hero" id="overview">
+      <p class="chip"><span class="live-dot"></span> 讲座预约管理台</p>
+      <h1>每一场讲座，<br><span>安排妥当。</span></h1>
+      <p class="hero-copy">集中管理，分别运行。<br>从下一次开抢，到每一次选听，进展尽在眼前。</p>
+      <div class="summary" aria-label="账号概况">
+        <div><strong id="total-count">0</strong><span>全部账号</span></div>
+        <div><strong id="running-count">0</strong><span>运行中</span></div>
+        <div><strong id="attention-count">0</strong><span>需要关注</span></div>
+      </div>
+    </section>
+
+    <div class="workspace">
+      <section id="accounts" class="accounts-section">
+        <div class="section-heading"><div><p class="eyebrow">YOUR ACCOUNTS</p><h2>学校账号</h2></div><button class="subtle add-account">＋ 新增账号</button></div>
+        <div id="account-grid" class="account-grid"></div>
+        <div id="empty-state" class="glass empty-state"><span class="empty-symbol" aria-hidden="true">＋</span><h3>从第一个账号开始</h3><p class="muted">添加学校账号、设置偏好，再由你启动预约。</p><button class="primary add-account">新增学校账号</button></div>
+        <section id="events" class="glass events-panel"><div class="section-heading"><h2>最近运行记录</h2><span class="small muted">选中账号</span></div><ol id="event-list"></ol><p id="events-empty" class="muted small">暂无运行记录。</p></section>
+      </section>
+
+      <aside class="detail-rail" aria-label="选中账号详情">
+        <section class="glass detail-card"><p class="eyebrow">ACCOUNT DETAIL</p><h2 id="detail-name">选择一个账号</h2><p id="detail-state" class="muted small">查看状态与选听进度</p>
+          <div class="progress-number"><strong id="completed-count">—</strong><span>/ 8 <small>已选听</small></span></div>
+          <progress id="goal-progress" value="0" max="8" aria-label="已选听目标进度"></progress>
+          <p id="planned-count" class="muted small">待参加：未知</p><div id="category-progress" class="category-progress"></div>
+          <dl class="facts"><div><dt>最近成功查询</dt><dd id="last-query">—</dd></div><div><dt>下次检查</dt><dd id="next-check">—</dd></div><div><dt>当前候选</dt><dd id="candidate-count">—</dd></div><div><dt>重大告警邮件</dt><dd id="mail-state">—</dd></div></dl>
+          <p id="account-error" class="error" role="status"></p>
+          <p id="protected-note" class="notice" hidden>预约仍有待确认结果或时间保护，请先完成核对再删除账号。</p>
+          <div class="account-actions"><button id="start-button" class="primary">启动预约</button><button id="stop-button" class="subtle">停止</button><button id="edit-button" class="subtle">配置</button></div>
+          <div class="secondary-actions"><button id="test-mail-button" class="text-button">发送测试邮件</button><button id="delete-button" class="text-button danger">删除账号</button></div>
+          <p class="fine">关闭页面后，已启动的账号继续运行。成功通知是否送达，以收件箱为准。</p>
+        </section>
+        <section id="challenge-panel" class="glass challenge-card" hidden><p class="eyebrow">ACTION REQUIRED</p><h2>需要人工认证</h2><p id="challenge-label" class="small muted"></p><button id="send-sms" class="subtle">发送／重发短信</button><form id="challenge-form"><label>六位短信验证码<input id="sms-code" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"></label><button class="primary" type="submit" id="answer-button">验证并继续</button></form><p class="fine">此账号等待认证时，其他账号照常运行。</p></section>
+        <section class="glass selection-card"><h2>当前筛选</h2><ul id="selection-list"></ul><p id="selection-empty" class="muted small">启动账号后显示最近一次筛选结果。</p></section>
+      </aside>
+    </div>
+    <footer><span>听序 · SEU Lecture Reserve</span><span id="connection-status">状态自动更新</span></footer>
+  </main>
+</div>
+
+<dialog id="account-dialog" class="glass"><form id="account-form"><header class="section-heading"><div><p class="eyebrow">ACCOUNT PREFERENCES</p><h2 id="form-title">新增学校账号</h2></div><button id="close-dialog" type="button" class="close-button" aria-label="关闭">×</button></header>
+  <div class="form-grid"><label>显示名称<input name="name" maxlength="80" required placeholder="如：我的账号"></label><label>一卡通号<input name="username" maxlength="128" required autocomplete="off"></label></div>
+  <label>学校密码<input name="password" type="password" maxlength="1024" autocomplete="new-password" placeholder="已有密码不回显；编辑时留空保留"></label>
+  <label>指定讲座标题 <span class="muted small">可选，每行一个完整标题</span><textarea name="titles" rows="3" maxlength="20000" placeholder="留空表示不限制标题"></textarea></label>
+  <fieldset><legend>允许的类别</legend><div id="category-options" class="checkbox-grid"></div></fieldset>
+  <fieldset><legend>允许的线下校区</legend><div id="campus-options" class="checkbox-grid"></div><p class="fine">不选择校区时，不预约线下讲座。</p></fieldset>
+  <div class="checkbox-grid option-switches"><label><input type="checkbox" name="online">允许线上</label><label><input type="checkbox" name="offline">允许线下</label><label><input type="checkbox" name="trust_device">记住此设备</label><label><input type="checkbox" name="prewarm">开抢前预热</label><label><input type="checkbox" name="captcha_prefetch">提前获取验证码</label><label><input type="checkbox" name="history_background">后台刷新已有预约</label><label><input type="checkbox" name="poller_align">实验性开抢对齐</label></div>
+  <fieldset><legend>邮件通知</legend><label>此账号的收信邮箱<input name="recipient" type="email" maxlength="254" placeholder="留空关闭邮件，不默认发给发信邮箱"></label><div class="checkbox-grid"><label><input type="checkbox" name="mail_enabled">启用重大告警邮件</label><label><input type="checkbox" name="mail_success">额外发送每次成功通知</label></div><p class="fine">发信账号由服务器统一配置。沙龙不计入选听目标，正式讲座目标保持 8 场及三类要求。</p></fieldset>
+  <p id="form-error" class="error" role="alert"></p><div class="form-footer"><p class="fine">运行中的账号保存后将安全重启，保留原任务。</p><button class="primary" type="submit">保存账号</button></div>
+</form></dialog>
+<div id="toast" class="toast glass" role="status" hidden></div>
+</body></html>

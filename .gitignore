@@ -9,3 +9,5 @@ __pycache__/
 config.local.toml
 state/
 *.log
+accounts.sqlite3
+manager.lock

@@ -1,10 +1,12 @@
-"""Plain-HTTP administration console. Account credentials are never response fields."""
+"""Authenticated HTTP console for a trusted network; school credentials never leave it."""
 
 import argparse
+import hmac
 import os
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
+from getpass import getpass
 from typing import Mapping
 
 from fastapi import FastAPI, Request
@@ -15,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
 from .accounts import AccountInput, Accounts, public_account
+from .admin import Administrators, COOKIE_NAME, SESSION_SECONDS, hash_password
 from .app import DEFAULT_CATEGORIES
 from .cli import configuration_from, data_root_from
 from .manager import Manager
@@ -41,6 +44,8 @@ SAFE_ERRORS = {
     'account_identity_immutable', 'account_deleting', 'reservation_protected',
     'mail_configuration_invalid', 'mail_disabled', 'challenge_expired', 'invalid_answer',
     'password_required', 'stop_timeout', 'service_stopping', 'state_in_use',
+    'configuration_conflict', 'admin_configuration_invalid', 'invalid_admin_password',
+    'login_rejected', 'login_rate_limited',
 }
 
 MAIL_FAILURE_REASONS = {
@@ -56,15 +61,23 @@ class AnswerInput(BaseModel):
     answer: str = Field(max_length=16)
 
 
+class LoginInput(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    username: str = Field(min_length=1, max_length=80)
+    password: str = Field(min_length=1, max_length=1024)
+
+
 def rejected(detail: str, status_code: int) -> JSONResponse:
     return JSONResponse({'detail': detail}, status_code=status_code, headers=SECURITY_HEADERS)
 
 
 def create_app(accounts: Accounts, shared: Mapping[str, str], *, manager: Manager | None = None) -> FastAPI:
+    administrators = Administrators(shared)
     supervisor = manager or Manager(accounts, shared)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
+        administrators.clear()
         try:
             await run_in_threadpool(supervisor.open)
         except BaseException as exc:
@@ -75,11 +88,13 @@ def create_app(accounts: Accounts, shared: Mapping[str, str], *, manager: Manage
         try:
             yield
         finally:
+            administrators.clear()
             await run_in_threadpool(supervisor.close)
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.manager = supervisor
     app.state.startup_error = ''
+    app.state.administrators = administrators
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError):
@@ -90,12 +105,14 @@ def create_app(accounts: Accounts, shared: Mapping[str, str], *, manager: Manage
     async def business_error(request: Request, exc: ValueError):
         reason = str(exc)
         safe = SAFE_ERRORS | {'mail_' + item for item in MAIL_FAILURE_REASONS}
-        return JSONResponse({'detail': reason if reason in safe else 'configuration_or_state_invalid'},
-                            status_code=404 if reason == 'account_not_found' else 409)
+        status = {'account_not_found': 404, 'login_rejected': 401, 'login_rate_limited': 429}.get(reason, 409)
+        return JSONResponse({'detail': reason if reason in safe else 'configuration_or_state_invalid'}, status_code=status)
 
     @app.middleware('http')
     async def protect(request: Request, call_next):
-        if request.method not in ('GET', 'HEAD') and request.url.path.startswith('/api/'):
+        api = request.url.path.startswith('/api/')
+        mutating = request.method not in ('GET', 'HEAD')
+        if mutating and api:
             origin = request.headers.get('origin')
             if origin and origin != str(request.base_url).rstrip('/'):
                 return rejected('origin_rejected', 403)
@@ -107,8 +124,35 @@ def create_app(accounts: Accounts, shared: Mapping[str, str], *, manager: Manage
                 return rejected('content_length_required', 411)
             if not length.isdigit() or int(length) > MAX_BODY_BYTES:
                 return rejected('request_too_large', 413)
+        if api and request.url.path != '/api/login':
+            session = administrators.session(request.cookies.get(COOKIE_NAME, ''))
+            if session is None:
+                return rejected('authentication_required', 401)
+            if mutating and not hmac.compare_digest(request.headers.get('x-csrf-token', '').encode(), session['csrf'].encode()):
+                return rejected('csrf_rejected', 403)
+            request.state.admin = session
         response = await call_next(request)
         response.headers.update(SECURITY_HEADERS)
+        return response
+
+    @app.post('/api/login')
+    def login(request: Request, data: LoginInput):
+        token, session = administrators.login(data.username, data.password,
+                                              request.client.host if request.client else 'unknown')
+        administrators.logout(request.cookies.get(COOKIE_NAME, ''))
+        response = JSONResponse({'username': session['username'], 'csrf': session['csrf']})
+        response.set_cookie(COOKIE_NAME, token, max_age=SESSION_SECONDS, httponly=True, samesite='strict')
+        return response
+
+    @app.get('/api/session')
+    def session(request: Request):
+        return {key: request.state.admin[key] for key in ('username', 'csrf')}
+
+    @app.post('/api/logout')
+    def logout(request: Request):
+        administrators.logout(request.cookies.get(COOKIE_NAME, ''))
+        response = JSONResponse({'ok': True})
+        response.delete_cookie(COOKIE_NAME)
         return response
 
     @app.get('/api/meta')
@@ -163,8 +207,15 @@ def create_app(accounts: Accounts, shared: Mapping[str, str], *, manager: Manage
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='SEU multi-account HTTP administration console')
     parser.add_argument('--config', type=Path, help='dotenv file (default: .env)')
+    parser.add_argument('--hash-password', action='store_true', help='generate an administrator password hash locally')
     args = parser.parse_args(argv)
     try:
+        if args.hash_password:
+            password = getpass('管理员密码：')
+            if password != getpass('再次输入密码：'):
+                raise ValueError('invalid_admin_password')
+            print(hash_password(password))
+            return 0
         _, shared = configuration_from(args.config, os.environ)
         source = args.config or Path('.env')
         root = data_root_from(source, shared)
@@ -175,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
         if not 1 <= port <= 65535:
             raise ValueError('invalid_port')
         host = (shared.get('SEU_WEB_HOST') or '').strip() or '0.0.0.0'
+        Administrators(shared)
         app = create_app(Accounts(root), shared)
         if host in ('0.0.0.0', '::'):
             print(f'管理台监听 {host}:{port}；本机浏览器请打开 http://127.0.0.1:{port}'
@@ -192,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         reason = str(exc) if isinstance(exc, ValueError) and str(exc) in SAFE_ERRORS else 'configuration_or_state_invalid'
         print('event=web_configuration_or_state_invalid reason=' + reason)
         return 1
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         return 130
 
 

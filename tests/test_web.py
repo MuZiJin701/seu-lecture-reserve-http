@@ -1,4 +1,4 @@
-"""Offline console checks: plain HTTP, no administrator login, synthetic school responses only."""
+"""Offline authenticated console checks, using synthetic school responses only."""
 
 import hashlib
 import json
@@ -16,11 +16,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from seu_reserve.accounts import AccountInput, Accounts, account_environ
+from seu_reserve.admin import COOKIE_NAME, SESSION_SECONDS, hash_password
 from seu_reserve.manager import Manager
 from seu_reserve.state import Task
 from seu_reserve.web import create_app, main
 
 SECRET = 'synthetic-school-secret'
+ADMIN_PASSWORD = 'synthetic-admin-password'
+ADMIN_SHARED = {'SEU_WEB_ADMINS': json.dumps({'admin': hash_password(ADMIN_PASSWORD)})}
 CAMPUSES = ['九龙湖校区', '四牌楼校区', '丁家桥校区', '无锡校区', '苏州校区']
 MAIL_SHARED = {'SMTP_HOST': 'smtp.example.com', 'SMTP_PORT': '465',
                'SMTP_USERNAME': 'sender@example.com', 'SMTP_PASSWORD': 'synthetic-mail-secret',
@@ -74,11 +77,15 @@ def make_manager(accounts, shared=None, clock=None):
 
 
 @contextmanager
-def web_client(tmp_path, shared=None):
+def web_client(tmp_path, shared=None, *, authenticated=True):
     accounts = Accounts(tmp_path / 'data')
     manager = make_manager(accounts, shared)
-    with TestClient(create_app(accounts, {} if shared is None else shared, manager=manager),
+    with TestClient(create_app(accounts, {**ADMIN_SHARED, **(shared or {})}, manager=manager),
                     base_url='http://testserver') as client:
+        if authenticated:
+            login = client.post('/api/login', json={'username': 'admin', 'password': ADMIN_PASSWORD})
+            assert login.status_code == 200
+            client.headers['X-CSRF-Token'] = login.json()['csrf']
         yield client, accounts, manager
 
 
@@ -105,7 +112,7 @@ def assert_hardened(response):
     assert 'strict-transport-security' not in response.headers
 
 
-def test_public_meta_page_and_absent_login_routes(web):
+def test_authenticated_meta_and_public_login_view(web):
     client, _, _ = web
     response = client.get('/api/meta')
     assert response.status_code == 200
@@ -116,16 +123,18 @@ def test_public_meta_page_and_absent_login_routes(web):
     page = client.get('/')
     assert page.status_code == 200
     assert_hardened(page)
-    assert 'id="dashboard"' in page.text and 'hidden' not in page.text.split('id="dashboard"')[1][:60]
-    assert 'login-view' not in page.text and 'admin-name' not in page.text
+    assert 'id="dashboard" hidden' in page.text
+    assert 'login-view' in page.text and 'admin-name' in page.text
+    assert '<nav' not in page.text and '每一场讲座' not in page.text
+    assert 'name="titles"' not in page.text and 'name="trust_device"' not in page.text
     assert 'set-cookie' not in page.headers
-    assert client.get('/api/login').status_code == 404
-    assert client.post('/api/login', json={}).status_code == 404
-    assert client.get('/api/session').status_code == 404
+    assert client.get('/api/login').status_code == 405
+    assert client.post('/api/login', json={}).status_code == 422
+    assert client.get('/api/session').json()['username'] == 'admin'
     assert client.get('/docs').status_code == 404
 
 
-def test_requests_need_no_login_and_never_echo_credentials(web):
+def test_authenticated_requests_never_echo_credentials(web):
     client, _, _ = web
     assert client.get('/api/accounts').json() == []
     payload = account_data().model_dump()
@@ -238,7 +247,7 @@ def test_mail_toggle_and_test_message(tmp_path, monkeypatch):
         accepted = client.post(f'/api/accounts/{identifier}/test-mail', json={})
         assert accepted.status_code == 200 and accepted.json()['status'] == 'smtp_accepted'
         assert sent == [('only@example.com', 'test_notification')]
-        payload = account_data(recipient='only@example.com', mail_enabled=False).model_dump()
+        payload = account_data(recipient='', mail_enabled=False).model_dump()
         assert client.put('/api/accounts/' + identifier, json=payload).status_code == 200
         disabled = client.post(f'/api/accounts/{identifier}/test-mail', json={})
         assert disabled.status_code == 409 and disabled.json()['detail'] == 'mail_disabled'
@@ -630,11 +639,11 @@ def test_supervisor_alert_is_once_per_task_and_uses_account_recipient(tmp_path, 
     assert accounts.checkpoint(account['id'])['health']['last_mail_status'] == 'accepted'
 
 
-def test_plain_http_round_trip_without_login(tmp_path):
+def test_plain_http_round_trip_with_login(tmp_path):
     import requests
     import uvicorn
     accounts = Accounts(tmp_path / 'data')
-    app = create_app(accounts, {})
+    app = create_app(accounts, ADMIN_SHARED)
     config = uvicorn.Config(app, host='127.0.0.1', port=0, log_level='critical', access_log=False,
                             timeout_graceful_shutdown=1)
     server = uvicorn.Server(config)
@@ -647,6 +656,10 @@ def test_plain_http_round_trip_without_login(tmp_path):
         until(lambda: server.started)
         with requests.Session() as session:
             session.trust_env = False
+            assert session.get(address + '/api/meta', timeout=3).status_code == 401
+            login = session.post(address + '/api/login', json={'username': 'admin', 'password': ADMIN_PASSWORD}, timeout=3)
+            assert login.status_code == 200
+            session.headers['X-CSRF-Token'] = login.json()['csrf']
             meta = session.get(address + '/api/meta', timeout=3)
             assert meta.status_code == 200 and len(meta.json()['categories']) == 5
             created = session.post(address + '/api/accounts',
@@ -683,7 +696,7 @@ def test_main_reports_held_manager_lock(tmp_path, capfd):
     holder.open()
     try:
         config = tmp_path / '.env'
-        config.write_text('SEU_DATA_DIR=data\nSEU_WEB_HOST=127.0.0.1\nSEU_WEB_PORT=18731\n',
+        config.write_text('SEU_DATA_DIR=data\nSEU_WEB_HOST=127.0.0.1\nSEU_WEB_PORT=18731\nSEU_WEB_ADMINS=' + ADMIN_SHARED['SEU_WEB_ADMINS'] + '\n',
                           encoding='utf-8')
         result = {}
 
@@ -710,10 +723,193 @@ def test_main_prints_a_browsable_url_for_a_wildcard_listener(tmp_path, capsys, m
 
     monkeypatch.setattr(uvicorn, 'run', fake_run)
     config = tmp_path / '.env'
-    config.write_text('SEU_DATA_DIR=data\nSEU_WEB_HOST=0.0.0.0\nSEU_WEB_PORT=18080\n',
+    config.write_text('SEU_DATA_DIR=data\nSEU_WEB_HOST=0.0.0.0\nSEU_WEB_PORT=18080\nSEU_WEB_ADMINS=' + ADMIN_SHARED['SEU_WEB_ADMINS'] + '\n',
                       encoding='utf-8')
     assert main(['--config', str(config)]) == 0
     out = capsys.readouterr().out
     assert 'http://127.0.0.1:18080' in out
     assert '0.0.0.0 只是监听所有网卡' in out
     assert calls['host'] == '0.0.0.0' and calls['port'] == 18080
+
+
+def test_delete_refuses_while_another_writer_holds_the_checkpoint(tmp_path):
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(account_data())
+    directory = accounts.state_dir(account['id'])
+    task = Task(directory, account['username'])
+    try:
+        task.data['status'] = 'scanning'
+        task.save()
+        with pytest.raises(ValueError, match='state_in_use'):
+            accounts.delete(account['id'])
+        assert accounts.get(account['id'])['deleting'] is False
+        assert (directory / 'task.json').exists()
+    finally:
+        task.close()
+
+
+def test_delete_marks_tombstone_and_holds_lock_through_cleanup(tmp_path, monkeypatch):
+    from seu_reserve import accounts as module
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(account_data())
+    directory = accounts.state_dir(account['id'])
+    task = Task(directory, account['username'])
+    task.data['status'] = 'scanning'
+    task.save()
+    task.close()
+    observed = {}
+    original = module.Accounts._remove_state_files
+
+    def wrapper(self, target):
+        observed['deleting'] = accounts.get(account['id'])['deleting']
+        # A concurrent CLI writer must not be able to take the checkpoint lock mid-deletion.
+        with pytest.raises(ValueError, match='state_in_use'):
+            Task(target, account['username'])
+        original(target)
+
+    monkeypatch.setattr(module.Accounts, '_remove_state_files', wrapper)
+    accounts.delete(account['id'])
+    assert observed['deleting'] is True
+    assert accounts.list() == []
+    assert not directory.exists()
+
+
+def test_read_only_account_environ_skips_mail_validation(tmp_path):
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(account_data(recipient='dest@example.com', mail_enabled=True))
+    with pytest.raises(ValueError, match='mail_configuration_invalid'):
+        account_environ(account, {})
+    env = account_environ(account, {}, mail=False)
+    assert env['SEU_USERNAME'] == '10001' and env['SEU_PASSWORD'] == SECRET
+    assert not any(key.startswith(('SMTP_', 'MAIL_')) for key in env)
+
+
+def test_delete_locks_before_a_missing_checkpoint(tmp_path, monkeypatch):
+    from seu_reserve import accounts as module
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(account_data())
+    directory = accounts.state_dir(account['id'])
+    assert not (directory / 'task.json').exists()
+    observed = {}
+    original = module.Accounts._remove_state_files
+
+    def wrapper(self, target):
+        # A first CLI start must not be able to create task.json after the delete's file check.
+        with pytest.raises(ValueError, match='state_in_use'):
+            Task(target, account['username'])
+        observed['locked'] = True
+        original(target)
+
+    monkeypatch.setattr(module.Accounts, '_remove_state_files', wrapper)
+    accounts.delete(account['id'])
+    assert observed.get('locked') is True
+    assert accounts.list() == []
+    assert not directory.exists()
+
+
+@pytest.mark.parametrize('plaintext', [False, True])
+def test_anonymous_access_csrf_logout_and_expiry(tmp_path, plaintext):
+    shared = {'SEU_WEB_ADMINS': json.dumps({'admin': ADMIN_PASSWORD})} if plaintext else ADMIN_SHARED
+    with web_client(tmp_path, shared, authenticated=False) as (client, accounts, manager):
+        assert client.get('/').status_code == 200
+        for path in ('meta', 'accounts', 'session'):
+            denied = client.get('/api/' + path)
+            assert denied.status_code == 401
+            assert_hardened(denied)
+        assert client.post('/api/accounts', json=account_data().model_dump()).status_code == 401
+        login = client.post('/api/login', json={'username': 'admin', 'password': ADMIN_PASSWORD})
+        assert login.status_code == 200
+        assert 'HttpOnly' in login.headers['set-cookie'] and 'SameSite=strict' in login.headers['set-cookie']
+        assert f'Max-Age={SESSION_SECONDS}' in login.headers['set-cookie']
+        assert client.post('/api/accounts', json=account_data().model_dump()).status_code == 403
+        client.headers['X-CSRF-Token'] = login.json()['csrf']
+        assert client.post('/api/accounts', json=account_data().model_dump()).status_code == 201
+        account = accounts.list()[0]
+        manager.start(account['id'])
+        assert client.post('/api/logout', json={}).status_code == 200
+        assert manager.workers[account['id']].process.is_alive()
+        assert client.get('/api/accounts').status_code == 401
+        login = client.post('/api/login', json={'username': 'admin', 'password': ADMIN_PASSWORD})
+        auth = client.app.state.administrators
+        token = client.cookies.get(COOKIE_NAME)
+        auth.sessions[token]['expires'] = 0
+        assert client.get('/api/accounts').status_code == 401
+
+
+def test_stale_configuration_does_not_stop_or_overwrite_running_account(web):
+    client, accounts, manager = web
+    payload = account_data().model_dump()
+    created = client.post('/api/accounts', json=payload).json()
+    identifier = created['id']
+    payload['name'] = 'first update'
+    updated = client.put('/api/accounts/' + identifier, json=payload)
+    assert updated.status_code == 200 and updated.json()['revision'] == 1
+    manager.start(identifier)
+    worker = manager.workers[identifier]
+    payload['name'] = 'stale update'
+    rejected = client.put('/api/accounts/' + identifier, json=payload)
+    assert rejected.status_code == 409 and rejected.json()['detail'] == 'configuration_conflict'
+    assert manager.workers[identifier] is worker and worker.process.is_alive()
+    assert accounts.get(identifier)['name'] == 'first update'
+
+
+def test_legacy_managed_options_are_normalized_without_losing_state(tmp_path):
+    accounts = Accounts(tmp_path)
+    account = accounts.create(account_data())
+    legacy = {**account['options'], 'titles': ['old filter'], 'trust_device': False,
+              'poller_align': False, 'mail_success': False}
+    with accounts.connect() as db:
+        db.execute('UPDATE accounts SET options=?, recipient=?, mail_enabled=0 WHERE id=?',
+                   (json.dumps(legacy), 'synthetic@example.com', account['id']))
+    normalized = accounts.get(account['id'])
+    assert normalized['options']['titles'] == []
+    assert all(normalized['options'][key] for key in ('trust_device', 'prewarm', 'captcha_prefetch',
+                                                     'history_background', 'poller_align', 'mail_success'))
+    assert normalized['mail_enabled'] is True
+    assert normalized['password'] == SECRET and normalized['revision'] == 0
+
+
+def test_reservation_snapshot_is_local_and_protection_is_separate(tmp_path):
+    accounts = Accounts(tmp_path)
+    account = accounts.create(account_data())
+    task = Task(accounts.state_dir(account['id']), account['username'])
+    task.data.update(status='pending', activity='unconfirmed', pending_start=time.time()+100,
+                     pending_end=time.time()+200,
+                     holds=None,
+                     reservations={'at': time.time(), 'items': [dict(wid='booked', title='synthetic lecture',
+                         start=time.time()+300, end=time.time()+400, status='reserved', password=SECRET)]})
+    task.save()
+    task.close()
+    manager = make_manager(accounts)
+    snapshot = manager.snapshot(account)
+    assert snapshot['reservations']['stale'] is True
+    assert snapshot['reservations']['items'][0]['wid'] == 'booked'
+    assert SECRET not in json.dumps(snapshot)
+    assert snapshot['protections'][0]['wid'] == 'unconfirmed'
+    assert manager.snapshot(accounts.create(account_data('10002')))['reservations'] is None
+
+
+def test_existing_catalogue_gains_revision_without_touching_checkpoint(tmp_path):
+    accounts = Accounts(tmp_path)
+    account = accounts.create(account_data())
+    task = Task(accounts.state_dir(account['id']), account['username'])
+    task.data.update(status='pending', activity='synthetic-pending')
+    task.save()
+    task.close()
+    before = (accounts.state_dir(account['id']) / 'task.json').read_bytes()
+    with accounts.connect() as db:
+        db.execute('ALTER TABLE accounts DROP COLUMN revision')
+    db.close()
+    reopened = Accounts(tmp_path)
+    assert reopened.get(account['id'])['revision'] == 0
+    assert reopened.get(account['id'])['password'] == SECRET
+    assert (accounts.state_dir(account['id']) / 'task.json').read_bytes() == before
+
+
+def test_web_without_admin_configuration_refuses_before_creating_data(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv('SEU_WEB_ADMINS', raising=False)
+    config = tmp_path / '.env'
+    config.write_text('SEU_DATA_DIR=data\n')
+    assert main(['--config', str(config)]) == 1
+    assert 'reason=admin_configuration_invalid' in capsys.readouterr().out
+    assert not (tmp_path / 'data').exists()

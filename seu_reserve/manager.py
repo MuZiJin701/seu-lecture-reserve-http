@@ -242,8 +242,10 @@ class Manager:
                     raise ValueError('account_identity_immutable')
                 if current['deleting']:
                     raise ValueError('account_deleting')
+                if data.revision != current['revision']:
+                    raise ValueError('configuration_conflict')
                 candidate = {**current, **data.model_dump(), 'password': data.password or current['password']}
-                candidate['mail_enabled'] = bool(data.mail_enabled and data.recipient)
+                candidate['mail_enabled'] = bool(data.recipient)
                 if current['desired']:
                     account_environ(candidate, self.shared)
                 active = current['desired']
@@ -400,6 +402,7 @@ class Manager:
     def snapshot(self, account: dict[str, Any]) -> dict[str, Any]:
         identifier = account['id']
         result = public_account(account)
+        result.update(reservations=None, protections=[])
         with self.lock:
             worker = self.workers.get(identifier)
             if worker is not None:
@@ -426,6 +429,24 @@ class Manager:
             result['selection'] = [{key: row.get(key) for key in
                 ('title', 'reason', 'reservation_start', 'reservation_end')} for row in selection
                 if isinstance(row, dict) and row.get('reason') in SELECTION_REASONS]
+            display = state.get('reservations')
+            if (isinstance(display, dict) and type(display.get('at')) in (int, float)
+                    and 0 < display['at'] <= 253402214400 and isinstance(display.get('items'), list)):
+                fields = ('wid', 'title', 'category', 'location', 'online', 'start', 'end', 'status')
+                result['reservations'] = dict(at=display['at'], stale=(not result['running']
+                    or time.time() - display['at'] > 30 or bool(health.get('failure_count'))),
+                    items=[{key: row.get(key) for key in fields} for row in display['items']
+                           if isinstance(row, dict) and type(row.get('end')) in (int, float)
+                           and row['end'] > time.time()])
+            if state.get('status') == 'pending':
+                result['protections'].append(dict(wid=state.get('activity'), kind='pending',
+                    start=state.get('pending_start'), end=state.get('pending_end')))
+            holds = state.get('holds')
+            for wid, entry in holds.items() if isinstance(holds, dict) else []:
+                if isinstance(entry, dict):
+                    result['protections'].append(dict(wid=wid,
+                        kind='confirmed_hold' if entry.get('confirmed') else 'hold',
+                        start=entry.get('start'), end=entry.get('end')))
         except (OSError, ValueError, AttributeError, TypeError):
             result.update(status='invalid', protected=True, health={}, selection=[])
         events = []

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import sys
@@ -22,7 +23,7 @@ from dotenv.parser import parse_stream
 from .app import SELECTION_REASONS, Settings, resolve_pending, run
 from .mail import Mailer, mail_failure_reason, mail_history
 from .model import SHANGHAI
-from .state import read_json, task_running
+from .state import Task, read_json, task_running
 
 
 def show_status(directory: Path) -> None:
@@ -111,7 +112,7 @@ def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[S
                'SMTP_USERNAME', 'SMTP_PASSWORD', 'MAIL_FROM', 'MAIL_TO', 'SEU_VPN_IP',
                'SEU_CAPTCHA_PREFETCH', 'SEU_PREWARM', 'SEU_POLLER_ALIGN',
                'SEU_HISTORY_BACKGROUND', 'SEU_TRUST_DEVICE', 'SEU_DATA_DIR',
-               'SEU_WEB_HOST', 'SEU_WEB_PORT'}
+               'SEU_WEB_HOST', 'SEU_WEB_PORT', 'SEU_WEB_ADMINS'}
     if set(values) - allowed:
         raise ValueError('unknown_configuration_key')
     environ = {**values, **process}
@@ -186,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         from .accounts import Accounts, account_environ, account_settings
         source = args.config or Path('.env')
         data_root = data_root_from(source, environ)
+        account_identifier = ''
         if args.account:
             catalogue = Accounts(data_root)
             entries = catalogue.list()
@@ -196,9 +198,13 @@ def main(argv: list[str] | None = None) -> int:
                 account = next((entry for entry in entries if entry['username'] == args.account), None)
             if account is None or account['deleting']:
                 raise ValueError('account_not_found')
+            account_identifier = account['id']
             settings = account_settings(account, catalogue.state_dir(account['id']))
             if not args.status:
-                environ = account_environ(account, environ)
+                # --check and --resolve-pending never send mail; do not let a broken shared SMTP
+                # configuration block read-only checks or pending resolution.
+                environ = account_environ(account, environ,
+                                          mail=not (args.check or args.resolve_pending))
         if args.status:
             show_status(settings.state_dir)
             return 0
@@ -237,15 +243,42 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         if args.resolve_pending:
             return resolve_pending(settings, environ=environ)
+        account_task: Task | None = None
+        if args.account and not args.check:
+            # Hold the checkpoint lock from the lifecycle re-check through engine startup (OCR
+            # loading included), so a delete cannot remove the account between the catalogue read
+            # and the engine's own checkpoint open. The engine reuses this locked checkpoint.
+            had_directory = settings.state_dir.exists()
+            had_task = (settings.state_dir / 'task.json').exists()
+            account_task = Task(settings.state_dir, environ['SEU_USERNAME'])
+            try:
+                current = Accounts(data_root).get(account_identifier)
+            except ValueError:
+                current = None
+            if current is None or current['deleting']:
+                account_task.close()
+                account_task = None
+                if not had_directory:
+                    shutil.rmtree(settings.state_dir, ignore_errors=True)
+                elif not had_task:
+                    (settings.state_dir / 'task.json').unlink(missing_ok=True)
+                print('event=account_not_found', flush=True)
+                return 1
         recognize = None
         if not args.check:
             try:
                 recognize = load_recognizer()
             except Exception:
+                if account_task is not None:
+                    account_task.close()
                 print('event=ocr_unavailable', flush=True)
                 return 1
-        return run(settings, environ=environ, check_only=args.check, new_task=args.new_task,
-                   recognize=recognize)
+        try:
+            return run(settings, environ=environ, check_only=args.check, new_task=args.new_task,
+                       recognize=recognize, checkpoint=account_task)
+        finally:
+            # run() owns and closes the checkpoint from the moment it takes over.
+            account_task = None
     except (KeyboardInterrupt, EOFError):
         return 130
     except (ValueError, OSError, TypeError, AttributeError, sqlite3.Error) as exc:

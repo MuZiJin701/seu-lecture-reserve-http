@@ -18,7 +18,7 @@ import requests
 from .client import AuthenticationExpired, AuthenticationRejected, Client, RemoteError, has_code
 from .model import (COFFEE_CATEGORY, GOAL_CATEGORIES, Lecture, Progress, REQUIRED_CATEGORIES, SHANGHAI,
                     activity_id, category_name, conflicting_records, interval, moment, progress,
-                    reserved, test_notice)
+                    reservation_display, reserved, test_notice)
 from .mail import Mailer, mail_failure_reason, mail_history
 from .poller import ActivityPoller, WaitGate
 from .state import FINGERPRINT_FILE, Task, open_nofollow
@@ -518,7 +518,8 @@ def run(settings: Settings, *, session: Any = None,
         recognize: Callable[[bytes], str] | None = None,
         check_only: bool = False, new_task: bool = False,
         background_poller: bool = True,
-        stop: Callable[[], bool] | None = None) -> int:
+        stop: Callable[[], bool] | None = None,
+        checkpoint: Task | None = None) -> int:
     environ = os.environ if environ is None else environ
     announced: set[str] = set()
     alerts: dict[str, float] = {}
@@ -946,6 +947,23 @@ def run(settings: Settings, *, session: Any = None,
     def ask(label: str) -> str:
         health(phase='manual_required', next_check_at=0)
         return prompt(label)
+
+    def remember_reservations(rows: list[dict[str, Any]], at: float) -> None:
+        nonlocal health_dirty
+        if task is None:
+            return
+        try:
+            items = reservation_display(rows, at)
+        except ValueError:
+            return
+        task.data['reservations'] = dict(at=at, items=items)
+        health_dirty = True
+
+    def query_mine() -> list[dict[str, Any]]:
+        assert client is not None
+        rows = client.mine()
+        remember_reservations(rows, clock())
+        return rows
     try:
         if not check_only:
             if notify is None and Mailer.configured(environ):
@@ -975,7 +993,7 @@ def run(settings: Settings, *, session: Any = None,
             client.captcha()
             print('event=read_only_complete', flush=True)
             return 0
-        task = Task(settings.state_dir, environ.get('SEU_USERNAME', ''))
+        task = checkpoint if checkpoint is not None else Task(settings.state_dir, environ.get('SEU_USERNAME', ''))
         # One startup rotation, before the scan writes any diagnostic: never while running.
         rotate_diagnostics(settings.state_dir)
         if settings.trust_device:
@@ -1199,6 +1217,7 @@ def run(settings: Settings, *, session: Any = None,
                 return False
             history = rows
             mine_at = snapshot.at
+            remember_reservations(rows, mine_at)
             mine_seconds = getattr(snapshot, 'seconds', 0.0) or 0.0
             refresh_mine = True
             diagnostic('history_background_used', age_seconds=round(clock() - mine_at, 3))
@@ -1462,7 +1481,7 @@ def run(settings: Settings, *, session: Any = None,
                     started = clock()
                     try:
                         # Keep the submit session warm and refresh the history the opening reuses.
-                        history = client.mine()
+                        history = query_mine()
                         mine_at = clock()
                         mine_seconds = max(0, clock() - started)
                         refresh_mine = True
@@ -1652,7 +1671,7 @@ def run(settings: Settings, *, session: Any = None,
                             # The wait may have been learned after the scan-start check; abort
                             # before the history request instead of querying inside it.
                             poller_wait_error()
-                            pending_history = client.mine()
+                            pending_history = query_mine()
                             history = pending_history
                             mine_at = clock()
                             mine_seconds = max(0, clock() - mine_started)
@@ -1875,7 +1894,7 @@ def run(settings: Settings, *, session: Any = None,
                     health(phase='my_activities', next_check_at=0,
                            activity_count=None, candidate_count=None)
                     mine_started = clock()
-                    history = client.mine()
+                    history = query_mine()
                     mine_at = clock()
                     mine_seconds = max(0, clock() - mine_started)
                     refresh_mine = True
@@ -2209,7 +2228,7 @@ def run(settings: Settings, *, session: Any = None,
                     # report confirmed progress; never submit from this probe.
                     progress_probe_attempted = True
                     try:
-                        history = client.mine()
+                        history = query_mine()
                         mine_at = clock()
                         latest_progress = progress(history, clock() + server_offset)
                         progress_at = mine_at

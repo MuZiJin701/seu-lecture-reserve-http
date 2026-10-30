@@ -11,3 +11,4 @@ state/
 *.log
 accounts.sqlite3
 manager.lock
+output/playwright/

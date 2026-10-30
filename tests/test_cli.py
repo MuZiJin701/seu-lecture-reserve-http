@@ -353,3 +353,101 @@ def test_running_checkpoint_blocks_a_second_reservation_loop(tmp_path):
         assert result.stdout.splitlines()[-1] == 'event=state_in_use'
     finally:
         task.close()
+
+
+def test_check_and_resolve_pending_do_not_require_shared_mail_configuration(tmp_path, monkeypatch, capsys):
+    from seu_reserve import cli
+    from seu_reserve.accounts import AccountInput, Accounts
+    (tmp_path / '.env').write_text('SEU_DATA_DIR=data\n', encoding='utf-8')
+    Accounts(tmp_path / 'data').create(AccountInput(
+        username='10001', name='邮件配置缺失', password='synthetic',
+        recipient='dest@example.com', mail_enabled=True))
+    captured = {}
+
+    def fake_run(settings, **options):
+        captured.update(options)
+        return 0
+
+    monkeypatch.setattr(cli, 'run', fake_run)
+    assert cli.main(['--config', str(tmp_path / '.env'), '--account', '10001', '--check']) == 0
+    assert captured['check_only'] is True
+    assert captured['environ']['SEU_USERNAME'] == '10001'
+    assert not any(key.startswith(('SMTP_', 'MAIL_')) for key in captured['environ'])
+
+    called = {}
+
+    class TtyLike:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(cli.sys, 'stdin', TtyLike())
+
+    def fake_resolve(settings, **options):
+        called.update(options)
+        return 0
+
+    monkeypatch.setattr(cli, 'resolve_pending', fake_resolve)
+    assert cli.main(['--config', str(tmp_path / '.env'), '--account', '10001', '--resolve-pending']) == 0
+    assert called['environ']['SEU_USERNAME'] == '10001'
+    assert not any(key.startswith(('SMTP_', 'MAIL_')) for key in called['environ'])
+
+    # A normal start still validates the shared mail configuration.
+    assert cli.main(['--config', str(tmp_path / '.env'), '--account', '10001']) == 1
+    assert 'event=mail_configuration_invalid' in capsys.readouterr().out
+
+
+def test_normal_run_holds_the_checkpoint_through_startup_and_blocks_delete(tmp_path, monkeypatch):
+    from seu_reserve import cli
+    from seu_reserve.accounts import AccountInput, Accounts
+    config = tmp_path / '.env'
+    config.write_text('SEU_DATA_DIR=data\n', encoding='utf-8')
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(AccountInput(username='10001', name='竞争测试', password='synthetic'))
+    seen = {}
+
+    def fake_recognizer():
+        # OCR loading happens before the engine starts; the checkpoint lock must already be held.
+        with pytest.raises(ValueError, match='state_in_use'):
+            accounts.delete(account['id'])
+        seen['delete_blocked'] = True
+        return lambda _: '1234'
+
+    monkeypatch.setattr(cli, 'load_recognizer', fake_recognizer)
+
+    def fake_run(settings, **options):
+        seen['checkpoint'] = options.get('checkpoint')
+        seen['check_only'] = options.get('check_only')
+        return 0
+
+    monkeypatch.setattr(cli, 'run', fake_run)
+    assert cli.main(['--config', str(config), '--account', '10001']) == 0
+    assert seen['delete_blocked'] is True
+    assert seen['check_only'] is False
+    assert seen['checkpoint'] is not None
+    assert accounts.get(account['id'])['id'] == account['id']
+    seen['checkpoint'].close()
+
+
+def test_normal_run_rechecks_the_account_before_entering_the_engine(tmp_path, monkeypatch, capsys):
+    from seu_reserve import accounts as module
+    from seu_reserve import cli
+    from seu_reserve.accounts import AccountInput, Accounts
+    config = tmp_path / '.env'
+    config.write_text('SEU_DATA_DIR=data\n', encoding='utf-8')
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(AccountInput(username='10001', name='已删除测试', password='synthetic'))
+    original = module.account_environ
+
+    def deleted_after_lookup(account_data, shared, **options):
+        environ = original(account_data, shared, **options)
+        with module.closing(accounts.connect()) as db, db:
+            db.execute('DELETE FROM accounts WHERE id=?', (account['id'],))
+        return environ
+
+    monkeypatch.setattr(module, 'account_environ', deleted_after_lookup)
+    called = []
+    monkeypatch.setattr(cli, 'run', lambda *args, **options: called.append(options) or 0)
+    assert cli.main(['--config', str(config), '--account', '10001']) == 1
+    assert 'event=account_not_found' in capsys.readouterr().out
+    assert called == []
+    assert not accounts.state_dir(account['id']).exists()

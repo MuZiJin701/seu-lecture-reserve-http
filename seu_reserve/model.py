@@ -170,6 +170,32 @@ def reserved(row: dict[str, Any]) -> bool:
     raise ValueError('reservation_status_unknown')
 
 
+def reservation_display(rows: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+    """Only the current reservations needed by the console, never the full school history."""
+    if conflicting_records(rows):
+        raise ValueError('attendance_record_conflict')
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        wid = activity_id(row)
+        if not reserved(row) or row.get('FBZT') == '-1':
+            continue
+        start, end = interval(row)
+        if end.timestamp() <= now:
+            continue
+        title = row.get('JZMC', row.get('HDMC', ''))
+        category = category_name(row.get('JZXL_DISPLAY', row.get('HDLX_DISPLAY', '')))
+        location = row.get('JZDD', '')
+        online = row.get('IS_ONLINE')
+        if isinstance(title, str) and title.startswith(('【线上】', '【线下】')):
+            online = title.startswith('【线上】')
+        result[wid] = dict(wid=wid, title=title[:512] if isinstance(title, str) else '',
+                           category=category[:512] if isinstance(category, str) else '',
+                           location=location[:512] if isinstance(location, str) else '',
+                           online=online if type(online) is bool else None,
+                           start=start.timestamp(), end=end.timestamp(), status='reserved')
+    return sorted(result.values(), key=lambda entry: (entry['start'], entry['wid']))
+
+
 @dataclass(frozen=True)
 class Lecture:
     wid: str

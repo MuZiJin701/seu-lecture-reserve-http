@@ -1,11 +1,13 @@
 import json
 import os
+import stat
 import subprocess
 import sys
 
 import pytest
 
-from seu_reserve.state import Task, open_nofollow
+from seu_reserve.state import (FINGERPRINT_FILE, FINGERPRINT_PATTERN, Task,
+                               load_or_create_device_fingerprint, open_nofollow)
 
 
 def test_save_retries_a_transient_file_sharing_violation(tmp_path, monkeypatch):
@@ -113,3 +115,73 @@ def test_state_file_replaced_during_open_is_rejected(tmp_path, monkeypatch):
     assert path.read_text() == 'do not change'
     with pytest.raises(OSError):
         os.fstat(opened[0])
+
+
+def test_device_fingerprint_is_generated_once_and_reused(tmp_path):
+    value = load_or_create_device_fingerprint(tmp_path)
+    assert value.startswith('stable_')
+    assert FINGERPRINT_PATTERN.fullmatch(value)
+    path = tmp_path / FINGERPRINT_FILE
+    assert path.read_text() == value
+    # A new login (new process, same state dir) must send the same device identity.
+    assert load_or_create_device_fingerprint(tmp_path) == value
+
+
+def test_device_fingerprint_creates_a_missing_state_directory_privately(tmp_path):
+    nested = tmp_path / 'a' / 'b'
+    value = load_or_create_device_fingerprint(nested)
+    assert (nested / FINGERPRINT_FILE).read_text() == value
+    if sys.platform != 'win32':
+        assert stat.S_IMODE(nested.stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='POSIX file mode only')
+def test_device_fingerprint_file_is_private(tmp_path):
+    load_or_create_device_fingerprint(tmp_path)
+    mode = stat.S_IMODE((tmp_path / FINGERPRINT_FILE).stat().st_mode)
+    assert mode == 0o600
+
+
+def test_device_fingerprint_regenerates_a_malformed_file(tmp_path):
+    path = tmp_path / FINGERPRINT_FILE
+    path.write_text('PRIVATE not a valid fingerprint\n')
+    value = load_or_create_device_fingerprint(tmp_path)
+    assert value != 'PRIVATE not a valid fingerprint'
+    assert FINGERPRINT_PATTERN.fullmatch(value)
+    assert path.read_text() == value
+
+
+def test_device_fingerprint_returns_a_generated_value_when_it_cannot_persist(tmp_path, monkeypatch):
+    from seu_reserve import state
+
+    def unsafe(path, flags):
+        raise OSError('unsafe_state_file')
+
+    monkeypatch.setattr(state, 'open_nofollow', unsafe)
+    value = load_or_create_device_fingerprint(tmp_path)
+    assert value.startswith('stable_') and FINGERPRINT_PATTERN.fullmatch(value)
+    assert not (tmp_path / FINGERPRINT_FILE).exists()
+
+
+def test_device_fingerprint_survives_an_unusable_state_directory(tmp_path):
+    # A path that exists but is not a directory must not fail the login attempt.
+    directory = tmp_path / 'not-a-directory'
+    directory.write_text('file')
+    value = load_or_create_device_fingerprint(directory)
+    assert value.startswith('stable_') and FINGERPRINT_PATTERN.fullmatch(value)
+
+
+def test_device_fingerprint_rejects_a_symlink_without_touching_its_target(tmp_path):
+    target = tmp_path / 'private'
+    target.write_text('do not change')
+    link = tmp_path / FINGERPRINT_FILE
+    try:
+        link.symlink_to(target)
+    except OSError:
+        if sys.platform == 'win32':
+            pytest.skip('Creating symlinks requires Windows Developer Mode or administrator rights')
+        raise
+    value = load_or_create_device_fingerprint(tmp_path)
+    assert value.startswith('stable_') and FINGERPRINT_PATTERN.fullmatch(value)
+    assert target.read_text() == 'do not change'
+    assert link.is_symlink()

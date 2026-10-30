@@ -5,6 +5,8 @@ import errno
 import json
 import math
 import os
+import re
+import secrets
 import stat
 import sys
 import tempfile
@@ -20,6 +22,12 @@ from .mail import mail_history
 # checkpoint (and flooding the terminal with health_write_failed).
 REPLACE_ATTEMPTS = 4
 REPLACE_RETRY_SECONDS = 0.005
+
+# Opt-in trusted-device fingerprint used with the school's SMS second factor. The value is a
+# client-generated stable ID: it identifies this state directory to the school, is never sent
+# anywhere else and is never logged.
+FINGERPRINT_FILE = 'device-fingerprint'
+FINGERPRINT_PATTERN = re.compile(r'[A-Za-z0-9_-]{8,128}')
 
 
 def lock_file(fd: int) -> None:
@@ -70,6 +78,38 @@ def open_nofollow(path: Path, flags: int) -> int:
     except BaseException:
         os.close(fd)
         raise
+
+
+def load_or_create_device_fingerprint(directory: Path) -> str:
+    """Stable, private device fingerprint for the opt-in SMS trusted-device flow.
+
+    An existing valid value is reused so the school sees the same device across logins and
+    restarts; a missing, unreadable or malformed value is replaced with a freshly generated
+    ``stable_<hex>`` ID. The file is private (0600 via ``open_nofollow``) and never removed.
+    I/O problems (unsafe symlink, permissions, read-only state dir) must never fail login, so the
+    generated value is returned even when it could not be persisted.
+    """
+    path = directory / FINGERPRINT_FILE
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError:
+        return 'stable_' + secrets.token_hex(16)
+    try:
+        fd = open_nofollow(path, os.O_RDONLY)
+        with os.fdopen(fd) as source:
+            value = source.read().strip()
+        if FINGERPRINT_PATTERN.fullmatch(value):
+            return value
+    except (OSError, UnicodeDecodeError):
+        pass
+    value = 'stable_' + secrets.token_hex(16)
+    try:
+        fd = open_nofollow(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        with os.fdopen(fd, 'w') as target:
+            target.write(value)
+    except OSError:
+        pass
+    return value
 
 
 class Task:

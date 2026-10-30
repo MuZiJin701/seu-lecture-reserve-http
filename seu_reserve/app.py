@@ -21,7 +21,7 @@ from .model import (COFFEE_CATEGORY, GOAL_CATEGORIES, Lecture, Progress, REQUIRE
                     reserved, test_notice)
 from .mail import Mailer, mail_failure_reason, mail_history
 from .poller import ActivityPoller, WaitGate
-from .state import Task, open_nofollow
+from .state import FINGERPRINT_FILE, Task, open_nofollow
 
 DEFAULT_CATEGORIES = GOAL_CATEGORIES + (COFFEE_CATEGORY,)
 QUERY_FAILURE_SECONDS = 5 * 60
@@ -166,6 +166,9 @@ class Settings:
     # Background "my activities" refresh during opening windows; can be disabled to keep the
     # request count minimal and fall back to the older synchronous history refresh.
     history_background: bool = True
+    # Opt-in trusted device for the SMS second factor: off by default so the login payload keeps
+    # its previous (untrusted) shape unless the user explicitly enables it.
+    trust_device: bool = False
 
 def server_wait_error(exc: BaseException) -> bool:
     """True when the school explicitly asked us to wait before another request."""
@@ -450,7 +453,9 @@ def resolve_pending(settings: Settings, *, session: Any = None,
     task = Task(settings.state_dir, environ.get('SEU_USERNAME', ''))
     client: Client | None = None
     try:
-        client = Client(session or requests.Session(), environ, prompt, lambda _: None)
+        client = Client(session or requests.Session(), environ, prompt, lambda _: None,
+                        trust_device=settings.trust_device,
+                        fingerprint_dir=settings.state_dir)
         if task.data['status'] != 'pending':
             _state_event(settings, 'pending_not_found')
             return 1
@@ -945,7 +950,9 @@ def run(settings: Settings, *, session: Any = None,
                           '高级配置请检查 SMTP_PORT、MAIL_FROM、MAIL_TO。清空邮件配置可关闭通知。', flush=True)
                     return 1
             snapshot['mail_status'] = 'ready' if notify else 'disabled'
-        client = Client(session or requests.Session(), environ, ask, emit)
+        client = Client(session or requests.Session(), environ, ask, emit,
+                        trust_device=settings.trust_device,
+                        fingerprint_dir=settings.state_dir)
         if check_only:
             stage = 'authentication'
             client.authenticate()
@@ -962,6 +969,11 @@ def run(settings: Settings, *, session: Any = None,
         task = Task(settings.state_dir, environ.get('SEU_USERNAME', ''))
         # One startup rotation, before the scan writes any diagnostic: never while running.
         rotate_diagnostics(settings.state_dir)
+        if settings.trust_device:
+            # Opt-in trusted device: the fingerprint itself is created lazily at login. Report
+            # only whether one already exists; its value must never reach any log.
+            diagnostic('device_trust_enabled',
+                       fingerprint_present=(settings.state_dir / FINGERPRINT_FILE).exists())
         alerts = task.data.setdefault('alerts', {})
         if notify:
             announced.update(alerts)

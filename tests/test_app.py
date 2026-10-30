@@ -3509,3 +3509,103 @@ def test_conflicting_activity_list_does_not_confirm_an_unconfirmed_hold(tmp_path
     events = (tmp_path / 'events.log').read_text()
     assert 'event=reservation_succeeded' not in events
     assert 'event=reservation_hold_confirmed' not in events
+
+
+def cas_login_payloads(school):
+    return [kwargs['json'] for method, url, kwargs in school.requests
+            if method == 'POST' and url.endswith('casLogin')]
+
+
+def test_device_trust_defaults_off_and_creates_no_fingerprint(tmp_path):
+    from seu_reserve.state import FINGERPRINT_FILE
+    school = School()
+    school.activities = [lecture(YYZT='未开放')]
+    assert execute(school, tmp_path) == 130
+    payloads = cas_login_payloads(school)
+    assert payloads
+    assert all(item['fingerPrint'] is None for item in payloads)
+    assert all(item['rememberTrustDevice'] is False for item in payloads)
+    assert all(item['rememberMe'] is False for item in payloads)
+    assert not (tmp_path / FINGERPRINT_FILE).exists()
+    assert not any(line['event'] == 'device_trust_enabled' for line in diagnostics_rows(tmp_path))
+
+
+def test_trusted_device_opt_in_persists_and_never_logs_the_fingerprint(tmp_path, capsys):
+    import re
+
+    from seu_reserve.state import FINGERPRINT_FILE
+    settings = Settings(state_dir=tmp_path, trust_device=True)
+    school = School()
+    school.activities = [lecture(YYZT='未开放')]
+    assert execute(school, tmp_path, settings=settings) == 130
+    path = tmp_path / FINGERPRINT_FILE
+    stored = path.read_text()
+    assert re.fullmatch(r'[A-Za-z0-9_-]{8,128}', stored)
+    payloads = cas_login_payloads(school)
+    assert payloads
+    assert all(item['rememberTrustDevice'] is True for item in payloads)
+    assert all(item['fingerPrint'] == stored for item in payloads)
+    lines = diagnostics_rows(tmp_path)
+    enabled = [line for line in lines if line['event'] == 'device_trust_enabled']
+    # The fingerprint is created lazily by the login, so the startup diagnostic reports absence
+    # on the first run and only its presence (never the value) afterwards.
+    assert len(enabled) == 1 and enabled[0]['fingerprint_present'] is False
+
+    later = School()
+    later.activities = [lecture(YYZT='未开放')]
+    assert execute(later, tmp_path, settings=settings) == 130
+    later_payloads = cas_login_payloads(later)
+    assert later_payloads and all(item['fingerPrint'] == stored for item in later_payloads)
+    enabled = [line for line in diagnostics_rows(tmp_path)
+               if line['event'] == 'device_trust_enabled']
+    assert len(enabled) == 2 and enabled[-1]['fingerprint_present'] is True
+
+    output = capsys.readouterr().out
+    assert stored not in output
+    assert stored not in (tmp_path / 'events.log').read_text()
+    assert stored not in (tmp_path / 'diagnostics.jsonl').read_text()
+
+
+def test_check_only_with_trust_device_creates_and_sends_the_fingerprint(tmp_path):
+    from seu_reserve.state import FINGERPRINT_FILE
+    school = School()
+    school.activities = [lecture(YYZT='未开放')]
+    assert execute(school, tmp_path, settings=Settings(state_dir=tmp_path, trust_device=True),
+                   check_only=True) == 0
+    stored = (tmp_path / FINGERPRINT_FILE).read_text()
+    payloads = cas_login_payloads(school)
+    assert payloads and payloads[0]['rememberTrustDevice'] is True
+    assert all(item['fingerPrint'] == stored for item in payloads)
+    assert not (tmp_path / 'task.json').exists()
+
+
+def test_resolve_pending_wires_the_trusted_device_options(tmp_path, monkeypatch):
+    import seu_reserve.app as app_module
+    from seu_reserve.state import Task
+
+    task = Task(tmp_path, 'test-user')
+    task.data.update(status='pending', activity='one')
+    task.save()
+    task.close()
+    seen = {}
+
+    class FakeClient:
+        session = types.SimpleNamespace(close=lambda: None)
+
+        def __init__(self, session, environ, prompt, notify, *, trust_device=False,
+                     fingerprint_dir=None):
+            seen['trust_device'] = trust_device
+            seen['fingerprint_dir'] = fingerprint_dir
+
+        def authenticate(self):
+            pass
+
+        def mine(self):
+            return []
+
+    monkeypatch.setattr(app_module, 'Client', FakeClient)
+    result = resolve_pending(Settings(state_dir=tmp_path, trust_device=True),
+                             environ={'SEU_USERNAME': 'test-user'},
+                             prompt=lambda _: 'cancel')
+    assert result == 1
+    assert seen == {'trust_device': True, 'fingerprint_dir': tmp_path}

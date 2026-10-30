@@ -182,6 +182,25 @@ def test_opening_speed_switches_default_on_and_can_be_disabled(tmp_path):
     assert configuration_from(config, {'SEU_PREWARM': 'true'})[0].prewarm is True
 
 
+def test_trust_device_switch_defaults_off_and_is_opt_in(tmp_path):
+    from seu_reserve.cli import configuration_from
+
+    empty = tmp_path / 'empty.env'
+    empty.write_text('')
+    assert configuration_from(empty, {})[0].trust_device is False
+    config = tmp_path / '.env'
+    config.write_text('SEU_TRUST_DEVICE=true\n')
+    assert configuration_from(config, {})[0].trust_device is True
+    # Process environment wins over the dotenv file, like every other switch.
+    assert configuration_from(config, {'SEU_TRUST_DEVICE': 'false'})[0].trust_device is False
+    invalid = tmp_path / 'invalid.env'
+    invalid.write_text('SEU_TRUST_DEVICE=on\n')
+    with pytest.raises(ValueError, match='invalid_switch'):
+        configuration_from(invalid, {})
+    with pytest.raises(ValueError, match='invalid_switch'):
+        configuration_from(config, {'SEU_TRUST_DEVICE': 'yes'})
+
+
 @pytest.mark.parametrize('configuration, outcome', [
     ('', 'mail_disabled'),
     ('SMTP_USERNAME=sender@gmail.com\n', 'mail_configuration_invalid'),

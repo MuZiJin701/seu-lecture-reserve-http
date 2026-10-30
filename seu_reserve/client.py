@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from http.client import RemoteDisconnected
 from ipaddress import ip_address
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
@@ -25,6 +26,8 @@ from urllib3.connection import HTTPSConnection as Urllib3HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool as Urllib3HTTPConnectionPool
 from urllib3.connectionpool import HTTPSConnectionPool as Urllib3HTTPSConnectionPool
 from urllib3.exceptions import ReadTimeoutError
+
+from .state import load_or_create_device_fingerprint
 
 BASE = 'https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu'
 ENTRY = BASE + '/*default/index.do'
@@ -333,13 +336,19 @@ class AuthenticationRejected(RemoteError):
 
 class Client:
     def __init__(self, session: Any, environ: Mapping[str, str],
-                 prompt: Callable[[str], str], notify: Callable[[str], None]):
+                 prompt: Callable[[str], str], notify: Callable[[str], None], *,
+                 trust_device: bool = False, fingerprint_dir: Path | None = None):
         self.session = session
         install_deadline_pools(session)
         self.environ = environ
         self.prompt = prompt
         self.notify = notify
         self.timeout = 10.0
+        # Opt-in SMS trusted-device support. The fingerprint is generated once per state directory
+        # and computed lazily so default logins keep sending no trust fields at all.
+        self.trust_device = trust_device
+        self.fingerprint_dir = fingerprint_dir
+        self._device_fingerprint: str | None = None
         # Observability for callers (app.py): one counter per request attempt and the handshake
         # cost of the connection that attempt opened, if any.
         self.requests_made = 0
@@ -350,6 +359,17 @@ class Client:
         # The school rejects too-frequent SMS sends. The deadline lives on the instance: a
         # campus -> gateway fallback calls login() a second time and must not reset it.
         self.sms_retry_at = 0.0
+
+    def device_fingerprint(self) -> str | None:
+        """Stable local fingerprint for the trusted-device opt-in; None when disabled.
+
+        The value is never logged: callers only report whether it is present.
+        """
+        if not self.trust_device or self.fingerprint_dir is None:
+            return None
+        if self._device_fingerprint is None:
+            self._device_fingerprint = load_or_create_device_fingerprint(self.fingerprint_dir)
+        return self._device_fingerprint
 
     def clone_readonly(self) -> 'Client':
         """Independent client with a copied-cookie session for read-only background queries.
@@ -600,6 +620,9 @@ class Client:
         password = self.environ.get('SEU_PASSWORD', '')
         if not username or not password:
             raise AuthenticationRejected('credentials_missing')
+        # Opt-in: the school only skips the SMS second factor for a device it already trusts, which
+        # requires this stable fingerprint together with rememberTrustDevice=true.
+        fingerprint = self.device_fingerprint()
         code = ''
         while True:
             captcha = self.payload(self.request('GET', CAS + 'needCaptcha'))
@@ -616,7 +639,9 @@ class Client:
                 encrypt = lambda value: base64.b64encode(key.encrypt(value.encode(), padding.PKCS1v15())).decode()
                 data = {'service': service, 'username': username, 'password': encrypt(password),
                         'captcha': '', 'rememberMe': False, 'loginType': 'account', 'wxBinded': False,
-                        'mobilePhoneNum': '', 'fingerPrint': None, 'mobileVerifyCode': encrypt(code) if code else ''}
+                        'mobilePhoneNum': '', 'fingerPrint': fingerprint,
+                        'rememberTrustDevice': bool(self.trust_device and fingerprint),
+                        'mobileVerifyCode': encrypt(code) if code else ''}
             except (KeyError, TypeError, ValueError):
                 raise RemoteError('cas_public_key_invalid') from None
             result = self.cas('casLogin', data)

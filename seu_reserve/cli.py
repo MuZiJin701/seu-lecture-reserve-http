@@ -109,7 +109,7 @@ def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[S
                'SEU_ENABLE_OFFLINE', 'SEU_STATE_DIR', 'SEU_MAIL_SUCCESS', 'SMTP_HOST', 'SMTP_PORT',
                'SMTP_USERNAME', 'SMTP_PASSWORD', 'MAIL_FROM', 'MAIL_TO', 'SEU_VPN_IP',
                'SEU_CAPTCHA_PREFETCH', 'SEU_PREWARM', 'SEU_POLLER_ALIGN',
-               'SEU_HISTORY_BACKGROUND'}
+               'SEU_HISTORY_BACKGROUND', 'SEU_TRUST_DEVICE'}
     if set(values) - allowed:
         raise ValueError('unknown_configuration_key')
     environ = {**values, **process}
@@ -134,7 +134,8 @@ def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[S
                       ('mail_success', 'SEU_MAIL_SUCCESS'),
                       ('captcha_prefetch', 'SEU_CAPTCHA_PREFETCH'), ('prewarm', 'SEU_PREWARM'),
                       ('poller_align', 'SEU_POLLER_ALIGN'),
-                      ('history_background', 'SEU_HISTORY_BACKGROUND')):
+                      ('history_background', 'SEU_HISTORY_BACKGROUND'),
+                      ('trust_device', 'SEU_TRUST_DEVICE')):
         raw = environ.get(name, str(getattr(defaults, key))).strip().lower()
         if raw not in ('true', 'false'):
             raise ValueError('invalid_switch')

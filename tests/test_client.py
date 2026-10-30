@@ -1,6 +1,8 @@
+import base64
 import datetime
 import gzip
 import json
+import re
 import socket
 import ssl
 import threading
@@ -20,6 +22,7 @@ from urllib3.exceptions import ProtocolError
 
 from seu_reserve.client import (Client, DEADLINE_POOLS, GATEWAY, GatewayIPAdapter, RemoteError,
                                 install_deadline_pools)
+from seu_reserve.state import FINGERPRINT_FILE
 
 
 @pytest.fixture
@@ -435,6 +438,89 @@ class StubSession:
 def stub_client(payload):
     session = StubSession(payload)
     return Client(session, {}, input, lambda _: None), session
+
+
+class CasSession:
+    """Fake CAS responses for a direct Client.login() call without an SMS challenge."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.calls = []
+        self.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        response = requests.Response()
+        response.url = url
+        response.status_code = 200
+        if url.endswith('needCaptcha'):
+            payload = {'code': 200}
+        elif url.endswith('getChiperKey'):
+            public = self.key.public_key().public_bytes(
+                serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+            payload = {'success': True, 'publicKey': base64.urlsafe_b64encode(public).decode()}
+        else:
+            payload = self.reply
+        response._content = json.dumps(payload).encode()
+        return response
+
+
+def cas_client(**options):
+    session = CasSession({'code': 200,
+                          'redirectUrl': 'https%3A%2F%2Fehall.seu.edu.cn%2Fcallback'})
+    client = Client(session, {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
+                    input, lambda _: None, **options)
+    return client, session
+
+
+def cas_login_data(session):
+    return next(kwargs['json'] for method, url, kwargs in session.calls
+                if url.endswith('casLogin'))
+
+
+def test_login_payload_has_no_trust_fields_by_default(tmp_path):
+    client, session = cas_client(fingerprint_dir=tmp_path)
+    client.login('https://ehall.seu.edu.cn/service')
+    data = cas_login_data(session)
+    assert data['fingerPrint'] is None
+    assert data['rememberTrustDevice'] is False
+    assert data['rememberMe'] is False
+    assert not (tmp_path / FINGERPRINT_FILE).exists()
+
+
+def test_login_with_trusted_device_sends_and_reuses_the_persisted_fingerprint(tmp_path):
+    client, session = cas_client(trust_device=True, fingerprint_dir=tmp_path)
+    client.login('https://ehall.seu.edu.cn/service')
+    data = cas_login_data(session)
+    stored = (tmp_path / FINGERPRINT_FILE).read_text()
+    assert re.fullmatch(r'[A-Za-z0-9_-]{8,128}', stored)
+    assert data['rememberTrustDevice'] is True
+    assert data['fingerPrint'] == stored
+    assert data['rememberMe'] is False
+    # A brand-new client (e.g. the next process start) must send the same device identity.
+    other, other_session = cas_client(trust_device=True, fingerprint_dir=tmp_path)
+    other.login('https://ehall.seu.edu.cn/service')
+    assert cas_login_data(other_session)['fingerPrint'] == stored
+
+
+def test_login_regenerates_a_corrupt_trusted_device_file(tmp_path):
+    path = tmp_path / FINGERPRINT_FILE
+    path.write_text('PRIVATE corrupt value')
+    client, session = cas_client(trust_device=True, fingerprint_dir=tmp_path)
+    client.login('https://ehall.seu.edu.cn/service')
+    data = cas_login_data(session)
+    assert re.fullmatch(r'[A-Za-z0-9_-]{8,128}', data['fingerPrint'])
+    assert data['fingerPrint'] != 'PRIVATE corrupt value'
+    assert path.read_text() == data['fingerPrint']
+
+
+def test_device_fingerprint_is_none_when_disabled_or_unconfigured(tmp_path):
+    session = StubSession({'code': 0})
+    disabled = Client(session, {}, input, lambda _: None, fingerprint_dir=tmp_path)
+    assert disabled.device_fingerprint() is None
+    unconfigured = Client(session, {}, input, lambda _: None, trust_device=True)
+    assert unconfigured.device_fingerprint() is None
+    assert not (tmp_path / FINGERPRINT_FILE).exists()
 
 
 def test_activities_joins_reservation_counts_and_server_clock():

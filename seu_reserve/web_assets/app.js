@@ -56,6 +56,7 @@ function populateForm(account){
 }
 async function selectAccount(identifier){
   if(saving){toast('正在保存，请稍候。');return;}
+  if(identifier===selected&&!creating)return;
   if(dirty&&!await confirmChoice('此账号有未保存的修改，放弃这些修改并切换？'))return;
   selected=identifier;creating=identifier===null;draftFor='';dirty=false;render();
 }

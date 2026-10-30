@@ -451,3 +451,97 @@ def test_normal_run_rechecks_the_account_before_entering_the_engine(tmp_path, mo
     assert 'event=account_not_found' in capsys.readouterr().out
     assert called == []
     assert not accounts.state_dir(account['id']).exists()
+
+
+def no_recognizer():
+    raise ImportError('synthetic missing ddddocr')
+
+
+def test_ocr_unavailable_removes_a_checkpoint_created_for_a_new_account(tmp_path, monkeypatch, capsys):
+    from seu_reserve import cli
+    from seu_reserve.accounts import AccountInput, Accounts
+    config = tmp_path / '.env'
+    config.write_text('SEU_DATA_DIR=data\n', encoding='utf-8')
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(AccountInput(username='10001', name='OCR 不可用', password='synthetic'))
+    directory = accounts.state_dir(account['id'])
+    assert not directory.exists()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('os.environ', {})
+    monkeypatch.setattr(cli, 'load_recognizer', no_recognizer)
+    assert cli.main(['--config', str(config), '--account', '10001']) == 1
+    assert 'event=ocr_unavailable' in capsys.readouterr().out
+    assert not directory.exists()
+
+
+def test_ocr_unavailable_leaves_an_existing_directory_without_a_task(tmp_path, monkeypatch, capsys):
+    from seu_reserve import cli
+    from seu_reserve.accounts import AccountInput, Accounts
+    config = tmp_path / '.env'
+    config.write_text('SEU_DATA_DIR=data\n', encoding='utf-8')
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(AccountInput(username='10001', name='已有目录', password='synthetic'))
+    directory = accounts.state_dir(account['id'])
+    directory.mkdir()
+    (directory / 'events.log').write_text('', encoding='utf-8')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('os.environ', {})
+    monkeypatch.setattr(cli, 'load_recognizer', no_recognizer)
+    assert cli.main(['--config', str(config), '--account', '10001']) == 1
+    assert 'event=ocr_unavailable' in capsys.readouterr().out
+    assert directory.exists()
+    assert not (directory / 'task.json').exists()
+    assert (directory / 'events.log').exists()
+
+
+def test_ocr_unavailable_keeps_a_preexisting_checkpoint(tmp_path, monkeypatch, capsys):
+    from seu_reserve import cli
+    from seu_reserve.accounts import AccountInput, Accounts
+    from seu_reserve.state import Task
+    config = tmp_path / '.env'
+    config.write_text('SEU_DATA_DIR=data\n', encoding='utf-8')
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(AccountInput(username='10001', name='已有检查点', password='synthetic'))
+    task = Task(accounts.state_dir(account['id']), '10001')
+    task.close()
+    before = (accounts.state_dir(account['id']) / 'task.json').read_bytes()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('os.environ', {})
+    monkeypatch.setattr(cli, 'load_recognizer', no_recognizer)
+    assert cli.main(['--config', str(config), '--account', '10001']) == 1
+    assert 'event=ocr_unavailable' in capsys.readouterr().out
+    assert (accounts.state_dir(account['id']) / 'task.json').read_bytes() == before
+
+
+def test_account_mode_forces_the_managed_settings_before_the_engine_starts(tmp_path, monkeypatch):
+    from seu_reserve import cli
+    from seu_reserve.accounts import AccountInput, Accounts
+    from seu_reserve.app import DEFAULT_CATEGORIES
+    config = tmp_path / '.env'
+    config.write_text('SEU_DATA_DIR=data\n', encoding='utf-8')
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(AccountInput(username='10001', name='托管设置', password='synthetic'))
+    legacy = {**account['options'], 'titles': ['旧筛选'], 'trust_device': False, 'prewarm': False,
+              'captcha_prefetch': False, 'poller_align': False, 'history_background': False,
+              'mail_success': False, 'online': False, 'offline': True}
+    with accounts.connect() as db:
+        db.execute('UPDATE accounts SET options=? WHERE id=?', (json.dumps(legacy), account['id']))
+    captured = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('os.environ', {})
+    monkeypatch.setattr(cli, 'load_recognizer', lambda: lambda _: '1234')
+
+    def fake_run(settings, **options):
+        captured.update(settings=settings, options=options)
+        return 0
+
+    monkeypatch.setattr(cli, 'run', fake_run)
+    assert cli.main(['--config', str(config), '--account', '10001']) == 0
+    settings = captured['settings']
+    assert settings.titles == ()
+    assert all(getattr(settings, key) is True for key in
+               ('trust_device', 'prewarm', 'captcha_prefetch', 'poller_align',
+                'history_background', 'mail_success'))
+    assert settings.categories == DEFAULT_CATEGORIES
+    assert settings.online is False and settings.offline is True
+    captured['options']['checkpoint'].close()

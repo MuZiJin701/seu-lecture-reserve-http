@@ -913,3 +913,186 @@ def test_web_without_admin_configuration_refuses_before_creating_data(tmp_path, 
     assert main(['--config', str(config)]) == 1
     assert 'reason=admin_configuration_invalid' in capsys.readouterr().out
     assert not (tmp_path / 'data').exists()
+
+
+def test_reservation_snapshot_freshness_tracks_running_state_and_query_failures(tmp_path):
+    accounts = Accounts(tmp_path)
+    account = accounts.create(account_data())
+    directory = accounts.state_dir(account['id'])
+    now = time.time()
+    task = Task(directory, account['username'])
+    task.data['reservations'] = {'at': now, 'items': [dict(
+        wid='booked', title='synthetic lecture', category='人文与科学素养系列讲座_心理健康',
+        location='九龙湖校区', online=False, start=now + 300, end=now + 400, status='reserved')]}
+    task.save()
+    task.close()
+    manager = make_manager(accounts)
+    manager.start(account['id'])
+    try:
+        fresh = manager.snapshot(account)
+        assert fresh['running'] is True
+        assert fresh['reservations']['stale'] is False
+        assert fresh['reservations']['items'][0]['wid'] == 'booked'
+        task = Task(directory, account['username'])
+        task.data['health'] = {'failure_count': 1}
+        task.save()
+        task.close()
+        # A failing query keeps the last good display but marks it stale; items are not dropped.
+        stale = manager.snapshot(account)
+        assert stale['reservations']['stale'] is True
+        assert stale['reservations']['at'] == now
+        assert [row['wid'] for row in stale['reservations']['items']] == ['booked']
+    finally:
+        manager.close()
+
+
+def test_console_reads_never_contact_the_school(web, monkeypatch):
+    client, _, _ = web
+    created = client.post('/api/accounts', json=account_data().model_dump())
+    assert created.status_code == 201
+    identifier = created.json()['id']
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('console pages must never contact the school')
+
+    monkeypatch.setattr('requests.Session.request', forbidden)
+    assert client.get('/').status_code == 200
+    assert client.get('/api/meta').json()['campuses'] == CAMPUSES
+    listed = client.get('/api/accounts')
+    assert listed.status_code == 200 and listed.json()[0]['id'] == identifier
+
+
+def test_second_client_lifecycle_invalidates_the_old_session_token(tmp_path):
+    accounts = Accounts(tmp_path / 'data')
+    app = create_app(accounts, ADMIN_SHARED, manager=make_manager(accounts))
+    with TestClient(app, base_url='http://testserver') as first:
+        login = first.post('/api/login', json={'username': 'admin', 'password': ADMIN_PASSWORD})
+        assert login.status_code == 200
+        token = first.cookies.get(COOKIE_NAME)
+        assert token and first.get('/api/accounts').status_code == 200
+    # Lifespan shutdown/startup clears process-local sessions; a restart must not trust old cookies.
+    assert app.state.administrators.session(token) is None
+    with TestClient(app, base_url='http://testserver') as second:
+        second.cookies.set(COOKIE_NAME, token)
+        assert second.get('/api/accounts').status_code == 401
+        assert second.post('/api/login', json={'username': 'admin',
+                                              'password': ADMIN_PASSWORD}).status_code == 200
+
+
+def test_created_account_options_are_forced_to_the_managed_policy(web):
+    client, accounts, _ = web
+    payload = account_data().model_dump()
+    payload['options'] = dict(
+        titles=['旧筛选'], categories=['人文与科学素养系列讲座_心理健康', '“SEU咖啡间”系列沙龙活动'],
+        campuses=['九龙湖校区'], online=False, offline=True, trust_device=False, prewarm=False,
+        captcha_prefetch=False, poller_align=False, history_background=False, mail_success=False)
+    created = client.post('/api/accounts', json=payload)
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert set(body['options']) == {'categories', 'campuses', 'online', 'offline'}
+    assert body['options'] == {'categories': payload['options']['categories'],
+                               'campuses': ['九龙湖校区'], 'online': False, 'offline': True}
+    saved = accounts.get(body['id'])
+    assert saved['options']['titles'] == []
+    assert all(saved['options'][key] is True for key in
+               ('trust_device', 'prewarm', 'captcha_prefetch', 'poller_align',
+                'history_background', 'mail_success'))
+
+
+@pytest.mark.parametrize('changes, status, detail', [
+    ({'password': ''}, 409, 'password_required'),
+    ({'recipient': 'not-an-address'}, 422, 'invalid_request'),
+    ({'options': {'categories': []}}, 422, 'invalid_request'),
+])
+def test_account_input_validation_never_writes_a_partial_account(web, changes, status, detail):
+    client, accounts, manager = web
+    payload = account_data().model_dump()
+    payload.update(changes)
+    response = client.post('/api/accounts', json=payload)
+    assert response.status_code == status
+    assert response.json() == {'detail': detail}
+    assert accounts.list() == [] and manager.workers == {}
+
+
+def test_login_shell_and_assets_are_public(tmp_path):
+    with web_client(tmp_path, authenticated=False) as (client, _, _):
+        page = client.get('/')
+        assert page.status_code == 200
+        assert 'name="viewport"' in page.text
+        assert 'id="confirm-dialog"' in page.text
+        assert '尚未同步' in page.text
+        for path, media_type in (('/assets/app.js', 'text/javascript'),
+                                 ('/assets/style.css', 'text/css'),
+                                 ('/assets/logo.png', 'image/png')):
+            asset = client.get(path)
+            assert asset.status_code == 200
+            assert asset.headers['content-type'].startswith(media_type)
+
+
+def test_revision_migration_tolerates_a_concurrent_duplicate_column(tmp_path):
+    import sqlite3
+
+    accounts = Accounts(tmp_path / 'data')
+    identifier = accounts.create(account_data())['id']
+    with accounts.connect() as db:
+        db.execute('ALTER TABLE accounts DROP COLUMN revision')
+
+    class RacingConnection:
+        """Proxy that simulates another process adding `revision` between PRAGMA and ALTER."""
+
+        def __init__(self, db, path):
+            self.db = db
+            self.path = path
+
+        def __getattr__(self, name):
+            return getattr(self.db, name)
+
+        def __enter__(self):
+            return self.db
+
+        def __exit__(self, *exc_info):
+            return self.db.__exit__(*exc_info)
+
+        def execute(self, statement, *args):
+            if statement.startswith('ALTER TABLE accounts ADD COLUMN revision'):
+                with sqlite3.connect(self.path) as peer:
+                    peer.execute(statement)
+                raise sqlite3.OperationalError('duplicate column name: revision')
+            return self.db.execute(statement, *args)
+
+    class RacingAccounts(Accounts):
+        def connect(self):
+            return RacingConnection(Accounts.connect(self), self.path)
+
+    reopened = RacingAccounts(tmp_path / 'data')
+    saved = reopened.get(identifier)
+    assert saved['revision'] == 0
+    assert saved['password'] == SECRET
+
+
+def test_main_constructs_the_administrator_registry_once_and_injects_it(tmp_path, monkeypatch):
+    import seu_reserve.web as module
+    instances = []
+    original = module.Administrators
+
+    class CountingAdministrators(original):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            instances.append(self)
+
+    captured = {}
+
+    def fake_create_app(accounts, shared, **options):
+        captured.update(options)
+        return object()
+
+    monkeypatch.setattr(module, 'Administrators', CountingAdministrators)
+    monkeypatch.setattr(module, 'create_app', fake_create_app)
+    monkeypatch.setattr('uvicorn.run', lambda app, **options: None)
+    config = tmp_path / '.env'
+    config.write_text('SEU_DATA_DIR=data\nSEU_WEB_HOST=127.0.0.1\nSEU_WEB_PORT=18080\n'
+                      'SEU_WEB_ADMINS=' + ADMIN_SHARED['SEU_WEB_ADMINS'] + '\n', encoding='utf-8')
+    assert module.main(['--config', str(config)]) == 0
+    # Plaintext passwords are hashed while building the registry; a second build would re-hash.
+    assert len(instances) == 1
+    assert captured['administrators'] is instances[0]

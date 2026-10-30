@@ -12,3 +12,5 @@ state/
 accounts.sqlite3
 manager.lock
 output/playwright/
+build/
+dist/

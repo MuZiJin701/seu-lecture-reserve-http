@@ -71,8 +71,10 @@ def rejected(detail: str, status_code: int) -> JSONResponse:
     return JSONResponse({'detail': detail}, status_code=status_code, headers=SECURITY_HEADERS)
 
 
-def create_app(accounts: Accounts, shared: Mapping[str, str], *, manager: Manager | None = None) -> FastAPI:
-    administrators = Administrators(shared)
+def create_app(accounts: Accounts, shared: Mapping[str, str], *, manager: Manager | None = None,
+               administrators: Administrators | None = None) -> FastAPI:
+    # main() validates and reuses the same instance so plaintext passwords are hashed once.
+    administrators = administrators or Administrators(shared)
     supervisor = manager or Manager(accounts, shared)
 
     @asynccontextmanager
@@ -106,7 +108,9 @@ def create_app(accounts: Accounts, shared: Mapping[str, str], *, manager: Manage
         reason = str(exc)
         safe = SAFE_ERRORS | {'mail_' + item for item in MAIL_FAILURE_REASONS}
         status = {'account_not_found': 404, 'login_rejected': 401, 'login_rate_limited': 429}.get(reason, 409)
-        return JSONResponse({'detail': reason if reason in safe else 'configuration_or_state_invalid'}, status_code=status)
+        headers = {'Retry-After': '60'} if reason == 'login_rate_limited' else None
+        return JSONResponse({'detail': reason if reason in safe else 'configuration_or_state_invalid'},
+                            status_code=status, headers=headers)
 
     @app.middleware('http')
     async def protect(request: Request, call_next):
@@ -226,8 +230,8 @@ def main(argv: list[str] | None = None) -> int:
         if not 1 <= port <= 65535:
             raise ValueError('invalid_port')
         host = (shared.get('SEU_WEB_HOST') or '').strip() or '0.0.0.0'
-        Administrators(shared)
-        app = create_app(Accounts(root), shared)
+        administrators = Administrators(shared)
+        app = create_app(Accounts(root), shared, administrators=administrators)
         if host in ('0.0.0.0', '::'):
             print(f'管理台监听 {host}:{port}；本机浏览器请打开 http://127.0.0.1:{port}'
                   '（0.0.0.0 只是监听所有网卡的绑定地址，不能直接作为网址访问）', flush=True)

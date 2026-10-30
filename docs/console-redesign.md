@@ -1,6 +1,6 @@
 # 控制台改版需求澄清
 
-2026-10-30 两轮细项澄清及纯图案 Logo 补充后，用户明确要求实施，状态：已确认并实现，离线验证通过。当前运行方式见 [Web 指南](web.md)，术语见 [GLOSSARY.md](../GLOSSARY.md)，架构取舍见 [ADR-0010](adr/0010-configured-admin-login.md)及 [ADR-0011](adr/0011-local-reservation-display-snapshot.md)，验证及限制见[改版验收](acceptance/2026-10-30-console-redesign.md)。
+2026-10-30 两轮细项澄清及纯图案 Logo 补充后，用户明确要求实施，状态：已确认并实现，离线验证通过。当前运行方式见 [Web 指南](web.md)，术语见 [GLOSSARY.md](../GLOSSARY.md)，架构取舍见 [ADR-0010](adr/0010-configured-admin-login.md)及 [ADR-0011](adr/0011-local-reservation-display-snapshot.md)，验证及限制见[改版验收](acceptance/2026-10-30-console-redesign.md)；实施后的只读审查修复见该验收的[后续审查修复](acceptance/2026-10-30-console-redesign.md#后续审查修复2026-10-30)一节。
 
 ## 用户已明确的方向
 

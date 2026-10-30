@@ -34,3 +34,26 @@ def test_engine_persists_minimal_display_without_extra_school_queries_and_preser
             return super().request(method, url, **options)
     assert execute(BrokenSchool(), tmp_path) == 130
     assert json.loads((tmp_path / 'task.json').read_text())['reservations'] == saved
+
+
+def test_display_maps_school_fields_and_orders_rows_by_start_time():
+    rows = [
+        lecture('later', HDMC='后一场', KSSJ='2030-01-01 14:00:00', JSSJ='2030-01-01 15:00:00',
+                YYZT='已预约', JZDD='九龙湖校区', IS_ONLINE=False,
+                HDLX_DISPLAY='人文与科学素养系列讲座_心理健康'),
+        lecture('earlier', HDMC='【线上】前一场', KSSJ='2030-01-01 08:00:00', JSSJ='2030-01-01 09:00:00',
+                YYZT='已预约', JZDD='线上', IS_ONLINE=False,
+                HDLX_DISPLAY='人文与科学素养系列讲座-艺术类'),
+    ]
+    now = moment('2026-10-30 10:00:00').timestamp()
+    result = reservation_display(rows, now)
+    assert [row['wid'] for row in result] == ['earlier', 'later']
+    earlier, later = result
+    assert earlier == dict(
+        wid='earlier', title='【线上】前一场', category='人文与科学素养系列讲座-艺术类',
+        location='线上', online=True, start=moment('2030-01-01 08:00:00').timestamp(),
+        end=moment('2030-01-01 09:00:00').timestamp(), status='reserved')
+    assert later['title'] == '后一场' and later['category'] == '人文与科学素养系列讲座_心理健康'
+    assert later['online'] is False and later['location'] == '九龙湖校区'
+    assert later['start'] == moment('2030-01-01 14:00:00').timestamp()
+    assert later['end'] == moment('2030-01-01 15:00:00').timestamp()

@@ -6,7 +6,7 @@
 
 ## 配置与启动
 
-在项目目录运行 `uv sync --locked`，复制 `.env.example` 为 `.env`，已有文件保留。直接填写管理员账号和密码，无需先执行哈希命令；替换示例密码：
+在项目目录运行 `uv sync --locked`，复制 `.env.example` 为 `.env`，已有文件保留。样例中的管理员列表是空对象 `'{}'`，会阻止启动；先按下面的格式直接填写账号和密码，无需执行哈希命令：
 
 ```dotenv
 SEU_WEB_ADMINS='{"admin":"换成你的密码","other":"另一个密码"}'
@@ -33,9 +33,9 @@ uv run --locked seu-reserve-web --config /绝对路径/.env
 
 - 管理员会话固定有效 12 小时，允许多浏览器并存，刷新不续期；退出只结束当前会话，管理服务重启使全部会话失效。
 - 关闭网页、退出或登录到期不停止后台预约。修改管理员配置后的重启仍按现有任务恢复语义安全停止和恢复学校账号。
-- 每来源每分钟最多 5 次登录尝试，全局每分钟最多 100 次，内存会话上限 1024；学校凭据、管理员密码、会话及短信码不写入日志或响应错误。
+- 登录限速只统计**失败**尝试：每来源每分钟最多 5 次失败，全局每分钟最多 100 次失败；成功登录不再占用预算并清除该来源的失败记录，超限响应带 `Retry-After: 60`。内存会话上限 1024；学校凭据、管理员密码、会话及短信码不写入日志或响应错误。
 - 学校数据接口均要求登录。非 GET `/api/*` 保留 Origin、JSON 类型与 64 KiB 请求大小校验；已登录的写操作还需当前会话的 `X-CSRF-Token`。Cookie 使用 HttpOnly、SameSite=Strict；普通 HTTP 不设置 Secure 或 HSTS，仍不能避免传输窃听。
-- 自行调用 API 时，登录或 `GET /api/session` 返回 CSRF 值；`PUT /api/accounts/<id>` 需携带读取到的 `revision`。旧版本保存返回 `409 configuration_conflict`，不会停止工作进程或覆盖新配置。
+- 自行调用 API 时，登录或 `GET /api/session` 返回 CSRF 值；`PUT /api/accounts/<id>` 需携带读取到的 `revision`。旧版本保存返回 `409 configuration_conflict`，不会停止工作进程或覆盖新配置。账号正由 CLI `--account` 持锁运行时，启动、保存、停止和删除返回 `409 state_in_use`，不会伪造成功或改动配置。
 
 ## 单页管理账号
 
@@ -62,7 +62,7 @@ uv run --locked main.py --account 你的一卡通号
 uv run --locked main.py --account 你的一卡通号 --resolve-pending
 ```
 
-`--account` 也接受内部 ID。CLI 不需要管理台登录；CLI 的认证输入和停止须在原终端进行，网页对外部 CLI 运行中的账号禁用编辑、停止和删除。旧单账号模式仍保留，已纳管账号应使用 `--account`。
+`--account` 也接受内部 ID。CLI 不需要管理台登录；CLI 的认证输入和停止须在原终端进行。外部 CLI 运行中的账号在网页禁用编辑、停止和删除，服务端对启动、保存、停止和删除同样返回 `state_in_use`，不会把未生效的停止报成成功，也不会让保存的配置与 CLI 实际运行的配置分叉。旧单账号模式仍保留，已纳管账号应使用 `--account`。
 
 - 数据根 `manager.lock` 限制同一数据根仅一个 Web 管理服务。
 - 每账号 `task.lock` 限制同一检查点仅一个写者；删除先加锁再检查是否存在 `task.json`，CLI 正常启动在 OCR 前持锁复查账号，避免删除与首次启动竞争。

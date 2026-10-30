@@ -69,7 +69,6 @@ class Administrators:
             self._prune()
             if len(self.attempts) >= 100 or sum(ip == address for _, ip in self.attempts) >= 5:
                 raise ValueError('login_rate_limited')
-            self.attempts.append((self.clock(), address))
         # Unknown names pay the same hash cost and return the same error as wrong passwords.
         encoded = self.admins.get(username, next(iter(self.admins.values())))
         match = HASH_PATTERN.fullmatch(encoded)
@@ -77,11 +76,16 @@ class Administrators:
         actual = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(match[1]), ITERATIONS)
         correct = hmac.compare_digest(actual, bytes.fromhex(match[2]))
         if not correct or username not in self.admins:
+            # Only failures consume the budget; a successful login must not lock the operator out.
+            with self.lock:
+                self._prune()
+                self.attempts.append((self.clock(), address))
             raise ValueError('login_rejected')
         token = secrets.token_urlsafe(32)
         session = dict(username=username, csrf=secrets.token_urlsafe(32), expires=self.clock() + SESSION_SECONDS)
         with self.lock:
             self._prune()
+            self.attempts = deque(item for item in self.attempts if item[1] != address)
             if len(self.sessions) >= 1024:
                 raise ValueError('login_rate_limited')
             self.sessions[token] = session

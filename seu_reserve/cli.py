@@ -244,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.resolve_pending:
             return resolve_pending(settings, environ=environ)
         account_task: Task | None = None
+        had_directory = had_task = False
         if args.account and not args.check:
             # Hold the checkpoint lock from the lifecycle re-check through engine startup (OCR
             # loading included), so a delete cannot remove the account between the catalogue read
@@ -270,7 +271,13 @@ def main(argv: list[str] | None = None) -> int:
                 recognize = load_recognizer()
             except Exception:
                 if account_task is not None:
+                    # Do not leave a checkpoint behind for an account that never started.
                     account_task.close()
+                    account_task = None
+                    if not had_directory:
+                        shutil.rmtree(settings.state_dir, ignore_errors=True)
+                    elif not had_task:
+                        (settings.state_dir / 'task.json').unlink(missing_ok=True)
                 print('event=ocr_unavailable', flush=True)
                 return 1
         try:

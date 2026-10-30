@@ -117,7 +117,13 @@ class Accounts:
                 options TEXT NOT NULL, desired INTEGER NOT NULL DEFAULT 0,
                 error TEXT NOT NULL DEFAULT '', deleting INTEGER NOT NULL DEFAULT 0)''')
             if 'revision' not in {row[1] for row in db.execute('PRAGMA table_info(accounts)')}:
-                db.execute('ALTER TABLE accounts ADD COLUMN revision INTEGER NOT NULL DEFAULT 0')
+                try:
+                    db.execute('ALTER TABLE accounts ADD COLUMN revision INTEGER NOT NULL DEFAULT 0')
+                except sqlite3.OperationalError as exc:
+                    # A concurrent CLI/Web startup may have added the column between the check
+                    # and the ALTER; that is the same end state, not a failure.
+                    if 'duplicate column' not in str(exc).lower():
+                        raise
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=10)

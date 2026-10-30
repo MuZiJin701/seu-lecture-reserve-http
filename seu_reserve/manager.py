@@ -172,6 +172,9 @@ class Manager:
             account = self.accounts.get(identifier)
             if not manual and not account['desired']:
                 return
+            # A CLI `--account` run owns the same checkpoint and lock; never start a second writer.
+            if task_running(self.accounts.state_dir(identifier)):
+                raise ValueError('state_in_use')
             self._launch(account)
             self.accounts.runtime(identifier, desired=True)
             self.retry_at.pop(identifier, None)
@@ -203,16 +206,21 @@ class Manager:
     def stop(self, identifier: str, *, preserve: bool = False, timeout: float = 60) -> None:
         with self.operation(identifier):
             with self.lock:
+                worker = self.workers.get(identifier)
+                if worker is None:
+                    # Another process (CLI `--account`) may own the checkpoint; a 200 here would
+                    # falsely promise a stop, so refuse instead of pretending success.
+                    if task_running(self.accounts.state_dir(identifier)):
+                        raise ValueError('state_in_use')
+                    self.accounts.get(identifier)
+                    self.retry_at.pop(identifier, None)
+                    if not preserve:
+                        self.accounts.runtime(identifier, desired=False)
+                    return
                 if not preserve:
                     self.accounts.get(identifier)
                     self.accounts.runtime(identifier, desired=False)
                 self.retry_at.pop(identifier, None)
-                worker = self.workers.get(identifier)
-                if worker is None:
-                    if preserve:
-                        return
-                    self.accounts.get(identifier)
-                    return
                 if worker.stopping:
                     raise ValueError('account_stopping')
                 worker.stopping = True
@@ -244,6 +252,10 @@ class Manager:
                     raise ValueError('account_deleting')
                 if data.revision != current['revision']:
                     raise ValueError('configuration_conflict')
+                # Refuse before any write: a CLI `--account` run would keep using the old
+                # configuration and the save would silently diverge from the running process.
+                if task_running(self.accounts.state_dir(identifier)):
+                    raise ValueError('state_in_use')
                 candidate = {**current, **data.model_dump(), 'password': data.password or current['password']}
                 candidate['mail_enabled'] = bool(data.recipient)
                 if current['desired']:
@@ -285,6 +297,12 @@ class Manager:
         """Keep the recovery intent unless the failure is explicitly not recoverable."""
         reason = str(exc)
         if reason in ('service_stopping', 'account_already_running', 'account_not_found', 'account_deleting'):
+            return
+        if reason == 'state_in_use':
+            # The checkpoint belongs to a CLI run. Drop the web start intent without burning the
+            # restart budget or sending a false "keeps exiting" alert.
+            self.retry_at.pop(identifier, None)
+            self.accounts.runtime(identifier, desired=False, error='state_in_use')
             return
         if reason in FATAL_ERRORS:
             self.retry_at.pop(identifier, None)
@@ -336,6 +354,11 @@ class Manager:
                     continue
                 if worker.result == 0:
                     self.accounts.runtime(identifier, desired=False)
+                elif worker.reason == 'state_in_use':
+                    # A CLI run took the checkpoint between the pre-launch check and startup.
+                    # Do not count it as an abnormal exit or alert on it.
+                    self.retry_at.pop(identifier, None)
+                    self.accounts.runtime(identifier, desired=False, error='state_in_use')
                 elif worker.reason in FATAL_ERRORS:
                     self.accounts.runtime(identifier, desired=False, error=worker.reason)
                     if worker.reason == 'authentication_rejected':

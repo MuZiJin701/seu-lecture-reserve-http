@@ -339,12 +339,16 @@ class AuthenticationRejected(RemoteError):
 class Client:
     def __init__(self, session: Any, environ: Mapping[str, str],
                  prompt: Callable[[str], str], notify: Callable[[str], None], *,
-                 trust_device: bool = False, fingerprint_dir: Path | None = None):
+                 trust_device: bool = False, fingerprint_dir: Path | None = None,
+                 diagnostic: Callable[..., None] | None = None):
         self.session = session
         install_deadline_pools(session)
         self.environ = environ
         self.prompt = prompt
         self.notify = notify
+        # Optional local diagnostics sink (app.py writes to diagnostics.jsonl). It must never
+        # carry cookie values or tickets and must never affect the login flow.
+        self.diagnostic = diagnostic
         self.timeout = 10.0
         # Opt-in SMS trusted-device support. The fingerprint is generated once per state directory
         # and computed lazily so default logins keep sending no trust fields at all.
@@ -376,6 +380,15 @@ class Client:
             self._device_fingerprint = load_or_create_device_fingerprint(self.fingerprint_dir)
         return self._device_fingerprint
 
+    def _diagnose(self, event: str, **fields: Any) -> None:
+        """Best-effort local diagnostics; never let a sink failure break authentication."""
+        if self.diagnostic is None:
+            return
+        try:
+            self.diagnostic(event, **fields)
+        except Exception:
+            pass
+
     def _load_trust_cookies(self) -> None:
         """Insert persisted CAS cookies so the first school request can reuse the trusted session.
 
@@ -391,6 +404,7 @@ class Client:
         try:
             stored = load_trust_cookies(self.fingerprint_dir, account=self.environ.get('SEU_USERNAME', ''))
         except OSError:
+            self._diagnose('trust_cookies_unavailable')
             return
         loaded = 0
         for item in stored:
@@ -400,6 +414,10 @@ class Client:
                 continue
             loaded += 1
         self._trust_cookies_loaded = loaded > 0
+        if loaded:
+            self._diagnose('trust_cookies_loaded', cookies=loaded)
+        else:
+            self._diagnose('trust_cookies_unavailable')
 
     @staticmethod
     def _saveable_cookie(cookie: Any) -> dict[str, Any] | None:
@@ -437,9 +455,12 @@ class Client:
         except TypeError:
             return
         try:
-            save_trust_cookies(self.fingerprint_dir, cookies, account=self.environ.get('SEU_USERNAME', ''))
+            saved = save_trust_cookies(self.fingerprint_dir, cookies,
+                                       account=self.environ.get('SEU_USERNAME', ''))
         except OSError:
-            pass
+            self._diagnose('trust_cookies_save_failed')
+            return
+        self._diagnose('trust_cookies_saved', cookies=saved)
 
     def _trusted_cas_login(self, service: str) -> Any | None:
         """Cookie-based silent CAS login for the opt-in trusted-device flow.
@@ -454,27 +475,36 @@ class Client:
         try:
             verified = self.cas('verifyTgt', {'service': service, 'loginType': 'account'})
         except RemoteError:
+            self._diagnose('trust_silent_login_failed', step='verify_tgt')
             return None
         if type(verified.get('success')) is not int or verified['success'] != 1:
+            self._diagnose('trust_silent_login_failed', step='verify_tgt')
             return None
         code = verified.get('code')
         if code == 201:
             redirect = verified.get('redirectUrl')
             if not isinstance(redirect, str) or not redirect:
+                self._diagnose('trust_silent_login_failed', step='redirect')
                 return None
             try:
                 app = self.get(CAS + 'loginRedirect?redirectUrl=' + redirect)
             except RemoteError:
+                self._diagnose('trust_silent_login_failed', step='redirect')
                 return None
         elif code == 200:
             try:
                 app = self.get(ENTRY)
             except RemoteError:
+                self._diagnose('trust_silent_login_failed', step='entry')
                 return None
         else:
+            self._diagnose('trust_silent_login_failed', step='verify_tgt',
+                           code=code if type(code) is int else -1)
             return None
         if urlsplit(app.url).hostname == 'ehall.seu.edu.cn' and 'indexjsp.js' in app.text:
+            self._diagnose('trust_silent_login_succeeded')
             return app
+        self._diagnose('trust_silent_login_failed', step='app_page')
         return None
 
     def clone_readonly(self) -> 'Client':

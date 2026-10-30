@@ -979,7 +979,8 @@ def run(settings: Settings, *, session: Any = None,
             snapshot['mail_status'] = 'ready' if notify else 'disabled'
         client = Client(session or requests.Session(), environ, ask, emit,
                         trust_device=settings.trust_device,
-                        fingerprint_dir=settings.state_dir)
+                        fingerprint_dir=settings.state_dir,
+                        diagnostic=diagnostic)
         if check_only:
             stage = 'authentication'
             client.authenticate()

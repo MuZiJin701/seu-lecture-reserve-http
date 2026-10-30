@@ -1097,3 +1097,55 @@ def test_verify_tgt_runs_only_when_persisted_cookies_were_loaded(tmp_path, trust
     assert session.verify_calls == 0
     assert session.cas_login_calls == 1
     assert session.authenticated
+
+def test_trust_diagnostics_report_cookie_load_and_save(tmp_path):
+    events = []
+
+    def sink(event, **fields):
+        events.append((event, fields))
+
+    session = requests.Session()
+    client = Client(session, TRUST_CREDENTIALS, input, lambda _: None,
+                    trust_device=True, fingerprint_dir=tmp_path, diagnostic=sink)
+    client._load_trust_cookies()
+    assert events == [('trust_cookies_unavailable', {})]
+
+    save_trust_cookies(tmp_path, school_trust_cookies(), account=TRUST_CREDENTIALS['SEU_USERNAME'])
+    events.clear()
+    client._load_trust_cookies()
+    assert events == [('trust_cookies_loaded', {'cookies': 2})]
+
+    events.clear()
+    client._save_trust_cookies()
+    assert events == [('trust_cookies_saved', {'cookies': 2})]
+
+
+def test_trust_diagnostics_report_silent_login_outcome(tmp_path):
+    events = []
+
+    def sink(event, **fields):
+        events.append((event, fields))
+
+    client = Client(requests.Session(), TRUST_CREDENTIALS, input, lambda _: None,
+                    trust_device=True, fingerprint_dir=tmp_path, diagnostic=sink)
+    client._trust_cookies_loaded = True
+    client.cas = lambda *args, **kwargs: {'success': 0, 'code': 500}
+    assert client._trusted_cas_login('service') is None
+    assert events == [('trust_silent_login_failed', {'step': 'verify_tgt'})]
+
+    events.clear()
+    client.cas = lambda *args, **kwargs: {'success': 1, 'code': 200}
+    client.get = lambda url, **kwargs: SimpleNamespace(
+        url='https://ehall.seu.edu.cn/gsapp/index.do', text='indexjsp.js')
+    assert client._trusted_cas_login('service') is not None
+    assert events == [('trust_silent_login_succeeded', {})]
+
+
+def test_trust_diagnostics_never_break_authentication(tmp_path):
+    def broken_sink(event, **fields):
+        raise RuntimeError('sink failed')
+
+    client = Client(requests.Session(), TRUST_CREDENTIALS, input, lambda _: None,
+                    trust_device=True, fingerprint_dir=tmp_path, diagnostic=broken_sink)
+    client._load_trust_cookies()
+    assert client._trust_cookies_loaded is False

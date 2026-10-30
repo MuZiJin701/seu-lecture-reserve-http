@@ -21,13 +21,15 @@ from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 import requests
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.serialization import load_der_public_key
+from requests.cookies import create_cookie
 from urllib3.connection import HTTPConnection as Urllib3HTTPConnection
 from urllib3.connection import HTTPSConnection as Urllib3HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool as Urllib3HTTPConnectionPool
 from urllib3.connectionpool import HTTPSConnectionPool as Urllib3HTTPSConnectionPool
 from urllib3.exceptions import ReadTimeoutError
 
-from .state import load_or_create_device_fingerprint
+from .state import (load_or_create_device_fingerprint, load_trust_cookies,
+                    save_trust_cookies)
 
 BASE = 'https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu'
 ENTRY = BASE + '/*default/index.do'
@@ -349,6 +351,9 @@ class Client:
         self.trust_device = trust_device
         self.fingerprint_dir = fingerprint_dir
         self._device_fingerprint: str | None = None
+        # True only after persisted CAS cookies were actually loaded for this login attempt:
+        # the cookie-based silent re-login (verifyTgt) must never run without them.
+        self._trust_cookies_loaded = False
         # Observability for callers (app.py): one counter per request attempt and the handshake
         # cost of the connection that attempt opened, if any.
         self.requests_made = 0
@@ -370,6 +375,107 @@ class Client:
         if self._device_fingerprint is None:
             self._device_fingerprint = load_or_create_device_fingerprint(self.fingerprint_dir)
         return self._device_fingerprint
+
+    def _load_trust_cookies(self) -> None:
+        """Insert persisted CAS cookies so the first school request can reuse the trusted session.
+
+        Only runs for the opt-in trusted-device flow. A missing, corrupt, expired or unusable
+        file yields no cookies and the normal password/SMS login continues unchanged.
+        """
+        self._trust_cookies_loaded = False
+        if not self.trust_device or self.fingerprint_dir is None:
+            return
+        jar = getattr(self.session, 'cookies', None)
+        if jar is None or not hasattr(jar, 'set_cookie'):
+            return
+        try:
+            stored = load_trust_cookies(self.fingerprint_dir)
+        except OSError:
+            return
+        loaded = 0
+        for item in stored:
+            try:
+                jar.set_cookie(create_cookie(**item))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            loaded += 1
+        self._trust_cookies_loaded = loaded > 0
+
+    @staticmethod
+    def _saveable_cookie(cookie: Any) -> dict[str, Any] | None:
+        """The fixed school-cookie fields worth persisting, or None for any other cookie."""
+        domain = getattr(cookie, 'domain', None)
+        if not isinstance(domain, str) or not domain:
+            return None
+        # Only the school's own cookies may be written: never unrelated hosts that a redirect or a
+        # proxy could have set on the same session.
+        if domain != 'seu.edu.cn' and not domain.endswith('.seu.edu.cn'):
+            return None
+        name = getattr(cookie, 'name', None)
+        value = getattr(cookie, 'value', None)
+        path = getattr(cookie, 'path', '/')
+        secure = getattr(cookie, 'secure', False)
+        expires = getattr(cookie, 'expires', None)
+        if not isinstance(name, str) or not isinstance(value, str):
+            return None
+        return dict(name=name, value=value, domain=domain,
+                    path=path if isinstance(path, str) and path else '/',
+                    secure=bool(secure),
+                    expires=(float(expires) if isinstance(expires, (int, float))
+                             and not isinstance(expires, bool) else None))
+
+    def _save_trust_cookies(self) -> None:
+        """Persist the school's CAS cookies after a successful login (opt-in only)."""
+        if not self.trust_device or self.fingerprint_dir is None:
+            return
+        jar = getattr(self.session, 'cookies', None)
+        if jar is None:
+            return
+        try:
+            cookies = [record for cookie in jar
+                       if (record := self._saveable_cookie(cookie)) is not None]
+        except TypeError:
+            return
+        try:
+            save_trust_cookies(self.fingerprint_dir, cookies)
+        except OSError:
+            pass
+
+    def _trusted_cas_login(self, service: str) -> Any | None:
+        """Cookie-based silent CAS login for the opt-in trusted-device flow.
+
+        Mirrors the CAS SPA's ``verifyTgt`` call: a persisted ``TGT`` cookie can yield a
+        ``loginRedirect`` (code 201) or an already-authenticated session (code 200). Returns the
+        verified application page, or None so the caller falls through to the normal password/SMS
+        login. Every failure is silent: a trust attempt must never raise or reuse a non-app page.
+        """
+        if not (self.trust_device and self._trust_cookies_loaded):
+            return None
+        try:
+            verified = self.cas('verifyTgt', {'service': service, 'loginType': 'account'})
+        except RemoteError:
+            return None
+        if type(verified.get('success')) is not int or verified['success'] != 1:
+            return None
+        code = verified.get('code')
+        if code == 201:
+            redirect = verified.get('redirectUrl')
+            if not isinstance(redirect, str) or not redirect:
+                return None
+            try:
+                app = self.get(CAS + 'loginRedirect?redirectUrl=' + redirect)
+            except RemoteError:
+                return None
+        elif code == 200:
+            try:
+                app = self.get(ENTRY)
+            except RemoteError:
+                return None
+        else:
+            return None
+        if urlsplit(app.url).hostname == 'ehall.seu.edu.cn' and 'indexjsp.js' in app.text:
+            return app
+        return None
 
     def clone_readonly(self) -> 'Client':
         """Independent client with a copied-cookie session for read-only background queries.
@@ -691,6 +797,9 @@ class Client:
                     break
 
     def authenticate(self) -> None:
+        # Opt-in trusted device: present the persisted CAS session before the first request so the
+        # entry GET (or the explicit verifyTgt call below) can restore the session without SMS.
+        self._load_trust_cookies()
         try:
             self._authenticate()
         except RemoteError as exc:
@@ -703,6 +812,7 @@ class Client:
             # Restart authentication, never replay a failed request or reservation submission.
             self._authenticate()
         self.initial_authentication = False
+        self._save_trust_cookies()
 
     def _authenticate(self) -> None:
         app = self.get(ENTRY)
@@ -717,6 +827,11 @@ class Client:
                     raise
             if service is not None and urlsplit(service).hostname == 'ehall.seu.edu.cn':
                 # Campus access goes straight to the application's CAS service, without VPN.
+                # Opt-in trusted device: try the SPA's explicit cookie-based session check first;
+                # a persisted CAS cookie may complete the login without password/SMS. Any other
+                # outcome falls through to the existing campus login below.
+                if self._trusted_cas_login(service) is not None:
+                    return
                 # Login errors (credentials, challenges, network failures inside login()) keep
                 # their existing behavior: only the application-entry step below may fall back.
                 result = self.login(service)

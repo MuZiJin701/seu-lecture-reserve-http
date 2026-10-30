@@ -10,6 +10,7 @@ import time
 from http.client import RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from types import SimpleNamespace
+from urllib.parse import quote, urlencode, urlsplit
 
 import pytest
 import requests
@@ -20,9 +21,10 @@ from cryptography.x509.oid import NameOID
 from urllib3.util import connection
 from urllib3.exceptions import ProtocolError
 
-from seu_reserve.client import (Client, DEADLINE_POOLS, GATEWAY, GatewayIPAdapter, RemoteError,
-                                install_deadline_pools)
-from seu_reserve.state import FINGERPRINT_FILE
+from seu_reserve.client import (Client, DEADLINE_POOLS, ENTRY, GATEWAY, GatewayIPAdapter,
+                                RemoteError, install_deadline_pools)
+from seu_reserve.state import (FINGERPRINT_FILE, TRUST_COOKIES_FILE, load_trust_cookies,
+                               save_trust_cookies)
 
 
 @pytest.fixture
@@ -867,3 +869,231 @@ def test_real_tls_handshake_reaches_last_connect_seconds(gateway_server, monkeyp
         client.request('GET', GATEWAY + ':443/public')
         assert client.requests_made == 3
         assert isinstance(client.last_connect_seconds, float)
+
+
+TRUST_CREDENTIALS = {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'}
+
+
+class CampusTrustSession(requests.Session):
+    """Campus-direct CAS/SPA flow with school cookies and a configurable verifyTgt reply.
+
+    The entry page always redirects to the CAS SPA until the session is authenticated, so a
+    persisted cookie alone is never treated as a completed login: only the explicit verifyTgt
+    attempt (or the normal password/SMS login) can finish authentication.
+    """
+
+    service = 'http://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do'
+
+    def __init__(self, *, verify=None, broken_trust_redirect=False):
+        super().__init__()
+        self.calls = []
+        self.authenticated = False
+        self.sso_active = False
+        self.verify_reply = verify
+        self.broken_trust_redirect = broken_trust_redirect
+        self.verify_calls = 0
+        self.cas_login_calls = 0
+        self.login_redirects = 0
+        self.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        response = requests.Response()
+        response.url = url
+        response.status_code = 200
+        response._content = b'{"code": 0}'
+        path = urlsplit(url).path
+        tail = path.rsplit('/', 1)[-1]
+        if tail == 'index.do' and method == 'GET':
+            if self.authenticated or self.sso_active:
+                response._content = b'<script src="indexjsp.js"></script>'
+            else:
+                response.status_code = 302
+                response.headers['Location'] = ('https://auth.seu.edu.cn/dist/#/login?'
+                                                + urlencode({'service': self.service}))
+        elif path.startswith('/dist/'):
+            response._content = b'<html>CAS</html>'
+        elif tail == 'verifyTgt' and method == 'POST':
+            self.verify_calls += 1
+            if isinstance(self.verify_reply, BaseException):
+                raise self.verify_reply
+            if self.verify_reply.get('code') == 200:
+                self.sso_active = True
+            response._content = json.dumps(self.verify_reply).encode()
+        elif tail == 'needCaptcha':
+            response._content = json.dumps({'code': 200}).encode()
+        elif tail == 'getChiperKey':
+            public = self.key.public_key().public_bytes(
+                serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+            response._content = json.dumps(
+                {'success': True, 'publicKey': base64.urlsafe_b64encode(public).decode()}).encode()
+        elif tail == 'casLogin' and method == 'POST':
+            self.cas_login_calls += 1
+            self.cookies.set('TGT', 'tgt-value', domain='auth.seu.edu.cn', path='/', secure=True)
+            self.cookies.set('JSESSIONID', 'jsession-value', domain='ehall.seu.edu.cn', path='/',
+                             expires=time.time() + 3600)
+            self.cookies.set('unrelated', 'other-value', domain='example.com', path='/')
+            response._content = json.dumps(
+                {'code': 200, 'redirectUrl': quote(self.service, safe='')}).encode()
+        elif tail == 'loginRedirect':
+            self.login_redirects += 1
+            if self.broken_trust_redirect and self.cas_login_calls == 0:
+                # The trust attempt's redirect must not be accepted: it is not the app page.
+                response._content = b'<html>not the application</html>'
+            else:
+                self.authenticated = True
+                response.status_code = 302
+                response.headers['Location'] = ENTRY + '?ticket=SYNTHETIC'
+        return response
+
+
+VERIFY_REDIRECT = {'success': 1, 'code': 201,
+                   'redirectUrl': quote(CampusTrustSession.service, safe='')}
+VERIFY_ALREADY = {'success': 1, 'code': 200}
+VERIFY_REJECTED = {'success': 0, 'code': 500}
+
+
+def school_trust_cookies():
+    return [
+        dict(name='TGT', value='tgt-value', domain='auth.seu.edu.cn', path='/',
+             secure=True, expires=None),
+        dict(name='JSESSIONID', value='jsession-value', domain='ehall.seu.edu.cn', path='/',
+             secure=False, expires=time.time() + 3600),
+    ]
+
+
+def campus_client(directory, *, trust_device=True, verify=None, **session_options):
+    session = CampusTrustSession(verify=verify, **session_options)
+    client = Client(session, TRUST_CREDENTIALS, input, lambda _: None,
+                    trust_device=trust_device, fingerprint_dir=directory)
+    return client, session
+
+
+def test_trusted_authenticate_persists_only_school_cookies(tmp_path):
+    client, session = campus_client(tmp_path)
+    client.authenticate()
+    assert session.authenticated
+    assert session.verify_calls == 0          # nothing persisted yet: normal login only
+    assert session.cas_login_calls == 1
+    stored = load_trust_cookies(tmp_path)
+    assert [item['name'] for item in stored] == ['TGT', 'JSESSIONID']
+    assert stored[0]['domain'] == 'auth.seu.edu.cn' and stored[0]['secure'] is True
+    assert stored[0]['expires'] is None
+    assert stored[1]['domain'] == 'ehall.seu.edu.cn' and stored[1]['secure'] is False
+    assert stored[1]['expires'] > time.time()
+    assert (tmp_path / TRUST_COOKIES_FILE).exists()
+
+
+def test_trust_device_disabled_persists_and_loads_nothing(tmp_path):
+    save_trust_cookies(tmp_path, school_trust_cookies())
+    client, session = campus_client(tmp_path, trust_device=False)
+    client.authenticate()
+    assert session.authenticated
+    assert session.verify_calls == 0
+    # The file was not used and not rewritten with the fake session's unrelated cookie.
+    assert [item['name'] for item in load_trust_cookies(tmp_path)] == ['TGT', 'JSESSIONID']
+
+
+def test_persisted_cookies_are_loaded_into_a_fresh_session_and_would_be_sent(tmp_path):
+    save_trust_cookies(tmp_path, school_trust_cookies())
+    session = requests.Session()
+    client = Client(session, TRUST_CREDENTIALS, input, lambda _: None,
+                    trust_device=True, fingerprint_dir=tmp_path)
+    seen = {}
+    def capture() -> None:
+        seen['cookies'] = [(cookie.name, cookie.value) for cookie in session.cookies]
+    client._authenticate = capture
+    client.authenticate()
+    assert ('TGT', 'tgt-value') in seen['cookies']
+    assert ('JSESSIONID', 'jsession-value') in seen['cookies']
+    # The initial ENTRY request would carry the persisted CAS cookie header.
+    prepared = session.prepare_request(
+        requests.Request('GET', 'https://auth.seu.edu.cn/dist/'))
+    assert 'TGT=tgt-value' in prepared.headers.get('Cookie', '')
+
+
+def test_expired_persisted_cookie_is_not_loaded(tmp_path):
+    save_trust_cookies(tmp_path, [dict(name='TGT', value='stale', domain='auth.seu.edu.cn',
+                                       path='/', secure=True, expires=time.time() - 60)])
+    client, session = campus_client(tmp_path, verify=VERIFY_REDIRECT)
+    client.authenticate()
+    assert session.verify_calls == 0          # an expired cookie must not trigger verifyTgt
+    assert session.cas_login_calls == 1
+    assert session.authenticated
+
+
+def test_corrupt_cookie_file_falls_back_to_password_login(tmp_path):
+    (tmp_path / TRUST_COOKIES_FILE).write_text('PRIVATE not json')
+    client, session = campus_client(tmp_path, verify=VERIFY_REDIRECT)
+    client.authenticate()
+    assert session.verify_calls == 0
+    assert session.cas_login_calls == 1
+    assert session.authenticated
+
+
+def test_unwritable_trust_state_directory_does_not_break_login(tmp_path):
+    directory = tmp_path / 'not-a-directory'
+    directory.write_text('file')
+    client, session = campus_client(directory, verify=VERIFY_REDIRECT)
+    client.authenticate()
+    assert session.cas_login_calls == 1 and session.authenticated
+    assert load_trust_cookies(directory) == []
+
+
+def test_verify_tgt_201_redirect_completes_login_without_password_or_sms(tmp_path):
+    save_trust_cookies(tmp_path, school_trust_cookies())
+    client, session = campus_client(tmp_path, verify=VERIFY_REDIRECT)
+    client.authenticate()
+    assert session.verify_calls == 1
+    assert session.cas_login_calls == 0
+    assert session.authenticated
+    verify = next(kwargs['json'] for method, url, kwargs in session.calls
+                  if url.endswith('verifyTgt'))
+    assert verify == {'service': CampusTrustSession.service, 'loginType': 'account'}
+
+
+def test_verify_tgt_200_rechecks_the_entry_page(tmp_path):
+    save_trust_cookies(tmp_path, school_trust_cookies())
+    client, session = campus_client(tmp_path, verify=VERIFY_ALREADY)
+    client.authenticate()
+    assert session.verify_calls == 1
+    assert session.cas_login_calls == 0
+    assert session.sso_active
+
+
+@pytest.mark.parametrize('verify', [VERIFY_REJECTED, RemoteError('service_unavailable')])
+def test_verify_tgt_failure_or_error_falls_back_to_password_login(tmp_path, verify):
+    save_trust_cookies(tmp_path, school_trust_cookies())
+    client, session = campus_client(tmp_path, verify=verify)
+    client.authenticate()
+    assert session.verify_calls == 1
+    assert session.cas_login_calls == 1
+    assert session.authenticated
+
+
+def test_verify_tgt_non_app_redirect_falls_back_to_password_login(tmp_path):
+    save_trust_cookies(tmp_path, school_trust_cookies())
+    client, session = campus_client(tmp_path, verify=VERIFY_REDIRECT,
+                                    broken_trust_redirect=True)
+    client.authenticate()
+    assert session.verify_calls == 1
+    assert session.login_redirects >= 2       # trust redirect rejected, normal login redirect used
+    assert session.cas_login_calls == 1
+    assert session.authenticated
+
+
+@pytest.mark.parametrize('trust_device, cookie_file', [
+    (False, 'valid'), (True, 'missing'), (True, 'expired'),
+])
+def test_verify_tgt_runs_only_when_persisted_cookies_were_loaded(tmp_path, trust_device,
+                                                                 cookie_file):
+    if cookie_file == 'valid':
+        save_trust_cookies(tmp_path, school_trust_cookies())
+    elif cookie_file == 'expired':
+        save_trust_cookies(tmp_path, [dict(name='TGT', value='stale', domain='auth.seu.edu.cn',
+                                           path='/', secure=True, expires=time.time() - 60)])
+    client, session = campus_client(tmp_path, trust_device=trust_device, verify=VERIFY_REDIRECT)
+    client.authenticate()
+    assert session.verify_calls == 0
+    assert session.cas_login_calls == 1
+    assert session.authenticated

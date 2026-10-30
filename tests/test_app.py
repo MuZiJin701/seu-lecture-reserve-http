@@ -4,7 +4,7 @@ import socket
 import sys
 import threading
 import types
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import requests
 import pytest
@@ -3609,3 +3609,102 @@ def test_resolve_pending_wires_the_trusted_device_options(tmp_path, monkeypatch)
                              prompt=lambda _: 'cancel')
     assert result == 1
     assert seen == {'trust_device': True, 'fingerprint_dir': tmp_path}
+
+
+class TrustedCampusSchool(School):
+    """Campus-direct CAS SPA: persisted TGT enables the explicit verifyTgt silent login."""
+
+    service = 'http://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do'
+    entry = 'https://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do'
+
+    def __init__(self):
+        super().__init__()
+        self.cookies = requests.cookies.RequestsCookieJar()
+        self.verify_tgt_calls = 0
+
+    def request(self, method, url, **kwargs):
+        path = urlsplit(url).path
+        tail = path.rsplit('/', 1)[-1]
+        has_tgt = any(cookie.name == 'TGT' for cookie in self.cookies)
+        if tail == 'index.do' and method == 'GET':
+            self.requests.append((method, url, kwargs))
+            response = requests.Response()
+            response.url = url
+            if self.authenticated:
+                response.status_code = 200
+                response._content = b'<script src="indexjsp.js"></script>'
+            else:
+                # The entry GET alone never completes a trusted login (the SPA route is served).
+                response.status_code = 302
+                response.headers['Location'] = ('https://auth.seu.edu.cn/dist/#/login?'
+                                                + urlencode({'service': self.service}))
+            return response
+        if path.startswith('/dist/'):
+            self.requests.append((method, url, kwargs))
+            response = requests.Response()
+            response.url = url
+            response.status_code = 200
+            response._content = b'<html>CAS</html>'
+            return response
+        if tail == 'verifyTgt' and method == 'POST':
+            self.verify_tgt_calls += 1
+            self.requests.append((method, url, kwargs))
+            payload = ({'success': 1, 'code': 201,
+                        'redirectUrl': quote(self.service, safe='')}
+                       if has_tgt else {'success': 0, 'code': 500})
+            response = requests.Response()
+            response.url = url
+            response.status_code = 200
+            response._content = json.dumps(payload).encode()
+            return response
+        if tail == 'loginRedirect':
+            self.requests.append((method, url, kwargs))
+            self.authenticated = True
+            response = requests.Response()
+            response.url = url
+            response.status_code = 302
+            response.headers['Location'] = self.entry + '?ticket=SYNTHETIC'
+            return response
+        if tail == 'casLogin' and method == 'POST':
+            self.requests.append((method, url, kwargs))
+            self.cookies.set('TGT', 'tgt-value', domain='auth.seu.edu.cn', path='/', secure=True)
+            self.cookies.set('JSESSIONID', 'jsession-value', domain='ehall.seu.edu.cn', path='/',
+                             expires=moment('2030-01-01 10:00:00').timestamp())
+            response = requests.Response()
+            response.url = url
+            response.status_code = 200
+            response._content = json.dumps(
+                {'code': 200, 'redirectUrl': quote(self.service, safe='')}).encode()
+            return response
+        return super().request(method, url, **kwargs)
+
+
+def test_check_reuses_persisted_cas_cookies_without_a_second_sms(tmp_path):
+    from seu_reserve.state import TRUST_COOKIES_FILE, load_trust_cookies
+    settings = Settings(state_dir=tmp_path, trust_device=True)
+    first = TrustedCampusSchool()
+    assert execute(first, tmp_path, settings=settings, check_only=True) == 0
+    assert first.verify_tgt_calls == 0          # no cookie was persisted yet
+    assert cas_login_payloads(first)
+    stored = load_trust_cookies(tmp_path)
+    assert [item['name'] for item in stored] == ['TGT', 'JSESSIONID']
+    assert stored[0]['domain'] == 'auth.seu.edu.cn' and stored[0]['secure'] is True
+    assert stored[1]['domain'] == 'ehall.seu.edu.cn'
+    assert (tmp_path / TRUST_COOKIES_FILE).exists()
+
+    second = TrustedCampusSchool()
+    assert execute(second, tmp_path, settings=settings, check_only=True) == 0
+    assert second.verify_tgt_calls == 1
+    assert cas_login_payloads(second) == []     # no password/SMS second factor on the second run
+    verify = [kwargs['json'] for method, url, kwargs in second.requests
+              if method == 'POST' and url.endswith('verifyTgt')]
+    assert verify == [{'service': TrustedCampusSchool.service, 'loginType': 'account'}]
+    assert 'agentId' not in verify[0]
+
+    # Opt-in only: with the flag off a fresh run ignores the persisted cookies and logs in again.
+    third = TrustedCampusSchool()
+    assert execute(third, tmp_path,
+                   settings=Settings(state_dir=tmp_path, trust_device=False),
+                   check_only=True) == 0
+    assert third.verify_tgt_calls == 0
+    assert cas_login_payloads(third)

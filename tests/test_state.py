@@ -3,11 +3,13 @@ import os
 import stat
 import subprocess
 import sys
+import time
 
 import pytest
 
-from seu_reserve.state import (FINGERPRINT_FILE, FINGERPRINT_PATTERN, Task,
-                               load_or_create_device_fingerprint, open_nofollow)
+from seu_reserve.state import (FINGERPRINT_FILE, FINGERPRINT_PATTERN, TRUST_COOKIE_FIELDS,
+                               TRUST_COOKIES_FILE, Task, load_or_create_device_fingerprint,
+                               load_trust_cookies, open_nofollow, save_trust_cookies)
 
 
 def test_save_retries_a_transient_file_sharing_violation(tmp_path, monkeypatch):
@@ -185,3 +187,94 @@ def test_device_fingerprint_rejects_a_symlink_without_touching_its_target(tmp_pa
     assert value.startswith('stable_') and FINGERPRINT_PATTERN.fullmatch(value)
     assert target.read_text() == 'do not change'
     assert link.is_symlink()
+
+
+def school_trust_cookies():
+    return [
+        dict(name='TGT', value='tgt-value', domain='auth.seu.edu.cn', path='/',
+             secure=True, expires=None),
+        dict(name='JSESSIONID', value='jsession-value', domain='ehall.seu.edu.cn', path='/',
+             secure=False, expires=time.time() + 3600),
+    ]
+
+
+def test_trust_cookies_round_trip_with_only_fixed_fields(tmp_path):
+    cookies = school_trust_cookies()
+    assert save_trust_cookies(tmp_path, cookies) == 2
+    path = tmp_path / TRUST_COOKIES_FILE
+    assert path.exists()
+    stored = load_trust_cookies(tmp_path)
+    assert [item['name'] for item in stored] == ['TGT', 'JSESSIONID']
+    assert set(stored[0]) == set(TRUST_COOKIE_FIELDS)
+    assert stored[0] == cookies[0]
+    assert stored[1]['secure'] is False and stored[1]['expires'] > time.time()
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='POSIX file mode only')
+def test_trust_cookies_file_is_private(tmp_path):
+    save_trust_cookies(tmp_path, school_trust_cookies())
+    mode = stat.S_IMODE((tmp_path / TRUST_COOKIES_FILE).stat().st_mode)
+    assert mode == 0o600
+
+
+def test_trust_cookies_overwrite_atomically_and_leave_no_temp_files(tmp_path):
+    save_trust_cookies(tmp_path, school_trust_cookies())
+    replacement = [dict(name='CASTGC', value='new-ticket', domain='.seu.edu.cn', path='/',
+                        secure=True, expires=None)]
+    assert save_trust_cookies(tmp_path, replacement) == 1
+    assert load_trust_cookies(tmp_path) == replacement
+    assert not list(tmp_path.glob('.trust-cookies-*'))
+
+
+def test_trust_cookies_retry_a_transient_windows_replace_failure(tmp_path, monkeypatch):
+    from seu_reserve import state
+
+    calls = []
+    original_replace = state.os.replace
+    def flaky_replace(source, target):
+        calls.append(target)
+        if len(calls) == 1:
+            raise PermissionError(13, 'sharing violation')
+        original_replace(source, target)
+
+    monkeypatch.setattr(state.os, 'replace', flaky_replace)
+    assert save_trust_cookies(tmp_path, school_trust_cookies()) == 2
+    assert len(calls) == 2
+    assert len(load_trust_cookies(tmp_path)) == 2
+
+
+def test_trust_cookies_swallow_write_errors_and_clean_up(tmp_path, monkeypatch):
+    from seu_reserve import state
+
+    def always_blocked(source, target):
+        raise PermissionError(13, 'sharing violation')
+
+    monkeypatch.setattr(state.os, 'replace', always_blocked)
+    assert save_trust_cookies(tmp_path, school_trust_cookies()) == 0
+    assert not (tmp_path / TRUST_COOKIES_FILE).exists()
+    assert not list(tmp_path.glob('.trust-cookies-*'))
+
+
+def test_trust_cookies_drop_expired_and_skip_invalid_entries(tmp_path):
+    expired = dict(name='TGT', value='stale', domain='auth.seu.edu.cn', path='/',
+                   secure=True, expires=time.time() - 60)
+    future = dict(name='JSESSIONID', value='js', domain='ehall.seu.edu.cn', path='/',
+                  secure=False, expires=time.time() + 60)
+    save_trust_cookies(tmp_path, [expired, future])
+    assert [item['name'] for item in load_trust_cookies(tmp_path)] == ['JSESSIONID']
+
+    # Malformed entries are skipped, not accepted: the schema is fixed.
+    path = tmp_path / TRUST_COOKIES_FILE
+    path.write_text(json.dumps([{'name': 42, 'value': 'x', 'domain': 'a', 'path': '/',
+                                 'secure': False, 'expires': None}]))
+    assert load_trust_cookies(tmp_path) == []
+
+
+def test_trust_cookies_corrupt_or_non_list_file_is_ignored(tmp_path):
+    path = tmp_path / TRUST_COOKIES_FILE
+    path.write_text('PRIVATE not json')
+    assert load_trust_cookies(tmp_path) == []
+    path.write_text(json.dumps({'name': 'TGT', 'value': 'x', 'domain': 'auth.seu.edu.cn',
+                                'path': '/', 'secure': True, 'expires': None}))
+    assert load_trust_cookies(tmp_path) == []
+    assert load_trust_cookies(tmp_path / 'missing') == []

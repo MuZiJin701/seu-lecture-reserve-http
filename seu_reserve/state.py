@@ -11,6 +11,7 @@ import stat
 import sys
 import tempfile
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,11 @@ REPLACE_RETRY_SECONDS = 0.005
 # anywhere else and is never logged.
 FINGERPRINT_FILE = 'device-fingerprint'
 FINGERPRINT_PATTERN = re.compile(r'[A-Za-z0-9_-]{8,128}')
+# Opt-in trusted-device CAS cookies (TGT/JSESSIONID, ...). A browser keeps these across sessions,
+# which is what lets the school skip the SMS second factor on a later login; the file is private
+# and only the fixed cookie fields are stored (never headers, passwords or page content).
+TRUST_COOKIES_FILE = 'trust-cookies.json'
+TRUST_COOKIE_FIELDS = ('name', 'value', 'domain', 'path', 'secure', 'expires')
 
 
 def lock_file(fd: int) -> None:
@@ -80,6 +86,18 @@ def open_nofollow(path: Path, flags: int) -> int:
         raise
 
 
+def replace_with_retry(source: str, target: Path) -> None:
+    """Publish a same-directory replacement atomically, tolerating brief Windows reader locks."""
+    for attempt in range(REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt + 1 == REPLACE_ATTEMPTS:
+                raise
+            time.sleep(REPLACE_RETRY_SECONDS * (attempt + 1))
+
+
 def load_or_create_device_fingerprint(directory: Path) -> str:
     """Stable, private device fingerprint for the opt-in SMS trusted-device flow.
 
@@ -110,6 +128,92 @@ def load_or_create_device_fingerprint(directory: Path) -> str:
     except OSError:
         pass
     return value
+
+
+def _trust_cookie_record(item: Any) -> dict[str, Any] | None:
+    """Normalize one stored cookie to the fixed schema; None when it is not valid.
+
+    Only the fields the school login needs are kept. Values are private local state and are never
+    logged; a malformed entry is dropped instead of failing the whole file.
+    """
+    if not isinstance(item, dict):
+        return None
+    name = item.get('name')
+    value = item.get('value')
+    domain = item.get('domain')
+    path = item.get('path')
+    secure = item.get('secure', False)
+    expires = item.get('expires')
+    if not (isinstance(name, str) and isinstance(value, str) and isinstance(domain, str)
+            and isinstance(path, str) and name and domain):
+        return None
+    if type(secure) is not bool:
+        return None
+    if expires is not None and (type(expires) not in (int, float) or not math.isfinite(expires)):
+        return None
+    return dict(name=name, value=value, domain=domain, path=path, secure=secure,
+                expires=float(expires) if expires is not None else None)
+
+
+def save_trust_cookies(directory: Path, cookies: Iterable[dict]) -> int:
+    """Persist the school's CAS cookies privately and atomically; never fails the login.
+
+    A same-directory temp file is fsynced and published with ``os.replace`` (Windows reader-lock
+    retry included), so a crash cannot leave a half-written file; the state directory is created
+    private (0700) and the file is created private (mkstemp 0600). Only fixed cookie fields are
+    stored. Any OSError is swallowed and reported as 0 saved cookies.
+    """
+    records = [record for item in cookies if (record := _trust_cookie_record(item)) is not None]
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError:
+        return 0
+    name: str | None = None
+    try:
+        fd, created = tempfile.mkstemp(prefix='.trust-cookies-', dir=directory)
+        name = created
+        with os.fdopen(fd, 'w') as target:
+            json.dump(records, target, allow_nan=False)
+            target.flush()
+            os.fsync(target.fileno())
+        replace_with_retry(name, directory / TRUST_COOKIES_FILE)
+        name = None
+    except OSError:
+        return 0
+    finally:
+        if name is not None:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+    return len(records)
+
+
+def load_trust_cookies(directory: Path) -> list[dict[str, Any]]:
+    """Read persisted CAS cookies; missing, unreadable, corrupt or malformed data returns [].
+
+    Expired cookies are dropped so a stale TGT does not suppress the normal password/SMS flow
+    with a request that can only fail.
+    """
+    try:
+        fd = open_nofollow(directory / TRUST_COOKIES_FILE, os.O_RDONLY)
+        with os.fdopen(fd) as source:
+            data = json.load(source)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    now = time.time()
+    cookies: list[dict[str, Any]] = []
+    for item in data:
+        record = _trust_cookie_record(item)
+        if record is None:
+            continue
+        expires = record['expires']
+        if expires is not None and expires <= now:
+            continue
+        cookies.append(record)
+    return cookies
 
 
 class Task:
@@ -230,14 +334,7 @@ class Task:
 
     def _replace(self, name: str) -> None:
         """Publish the checkpoint atomically, tolerating brief reader locks."""
-        for attempt in range(REPLACE_ATTEMPTS):
-            try:
-                os.replace(name, self.path)
-                return
-            except PermissionError:
-                if attempt + 1 == REPLACE_ATTEMPTS:
-                    raise
-                time.sleep(REPLACE_RETRY_SECONDS * (attempt + 1))
+        replace_with_retry(name, self.path)
 
     def close(self) -> None:
         os.close(self.lock)

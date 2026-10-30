@@ -176,6 +176,11 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError('invalid_port')
         host = (shared.get('SEU_WEB_HOST') or '').strip() or '0.0.0.0'
         app = create_app(Accounts(root), shared)
+        if host in ('0.0.0.0', '::'):
+            print(f'管理台监听 {host}:{port}；本机浏览器请打开 http://127.0.0.1:{port}'
+                  '（0.0.0.0 只是监听所有网卡的绑定地址，不能直接作为网址访问）', flush=True)
+        else:
+            print(f'管理台监听 {host}:{port}；浏览器请打开 http://{host}:{port}', flush=True)
         import uvicorn
         try:
             uvicorn.run(app, host=host, port=port, workers=1, proxy_headers=False,

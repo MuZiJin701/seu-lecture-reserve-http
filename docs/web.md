@@ -22,7 +22,7 @@
 uv run --locked seu-reserve-web
 ```
 
-随后在可信网络内用浏览器打开 `http://<服务器地址>:8080`；本机部署可用 `http://127.0.0.1:8080`。服务器防火墙或安全组需允许所选端口。使用非 root 用户及大于 1024 的端口即可直接访问，不需要证书、反向代理或 TLS 配置。不要使用 `fastapi dev`、热重载或多个 Uvicorn worker；管理服务固定一个进程，账号进程承担并发。同一数据根目录有管理器锁 `manager.lock`，第二个管理服务启动会失败。
+随后在可信网络内用浏览器打开 `http://<服务器地址>:8080`；本机部署可用 `http://127.0.0.1:8080`。`SEU_WEB_HOST=0.0.0.0` 只是监听所有网卡的绑定地址，不能直接当网址访问；看到 `ERR_ADDRESS_INVALID` 时改用 `127.0.0.1`、`localhost` 或服务器实际 IP。服务器防火墙或安全组需允许所选端口。使用非 root 用户及大于 1024 的端口即可直接访问，不需要证书、反向代理或 TLS 配置。不要使用 `fastapi dev`、热重载或多个 Uvicorn worker；管理服务固定一个进程，账号进程承担并发。同一数据根目录有管理器锁 `manager.lock`，第二个管理服务启动会失败。
 
 管理台没有认证。作为浏览器侧的防误操作与跨站请求防护，非 GET 的 `/api/*` 请求仍校验 Origin（仅接受浏览器来源）与 `Content-Type: application/json`，并要求 `Content-Length` 不超过 64 KiB；响应保留 CSP、`no-store`、`nosniff` 与 Referrer-Policy，不设置 HSTS。这些校验降低误触和跨站请求风险，但不是认证，也不能替代网络边界。
 

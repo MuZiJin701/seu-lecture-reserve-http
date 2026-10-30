@@ -33,7 +33,7 @@ SEU_WEB_PORT=8080
 SEU_DATA_DIR=state
 ```
 
-Use `--config /absolute/path/.env` to select another configuration file. There is no administrator login; deploy only on a trusted LAN or VPN. Any reachable host on the same network can operate the console and access plaintext school credentials, so never expose the port publicly.
+Use `--config /absolute/path/.env` to select another configuration file. `SEU_WEB_HOST=0.0.0.0` only binds every interface; it is **not a browsable address**. Open `http://127.0.0.1:8080` locally, or the server's real IP from another machine. There is no administrator login; deploy only on a trusted LAN or VPN. Any reachable host on the same network can operate the console and access plaintext school credentials, so never expose the port publicly.
 
 ```bash
 uv run --locked seu-reserve-web

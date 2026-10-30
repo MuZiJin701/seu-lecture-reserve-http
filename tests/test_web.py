@@ -698,3 +698,22 @@ def test_main_reports_held_manager_lock(tmp_path, capfd):
         assert 'reason=manager_already_running' in capfd.readouterr().out
     finally:
         holder.close()
+
+
+def test_main_prints_a_browsable_url_for_a_wildcard_listener(tmp_path, capsys, monkeypatch):
+    import uvicorn
+
+    calls = {}
+
+    def fake_run(app, **kwargs):
+        calls.update(kwargs)
+
+    monkeypatch.setattr(uvicorn, 'run', fake_run)
+    config = tmp_path / '.env'
+    config.write_text('SEU_DATA_DIR=data\nSEU_WEB_HOST=0.0.0.0\nSEU_WEB_PORT=18080\n',
+                      encoding='utf-8')
+    assert main(['--config', str(config)]) == 0
+    out = capsys.readouterr().out
+    assert 'http://127.0.0.1:18080' in out
+    assert '0.0.0.0 只是监听所有网卡' in out
+    assert calls['host'] == '0.0.0.0' and calls['port'] == 18080

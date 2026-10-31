@@ -44,6 +44,8 @@ uv run --locked seu-reserve-web
 
 Open `http://127.0.0.1:8080` (or the server address). Log in, add an account using the last card, select it to edit configuration and inspect progress and current reservations, then explicitly start it. Stale edits are rejected without discarding the input. Send SMS and enter its code in that account's authentication panel; other accounts continue. Closing the page does not stop reservations.
 
+Saving a running console account safely stops and restarts its worker. A CLI already holding that account's state lock blocks the save. If the CLI takes the lock after the save completes, the save succeeds, the page shows that the CLI is running, and the CLI uses the saved configuration.
+
 See the [Web console, systemd and risk notes](docs/web.md) (Chinese). A new deployment starts from an empty data root and does not detect or import old single-account task files.
 
 ## Mail and account data
@@ -70,6 +72,8 @@ The old single-account `.env` mode and its configuration choices without `--acco
 ## Validation boundaries
 
 Offline evidence for this redesign is in the [console redesign acceptance](docs/acceptance/2026-10-30-console-redesign.md). Existing single-account live reservations are recorded for [2026-10-26](docs/acceptance/2026-10-26-live-run.md), [2026-10-28](docs/acceptance/2026-10-28-live-run.md) and [2026-10-29](docs/acceptance/2026-10-29-live-run.md). Evidence for the HTTP console simplification and concurrent sessions is in the [current HTTP simplification record](docs/acceptance/2026-10-30-http-console.md) and the [concurrent login record](docs/acceptance/2026-10-30-concurrent-login.md); the earlier HTTPS-version offline evidence is kept in the [2026-10-30 Web offline acceptance](docs/acceptance/2026-10-30-web-offline.md). Real multi-account operation, Linux systemd and long runs require separate acceptance.
+
+The [2026-10-31 review fixes and follow-up](docs/acceptance/2026-10-31-review-fixes.md) cover running-account saves, actual request body limits, concurrent login limits and CLI configuration consistency. The full offline suite passed **711 tests, with 3 platform skips**; mypy passed.
 
 Existing 429/`Retry-After`, short backoff and fallback handling is retained. The earlier claim that the school actively throttles requests was an unsupported assumption and has been withdrawn. [Existing measurements](docs/acceptance/2026-10-29-read-only-probe.md) observed no business-API throttling; that assumption must not explain failures or set polling rates. Single-account samples do not establish multi-account capacity.
 

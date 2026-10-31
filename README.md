@@ -44,6 +44,8 @@ uv run --locked seu-reserve-web
 
 打开 `http://127.0.0.1:8080`（服务器部署换成实际地址）。登录后，在卡片队列末尾新增学校账号；选中卡片，在详情区修改配置、查看进度与当前预约，保存后手动点击“启动预约”。多人编辑发生冲突时拒绝覆盖并保留输入。需要短信时，在对应账号卡片里发送短信并输入验证码；其他账号继续运行。关闭网页不会停止后台任务。
 
+运行中的管理台账号保存配置时会安全停止并重启。若外部 CLI 已持有该账号状态锁，保存会被拒绝；若 CLI 在保存完成后抢先取得锁，保存仍成功，页面显示“CLI 正在运行”，CLI 使用保存后的配置。
+
 [完整 Web 使用、systemd 部署与风险说明](docs/web.md)。新部署从空数据根目录开始，不检测也不导入旧的单账号任务文件。
 
 ## 邮件与账号数据
@@ -70,6 +72,8 @@ uv run --locked main.py --account 你的一卡通号
 ## 验证边界
 
 本轮管理员登录与单页改版的离线证据见[改版验收](docs/acceptance/2026-10-30-console-redesign.md)。已有单账号真实预约记录见 [2026-10-26](docs/acceptance/2026-10-26-live-run.md)、[2026-10-28](docs/acceptance/2026-10-28-live-run.md)及 [2026-10-29](docs/acceptance/2026-10-29-live-run.md)。管理台 HTTP 简化与同账号并发登录的证据见[本轮 HTTP 简化验收](docs/acceptance/2026-10-30-http-console.md)与[并发登录记录](docs/acceptance/2026-10-30-concurrent-login.md)；HTTPS 版本的离线记录保留在[2026-10-30 Web 离线验收](docs/acceptance/2026-10-30-web-offline.md)。真实多账号、Linux systemd 和长期运行仍需分别验收。
+
+2026-10-31 的[审查修复与复核](docs/acceptance/2026-10-31-review-fixes.md)覆盖运行中保存、实际请求体大小限制、并发登录限速及 CLI 配置一致性；完整离线测试 **711 项通过、3 项平台限制跳过**，mypy 通过。
 
 保留现有 429／`Retry-After`、短退避与故障回退逻辑。此前“学校会主动限流”的判断属于无实测支持的主观猜测，已撤回；[既有实测](docs/acceptance/2026-10-29-read-only-probe.md)未观察到业务接口限流，不以该猜测解释故障或选择请求频率。多账号负载不能由单账号样本推定。
 

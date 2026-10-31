@@ -1096,3 +1096,53 @@ def test_main_constructs_the_administrator_registry_once_and_injects_it(tmp_path
     # Plaintext passwords are hashed while building the registry; a second build would re-hash.
     assert len(instances) == 1
     assert captured['administrators'] is instances[0]
+
+def test_oversized_chunked_body_is_rejected_on_received_bytes(tmp_path):
+    import uvicorn
+
+    accounts = Accounts(tmp_path / 'data')
+    app = create_app(accounts, ADMIN_SHARED)
+    sock = socket.socket()
+    sock.bind(('127.0.0.1', 0))
+    port = sock.getsockname()[1]
+    config = uvicorn.Config(app, host='127.0.0.1', port=port, log_level='critical',
+                            access_log=False, timeout_graceful_shutdown=1)
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=lambda: server.run(sockets=[sock]), daemon=True)
+    thread.start()
+    try:
+        until(lambda: server.started)
+        # A chunked request can declare a tiny Content-Length; h11 prefers Transfer-Encoding, so
+        # the body actually delivered is what must be capped.
+        body = json.dumps({'username': 'admin', 'password': ADMIN_PASSWORD}).encode()
+        body += b' ' * (131133 - len(body))
+        # Send headers plus just enough of the declared chunk to cross the cap, then read the
+        # rejection before sending the rest; the server closes without draining the socket, so a
+        # connection reset is expected on some platforms and must not hide the response.
+        head = (f'POST /api/login HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n'
+                f'Content-Type: application/json\r\nOrigin: http://127.0.0.1:{port}\r\n'
+                f'Content-Length: 1\r\nTransfer-Encoding: chunked\r\n'
+                f'Connection: close\r\n\r\n').encode()
+        partial = head + f'{len(body):X}\r\n'.encode() + body[:70000]
+        response = b''
+        for attempt in range(3):
+            response = b''
+            with socket.create_connection(('127.0.0.1', port), timeout=5) as client:
+                client.sendall(partial)
+                try:
+                    while True:
+                        part = client.recv(65536)
+                        if not part:
+                            break
+                        response += part
+                except ConnectionResetError:
+                    pass
+            if b'413' in response.split(b'\r\n', 1)[0]:
+                break
+        assert b'413' in response.split(b'\r\n', 1)[0]
+        assert b'request_too_large' in response
+    finally:
+        server.should_exit = True
+        thread.join(5)
+        sock.close()
+    assert not thread.is_alive()

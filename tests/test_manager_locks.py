@@ -137,3 +137,39 @@ def test_retry_that_meets_an_external_checkpoint_lock_stops_retrying(tmp_path, m
         assert alerts == []
     finally:
         checkpoint.close()
+
+def _real_locking_worker(account, root, shared, commands, updates, stopped):
+    """Own worker stand-in that really holds the account checkpoint lock, like the Web worker."""
+    from pathlib import Path
+    from seu_reserve.accounts import Accounts
+    from seu_reserve.state import Task
+    accounts = Accounts(Path(root))
+    checkpoint = Task(accounts.state_dir(account['id']), account['username'])
+    updates.put({'type': 'started'})
+    while not stopped.wait(0.05):
+        pass
+    checkpoint.close()
+    updates.put({'type': 'finished', 'result': 0, 'reason': 'stopped'})
+
+
+def test_saving_a_running_web_account_restarts_it_instead_of_refusing(tmp_path):
+    import time
+    from seu_reserve.manager import Manager
+    from seu_reserve.state import task_running
+
+    accounts = Accounts(tmp_path)
+    account = accounts.create(account_data())
+    manager = Manager(accounts, {}, target=_real_locking_worker)
+    manager.start(account['id'])
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline and not task_running(accounts.state_dir(account['id'])):
+            time.sleep(0.05)
+        # The manager's own live worker owns the checkpoint lock; saving must still work.
+        assert task_running(accounts.state_dir(account['id']))
+        saved = manager.update(account['id'], account_data().model_copy(update={'name': '运行中改名'}))
+        assert saved['name'] == '运行中改名'
+        assert accounts.get(account['id'])['revision'] == 1
+        assert account['id'] in manager.workers
+    finally:
+        manager.close()

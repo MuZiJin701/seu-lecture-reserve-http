@@ -7,7 +7,7 @@ import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 from getpass import getpass
-from typing import Mapping
+from typing import Any, Mapping
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -69,6 +69,49 @@ class LoginInput(BaseModel):
 
 def rejected(detail: str, status_code: int) -> JSONResponse:
     return JSONResponse({'detail': detail}, status_code=status_code, headers=SECURITY_HEADERS)
+
+
+class _BodyLimitMiddleware:
+    """Cap the bytes actually received, not only the declared Content-Length.
+
+    A chunked request can declare a small Content-Length and still stream a large body (h11
+    prefers Transfer-Encoding), so checking the header alone would let unauthenticated callers
+    make the server buffer an arbitrary body. The received messages are replayed downstream so
+    the normal JSON parsing still sees the complete, already-limited body.
+    """
+
+    def __init__(self, app: Any, limit: int):
+        self.app = app
+        self.limit = limit
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if (scope['type'] != 'http' or scope['method'] in ('GET', 'HEAD')
+                or not scope['path'].startswith('/api/')):
+            await self.app(scope, receive, send)
+            return
+        messages: list[dict[str, Any]] = []
+        total = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message['type'] != 'http.request':
+                break
+            total += len(message.get('body', b''))
+            if total > self.limit:
+                await rejected('request_too_large', 413)(scope, receive, send)
+                return
+            if not message.get('more_body', False):
+                break
+        state = {'index': 0}
+
+        async def replay() -> dict[str, Any]:
+            if state['index'] < len(messages):
+                message = messages[state['index']]
+                state['index'] += 1
+                return message
+            return await receive()
+
+        await self.app(scope, replay, send)
 
 
 def create_app(accounts: Accounts, shared: Mapping[str, str], *, manager: Manager | None = None,
@@ -205,6 +248,7 @@ def create_app(accounts: Accounts, shared: Mapping[str, str], *, manager: Manage
         return FileResponse(ASSETS / 'index.html', media_type='text/html')
 
     app.mount('/assets', StaticFiles(directory=ASSETS), name='assets')
+    app.add_middleware(_BodyLimitMiddleware, limit=MAX_BODY_BYTES)
     return app
 
 

@@ -164,3 +164,43 @@ def test_create_app_reuses_an_injected_administrators_instance(tmp_path, shared)
         assert login.status_code == 200
         assert auth.session(client.cookies.get(COOKIE_NAME)) is not None
         assert client.get('/api/accounts').json() == []
+
+
+def test_concurrent_failed_logins_cannot_exceed_the_source_budget(shared, monkeypatch):
+    import threading
+
+    import seu_reserve.admin as admin_module
+
+    now = [1000.0]
+    auth = Administrators(shared, clock=lambda: now[0])
+    barrier = threading.Barrier(12)
+    results = []
+    calls = [0]
+    real = admin_module.hashlib.pbkdf2_hmac
+
+    def counted(*args, **kwargs):
+        calls[0] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(admin_module.hashlib, 'pbkdf2_hmac', counted)
+    lock = threading.Lock()
+
+    def attempt():
+        barrier.wait()
+        try:
+            auth.login('alice', 'wrong', '10.0.0.9')
+            outcome = 'ok'
+        except ValueError as exc:
+            outcome = str(exc)
+        with lock:
+            results.append(outcome)
+
+    threads = [threading.Thread(target=attempt) for _ in range(12)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert calls[0] == 5
+    assert results.count('login_rejected') == 5
+    assert results.count('login_rate_limited') == 7
+    assert auth.pending_total == 0 and auth.pending == {}

@@ -252,9 +252,12 @@ class Manager:
                     raise ValueError('account_deleting')
                 if data.revision != current['revision']:
                     raise ValueError('configuration_conflict')
-                # Refuse before any write: a CLI `--account` run would keep using the old
-                # configuration and the save would silently diverge from the running process.
-                if task_running(self.accounts.state_dir(identifier)):
+                # Refuse before any write only when another process (CLI `--account`) owns the
+                # checkpoint. Our own live worker holds the same lock, and stopping it below is
+                # the normal safe-restart path, so it must never be mistaken for an external run.
+                worker = self.workers.get(identifier)
+                own_running = worker is not None and worker.process.is_alive()
+                if not own_running and task_running(self.accounts.state_dir(identifier)):
                     raise ValueError('state_in_use')
                 candidate = {**current, **data.model_dump(), 'password': data.password or current['password']}
                 candidate['mail_enabled'] = bool(data.recipient)
@@ -263,6 +266,10 @@ class Manager:
                 active = current['desired']
             self.stop(identifier, preserve=True)
             with self.lock:
+                # The worker just released its lock; if another process (CLI `--account`) took
+                # the checkpoint in the meantime, refuse before writing instead of diverging.
+                if task_running(self.accounts.state_dir(identifier)):
+                    raise ValueError('state_in_use')
                 account = self.accounts.update(identifier, data)
                 if active:
                     try:

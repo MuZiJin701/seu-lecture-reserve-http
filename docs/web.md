@@ -35,7 +35,7 @@ uv run --locked seu-reserve-web --config /绝对路径/.env
 - 关闭网页、退出或登录到期不停止后台预约。修改管理员配置后的重启仍按现有任务恢复语义安全停止和恢复学校账号。
 - 登录限速只统计**失败**尝试：每来源每分钟最多 5 次失败，全局每分钟最多 100 次失败；成功登录不再占用预算并清除该来源的失败记录，超限响应带 `Retry-After: 60`。并发请求在计算哈希前原子预留校验名额，超出预算的直接 429，不会让多条请求同时通过检查。内存会话上限 1024；学校凭据、管理员密码、会话及短信码不写入日志或响应错误。
 - 学校数据接口均要求登录。非 GET `/api/*` 保留 Origin、JSON 类型与请求大小校验：除 `Content-Length` 外还按实际接收的字节数累计（含分块传输），超过 64 KiB 返回 413，不依赖客户端声明的长度；已登录的写操作还需当前会话的 `X-CSRF-Token`。Cookie 使用 HttpOnly、SameSite=Strict；普通 HTTP 不设置 Secure 或 HSTS，仍不能避免传输窃听。
-- 自行调用 API 时，登录或 `GET /api/session` 返回 CSRF 值；`PUT /api/accounts/<id>` 需携带读取到的 `revision`。旧版本保存返回 `409 configuration_conflict`，不会停止工作进程或覆盖新配置。账号正由 CLI `--account` 持锁运行时，启动、保存、停止和删除返回 `409 state_in_use`，不会伪造成功或改动配置；管理台自己运行中的账号仍可保存，保存沿用安全停止、写入和重启。
+- 自行调用 API 时，登录或 `GET /api/session` 返回 CSRF 值；`PUT /api/accounts/<id>` 需携带读取到的 `revision`。旧版本保存返回 `409 configuration_conflict`，不会停止工作进程或覆盖新配置。账号正由 CLI `--account` 持锁运行时，启动、保存、停止和删除返回 `409 state_in_use`，不会伪造成功或改动配置；管理台自己运行中的账号仍可保存，保存沿用安全停止、写入和重启。保存期间持有该账号检查点锁完成写入，CLI `--account` 取得锁后重新读取配置，两者不会出现“页面新配置、运行旧配置”的分叉。
 
 ## 单页管理账号
 

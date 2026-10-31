@@ -545,3 +545,31 @@ def test_account_mode_forces_the_managed_settings_before_the_engine_starts(tmp_p
     assert settings.categories == DEFAULT_CATEGORIES
     assert settings.online is False and settings.offline is True
     captured['options']['checkpoint'].close()
+
+
+def test_account_mode_rereads_configuration_after_taking_the_lock(tmp_path, monkeypatch):
+    from seu_reserve import cli
+    from seu_reserve.accounts import AccountInput, Accounts
+    config = tmp_path / '.env'
+    config.write_text('SEU_DATA_DIR=data\n', encoding='utf-8')
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(AccountInput(username='10001', name='重读配置', password='synthetic'))
+    stale = dict(account)
+    stale['options'] = {**account['options'], 'online': True, 'offline': True}
+    fresh = dict(account)
+    fresh['options'] = {**account['options'], 'online': False, 'offline': True}
+    monkeypatch.setattr(Accounts, 'list', lambda self: [stale])
+    monkeypatch.setattr(Accounts, 'get', lambda self, identifier: fresh)
+    captured = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('os.environ', {})
+    monkeypatch.setattr(cli, 'load_recognizer', lambda: lambda _: '1234')
+
+    def fake_run(settings, **options):
+        captured.update(settings=settings, options=options)
+        return 0
+
+    monkeypatch.setattr(cli, 'run', fake_run)
+    assert cli.main(['--config', str(config), '--account', '10001']) == 0
+    assert captured['settings'].online is False and captured['settings'].offline is True
+    captured['options']['checkpoint'].close()

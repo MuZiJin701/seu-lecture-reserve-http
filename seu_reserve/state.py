@@ -11,7 +11,8 @@ import stat
 import sys
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,28 @@ def read_json(path: Path) -> Any:
     fd = open_nofollow(path, os.O_RDONLY)
     with os.fdopen(fd) as source:
         return json.load(source)
+
+
+@contextmanager
+def hold_checkpoint(directory: Path) -> Iterator[None]:
+    """Hold the account checkpoint lock for a short critical section.
+
+    Unlike ``Task`` this does not create ``task.json``; it only guarantees that no reservation
+    process (CLI ``--account``) owns the checkpoint while the caller mutates the shared account
+    configuration. Raises ``ValueError('state_in_use')`` when another process owns it.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    fd = open_nofollow(directory / 'task.lock', os.O_CREAT | os.O_RDWR)
+    try:
+        try:
+            lock_file(fd)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise ValueError('state_in_use') from None
+            raise
+        yield
+    finally:
+        os.close(fd)
 
 
 def open_nofollow(path: Path, flags: int) -> int:

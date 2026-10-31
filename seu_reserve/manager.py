@@ -20,7 +20,7 @@ from typing import Any, Callable, Mapping
 from .accounts import MAIL_KEYS, AccountInput, Accounts, account_environ, account_settings, public_account
 from .app import SELECTION_REASONS, run
 from .mail import Mailer, mail_failure_reason
-from .state import Task, lock_file, open_nofollow, read_json, task_running
+from .state import Task, hold_checkpoint, lock_file, open_nofollow, read_json, task_running
 
 FATAL_ERRORS = {'authentication_rejected', 'credentials_missing', 'configuration_or_state_invalid',
                 'state_invalid', 'account_already_running', 'mail_configuration_invalid', 'ocr_unavailable'}
@@ -265,19 +265,23 @@ class Manager:
                     account_environ(candidate, self.shared)
                 active = current['desired']
             self.stop(identifier, preserve=True)
-            with self.lock:
-                # The worker just released its lock; if another process (CLI `--account`) took
-                # the checkpoint in the meantime, refuse before writing instead of diverging.
-                if task_running(self.accounts.state_dir(identifier)):
-                    raise ValueError('state_in_use')
-                account = self.accounts.update(identifier, data)
-                if active:
-                    try:
-                        self.start(identifier)
-                    except (ValueError, OSError) as exc:
-                        self._note_start_failure(identifier, exc)
-                        raise
-                return account
+            # Hold the checkpoint lock across the configuration write: a check followed by a
+            # separate write would let an external CLI take the lock in between, so the console
+            # would save a configuration that the running CLI never saw.
+            with hold_checkpoint(self.accounts.state_dir(identifier)):
+                with self.lock:
+                    account = self.accounts.update(identifier, data)
+            if active:
+                try:
+                    self.start(identifier)
+                except (ValueError, OSError) as exc:
+                    self._note_start_failure(identifier, exc)
+                    if str(exc) == 'state_in_use':
+                        # The configuration is saved and consistent (the CLI re-reads it under
+                        # the lock); only the restart is skipped because the CLI owns the run.
+                        return self.accounts.get(identifier)
+                    raise
+            return account
 
     def delete(self, identifier: str) -> None:
         with self.operation(identifier):

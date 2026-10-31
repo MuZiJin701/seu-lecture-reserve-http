@@ -4,10 +4,13 @@ The lock is taken with the real `Task` checkpoint object (same file lock the CLI
 supervisor is driven through the same fakes as tests/test_web.py; no process or network is used.
 """
 
+import time
+
 import pytest
 
 from seu_reserve.accounts import Accounts
-from seu_reserve.state import Task
+from seu_reserve.manager import Manager
+from seu_reserve.state import Task, task_running
 from test_web import MAIL_SHARED, account_data, make_manager, web_client
 
 
@@ -171,5 +174,83 @@ def test_saving_a_running_web_account_restarts_it_instead_of_refusing(tmp_path):
         assert saved['name'] == '运行中改名'
         assert accounts.get(account['id'])['revision'] == 1
         assert account['id'] in manager.workers
+    finally:
+        manager.close()
+
+def test_configuration_write_happens_under_the_checkpoint_lock(tmp_path, monkeypatch):
+    from seu_reserve.state import hold_checkpoint, task_running
+
+    accounts = Accounts(tmp_path)
+    account = accounts.create(account_data())
+    manager = Manager(accounts, {}, target=_real_locking_worker)
+    manager.start(account['id'])
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline and not task_running(accounts.state_dir(account['id'])):
+            time.sleep(0.05)
+        recorded = {}
+        original_update = accounts.update
+
+        def checking_update(identifier, data):
+            recorded['locked'] = task_running(accounts.state_dir(identifier))
+            return original_update(identifier, data)
+
+        monkeypatch.setattr(accounts, 'update', checking_update)
+        saved = manager.update(account['id'], account_data().model_copy(update={'name': '持锁写入'}))
+        assert saved['name'] == '持锁写入'
+        assert recorded['locked'] is True
+    finally:
+        manager.close()
+
+
+def _external_lock_worker(account, root, hold, result):
+    """Separate process that tries to own the checkpoint like a CLI `--account` run."""
+    from pathlib import Path
+    from seu_reserve.accounts import Accounts
+    from seu_reserve.state import Task
+    accounts = Accounts(Path(root))
+    try:
+        checkpoint = Task(accounts.state_dir(account['id']), account['username'])
+    except ValueError as exc:
+        result.put(str(exc))
+        return
+    result.put('locked')
+    hold.wait(20)
+    checkpoint.close()
+
+
+def test_external_lock_taken_between_check_and_write_blocks_the_write(tmp_path, monkeypatch):
+    import multiprocessing
+
+    accounts = Accounts(tmp_path)
+    account = accounts.create(account_data())
+    manager = Manager(accounts, {}, target=_real_locking_worker)
+    manager.start(account['id'])
+    context = multiprocessing.get_context('spawn')
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline and not task_running(accounts.state_dir(account['id'])):
+            time.sleep(0.05)
+        original_update = accounts.update
+        recorded = {}
+
+        def update_racing_with_a_cli(identifier, data):
+            # The CLI starts exactly after the manager's check and before the write. Holding the
+            # checkpoint lock across the write is what must keep it out until the save is done.
+            hold, result = context.Event(), context.Queue()
+            process = context.Process(
+                target=_external_lock_worker, args=(account, str(tmp_path), hold, result))
+            process.start()
+            recorded['outcome'] = result.get(timeout=20)
+            try:
+                return original_update(identifier, data)
+            finally:
+                hold.set()
+                process.join(20)
+
+        monkeypatch.setattr(accounts, 'update', update_racing_with_a_cli)
+        saved = manager.update(account['id'], account_data().model_copy(update={'name': '持锁写入'}))
+        assert recorded['outcome'] == 'state_in_use'
+        assert saved['name'] == '持锁写入' and saved['revision'] == 1
     finally:
         manager.close()

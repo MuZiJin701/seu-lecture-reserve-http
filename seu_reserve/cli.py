@@ -187,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         from .accounts import Accounts, account_environ, account_settings
         source = args.config or Path('.env')
         data_root = data_root_from(source, environ)
+        shared_environ = environ
         account_identifier = ''
         if args.account:
             catalogue = Accounts(data_root)
@@ -265,6 +266,17 @@ def main(argv: list[str] | None = None) -> int:
                     (settings.state_dir / 'task.json').unlink(missing_ok=True)
                 print('event=account_not_found', flush=True)
                 return 1
+            # The console may have saved a new configuration while this process was starting,
+            # before this checkpoint lock was held. Re-read it now so the running engine and the
+            # database can never disagree about the account options.
+            try:
+                settings = account_settings(current, catalogue.state_dir(current['id']))
+                environ = account_environ(current, shared_environ,
+                                          mail=not (args.check or args.resolve_pending))
+            except ValueError:
+                account_task.close()
+                account_task = None
+                raise
         recognize = None
         if not args.check:
             try:

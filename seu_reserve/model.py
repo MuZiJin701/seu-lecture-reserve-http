@@ -29,6 +29,11 @@ def test_notice(row: dict[str, Any]) -> bool:
 class Progress:
     completed: Counter[str]
     planned: Counter[str]
+    # Activity IDs of ended reservations whose attendance result is not readable yet. They are
+    # counted neither as completed nor as planned and never stop the search for other lectures:
+    # the school may publish the result up to about a day later, so waiting for it would block
+    # every other reservation. A later scan counts the lecture as soon as the school updates it.
+    unresolved: frozenset[str] = frozenset()
 
     @property
     def done(self) -> bool:
@@ -48,6 +53,7 @@ def progress(rows: list[dict[str, Any]], now: float) -> Progress:
     completed: Counter[str] = Counter()
     planned: Counter[str] = Counter()
     records: list[tuple[str, str, datetime, datetime, str]] = []
+    unresolved: set[str] = set()
     seen: dict[str, dict[str, Any]] = {}
     for row in rows:
         wid = activity_id(row)
@@ -71,22 +77,25 @@ def progress(rows: list[dict[str, Any]], now: float) -> Progress:
             raise ValueError('attendance_category_unknown')
         start, end = interval(row)
         checked, breached = row.get('SFDK'), row.get('SFWY')
-        if checked not in ('0', '1') or breached not in ('0', '1'):
-            # A freshly created reservation can arrive without attendance/breach fields (the
-            # school fills them after the event). For a record that has not ended yet, a missing
-            # field means "not attended/violated yet", so it counts as planned rather than
-            # blocking every later booking on an impossible future attendance result.
-            if end.timestamp() > now:
-                if checked is None or checked == '':
-                    checked = '0'
-                if breached is None or breached == '':
-                    breached = '0'
-            if checked not in ('0', '1') or breached not in ('0', '1'):
-                raise ValueError('attendance_status_unknown')
+        # The school omits SFWY when the reservation did not break the rules.
+        if breached is None or breached == '':
+            breached = '0'
         if breached == '1':
+            # A violated reservation never counts, whatever its attendance field says.
             continue
-        records.append((checked, category, start, end, wid))
-    result = Progress(completed, planned)
+        if end.timestamp() <= now:
+            if checked == '1' and breached == '0':
+                records.append(('1', category, start, end, wid))
+            else:
+                # Ended without a readable attendance result. It may still appear up to a day
+                # later, but it must never block other reservations, so it is only tracked as
+                # unresolved and counted again on a later scan once the school updates it.
+                unresolved.add(wid)
+            continue
+        # A reservation that has not ended has no attendance result yet: it is planned. An
+        # unreadable value here is not a reason to block, because the result does not exist yet.
+        records.append(('1' if checked == '1' else '0', category, start, end, wid))
+    result = Progress(completed, planned, frozenset(unresolved))
     # shortcut: greedy priorities do not maximize all schedule combinations; revisit if optimal planning is needed.
     while records:
         missing = result.missing
@@ -94,10 +103,8 @@ def progress(rows: list[dict[str, Any]], now: float) -> Progress:
             record[0] != '1', record[1] not in missing, record[3], record[4]))
         if checked == '1':
             completed[category] += 1
-        elif end.timestamp() > now:
-            planned[category] += 1
         else:
-            raise ValueError('attendance_result_pending')
+            planned[category] += 1
         records = [record for record in records if record[2] > end or record[3] < start]
     return result
 

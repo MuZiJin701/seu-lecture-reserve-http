@@ -250,16 +250,32 @@ def test_real_school_fields_are_counted_and_duplicates_are_not():
 
 
 @pytest.mark.parametrize('changes', [
-    {'SFDK': None}, {'SFWY': 'unknown'}, {'HDLX_DISPLAY': ''}, {'HDLX_DISPLAY': '未知类别'},
+    {'HDLX_DISPLAY': ''}, {'HDLX_DISPLAY': '未知类别'},
     {'KSSJ': 'invalid'}, {'FBZT': 'unknown'},
-    {'SFDK': '0', 'KSSJ': '2020-01-01 10:00:00', 'JSSJ': '2020-01-01 11:00:00'},
 ])
-def test_uncertain_attendance_blocks_new_submissions(tmp_path, changes):
+def test_structural_errors_still_block_new_submissions(tmp_path, changes):
     school = School()
     school.mine = [lecture('uncertain', YYZT='已预约', **changes)]
     school.activities = [lecture()]
     assert execute(school, tmp_path) == 130
     assert not school.submitted
+
+
+@pytest.mark.parametrize('changes', [
+    {'SFDK': None}, {'SFDK': 'unknown'}, {'SFWY': 'unknown'},
+    {'SFDK': None, 'SFWY': None},
+])
+def test_unreadable_attendance_on_a_future_reservation_is_planned_without_blocking(tmp_path, changes):
+    row = lecture('future', YYZT='已预约', **changes)
+    current = progress([row], 0)
+    assert current.planned == {PSYCHOLOGY: 1}
+    assert not current.unresolved
+    school = School()
+    school.mine = [lecture('future', YYZT='已预约', **changes)]
+    school.activities = [lecture('next-law', HDLX_DISPLAY=LAW,
+                                 KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00')]
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == ['next-law']
 
 
 def test_conflicting_duplicate_activity_is_rejected():
@@ -330,7 +346,7 @@ def test_unselected_ended_overlap_does_not_pause_confirmed_attendance():
     assert not current.planned
 
 
-@pytest.mark.parametrize('changes', [{'SFDK': 'unknown'}, {'HDLX_DISPLAY': '未知'}, {'KSSJ': 'invalid'}])
+@pytest.mark.parametrize('changes', [{'HDLX_DISPLAY': '未知'}, {'KSSJ': 'invalid'}])
 def test_unknown_overlapping_record_still_requires_validation(changes):
     rows = [lecture('checked', YYZT='已预约', SFDK='1'),
             lecture('unknown', YYZT='已预约', **changes)]
@@ -367,11 +383,20 @@ def test_recheck_completed_task_does_not_count_eight_overlapping_attendances(tmp
     assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
 
 
-def test_read_only_check_validates_attendance_schema_without_creating_state(tmp_path):
+def test_read_only_check_rejects_structural_history_errors_without_creating_state(tmp_path):
     school = School()
-    school.mine = [lecture('unknown', YYZT='已预约', SFDK='unknown')]
+    school.mine = [lecture('unknown', YYZT='已预约', HDLX_DISPLAY='未知类别')]
     directory = tmp_path / 'unused'
     assert execute(school, directory, check_only=True) == 1
+    assert not directory.exists() and not school.submitted
+
+
+def test_read_only_check_accepts_unresolved_attendance_without_creating_state(tmp_path):
+    school = School()
+    school.mine = [lecture('past', YYZT='已预约', SFDK=None,
+                           KSSJ='2020-01-01 10:00:00', JSSJ='2020-01-01 11:00:00')]
+    directory = tmp_path / 'unused'
+    assert execute(school, directory, check_only=True) == 0
     assert not directory.exists() and not school.submitted
 
 
@@ -383,11 +408,57 @@ def test_future_reservation_with_missing_attendance_fields_counts_as_planned():
     assert not current.completed
 
 
-def test_ended_reservation_with_missing_attendance_status_still_blocks():
-    row = {'WID': 'booking', 'HD_WID': 'past-art', 'FBZT': '1', 'SFDK': None,
-           'JZXL_DISPLAY': ART, 'JZSJ': '2020-01-01 10:00:00', 'HDJSSJ': '2020-01-01 11:00:00'}
-    with pytest.raises(ValueError):
-        progress([row], 1793000000)
+def past_row(**changes):
+    return {'WID': 'booking', 'HD_WID': 'past-art', 'FBZT': '1', 'JZXL_DISPLAY': ART,
+            'JZSJ': '2020-01-01 10:00:00', 'HDJSSJ': '2020-01-01 11:00:00',
+            'SFDK': None, 'SFWY': None, **changes}
+
+
+@pytest.mark.parametrize('changes', [
+    {'SFDK': '0'}, {'SFDK': 'unknown'}, {'SFDK': None}, {'SFDK': ''},
+    {'SFDK': '0', 'SFWY': 'unknown'}, {'SFDK': '1', 'SFWY': 'unknown'},
+])
+def test_ended_reservation_with_unresolved_attendance_is_tracked_not_blocking(changes):
+    row = past_row(**changes)
+    current = progress([row, lecture('future-law', YYZT='已预约', HDLX_DISPLAY=LAW)], 1793000000)
+    assert current.unresolved == frozenset({'past-art'})
+    assert current.completed == {}
+    assert current.planned == {LAW: 1}
+
+
+def test_unresolved_attendance_is_counted_once_the_school_updates_it():
+    row = past_row(SFDK='0')
+    current = progress([row], 1793000000)
+    assert current.unresolved == frozenset({'past-art'}) and not current.completed
+    row['SFDK'] = '1'
+    current = progress([row], 1793000000)
+    assert current.completed == {ART: 1} and not current.unresolved
+
+
+def test_ended_reservation_with_unknown_attendance_never_blocks_new_booking(tmp_path):
+    school = School()
+    school.mine = [past_row(SFDK='0')]
+    school.activities = [lecture('next-law', HDLX_DISPLAY=LAW,
+                                 KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00')]
+    assert execute(school, tmp_path) == 130
+    assert school.submitted == ['next-law']
+
+
+def test_violated_ended_reservation_is_resolved_and_never_counted():
+    row = past_row(SFDK='1', SFWY='1')
+    current = progress([row], 1793000000)
+    assert current.completed == {} and not current.unresolved
+
+
+def test_unresolved_attendance_is_recorded_once_as_a_local_diagnostic(tmp_path):
+    school = School()
+    school.mine = [past_row(SFDK='0')]
+    school.activities = [lecture('next-law', HDLX_DISPLAY=LAW)]
+    assert execute(school, tmp_path) == 130
+    events = [json.loads(line) for line in
+              (tmp_path / 'diagnostics.jsonl').read_text(encoding='utf-8').splitlines()]
+    unresolved = [event for event in events if event['event'] == 'attendance_unresolved']
+    assert unresolved and unresolved[0]['count'] == 1
 
 
 def test_future_reservation_missing_breach_field_does_not_block_next_submission(tmp_path):

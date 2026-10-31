@@ -143,6 +143,7 @@ uv run --locked main.py --test-mail
 | `trust_cookies_loaded` / `trust_cookies_unavailable` | 登录前加载持久化学校 Cookie 的数量（`cookies`）／未加载（文件缺失、过期、损坏或账号不匹配）；不记录 Cookie 值或票据 |
 | `trust_cookies_saved` / `trust_cookies_save_failed` | 登录成功后保存的学校 Cookie 数量（`cookies`）／写入失败；不记录 Cookie 值 |
 | `trust_silent_login_succeeded` / `trust_silent_login_failed` | `verifyTgt` 静默登录成功／失败：`step` 为 `verify_tgt`、`redirect`、`entry` 或 `app_page`，`code` 仅在校方返回整数时记录；失败后静默回退密码＋短信 |
+| `attendance_unresolved` | 已结束但学校尚未给出可读考勤结果的讲座数量（`count`）；这些记录不计入已选听或待参加，也不阻塞新预约，学校回填后自动计入。数量变化时才写一行，仅本地诊断 |
 | `submission_started` 的 `captcha_source`、`prefetch_age`、`connect_seconds`、`rows_age`、`rows_data_age`、`precommit_save_seconds` | 验证码来自预取（`prefetch`）还是现场取图（`fresh`）、预取年龄、该次现场取图的 TCP/TLS 建连耗时（复用连接、使用预取或本地拒绝时为 `null`）、候选所用列表快照年龄、候选数据年龄（从列表请求开始计）、提交前落盘耗时 |
 | `submission_reply.captcha_source` / `connect_seconds` | 该次提交回复对应的验证码来源，便于对照判错；`connect_seconds` 为提交请求的 TCP/TLS 建连耗时（复用连接时为 `null`） |
 | `scan_timing` 的 `rows_age`、`rows_fetch_seconds`、`rows_data_age`、`main_requests`、`poller_polls` | 本次扫描消费的列表快照年龄、列表请求耗时、从请求开始到主线程消费的数据年龄、主循环累计请求数、后台轮询累计完成次数 |
@@ -269,7 +270,7 @@ tail -n 20 state/events.log
 
 ### 筛选原因
 
-`--check` 展示当前结果；`--status` 展示最近成功快照，可能因等待打卡、待确认或查询失败而陈旧。每场仅保留标题、首个原因及学校预约时间，时间以北京时间显示，未知为 `null`。不为诊断额外查询学校，逐场详情不进入邮件或事件日志。
+`--check` 展示当前结果；`--status` 展示最近成功快照，可能因待确认、查询失败或考勤结果未决而陈旧。每场仅保留标题、首个原因及学校预约时间，时间以北京时间显示，未知为 `null`。不为诊断额外查询学校，逐场详情不进入邮件或事件日志。
 
 | 原因 | 含义 |
 | --- | --- |
@@ -302,8 +303,8 @@ tail -n 20 state/events.log
 | `campus_login_fallback` | 校园直连缺少 CAS 服务信息，或登录后进入应用阶段的网络／HTTP／TLS 失败（含非应用页面）时，已回退一次原网关认证；凭据错误、人工挑战与 `login()` 内部失败不回退 |
 | `sms_send_failed` | 短信发送被学校拒绝、请求过于频繁，或发送请求本身遇到网络／429 错误；程序提示稍后重试，冷却取 max(60 秒, `Retry-After`) 并跨校园→网关二次登录保持，期间不再重复发送 |
 | `activity_schema_unknown` / `business_response_invalid` | 目标数据或活动列表响应格式变化，暂停提交并核实接口，不能当作零候选 |
-| `invalid_activity_data` / `attendance_category_unknown` / `attendance_status_unknown` / `attendance_record_conflict` | 已有记录不可靠，不删除状态或绕过校验；尚未结束的新预约缺少打卡/违约字段时按未参加处理，结束后仍未知才暂停 |
-| `attendance_result_pending` | 已结束记录尚无打卡或违约结论，等学校更新 |
+| `invalid_activity_data` / `attendance_category_unknown` / `attendance_record_conflict` | 已有记录结构不可靠，不删除状态或绕过校验并暂停新增；尚未结束的新预约缺少打卡/违约字段按未参加、未违约计入待参加 |
+| 已结束但考勤结果不可读（`SFDK` 为 `0/空/未知` 等） | 不计为已选听、也不计入待参加，但**不再暂停或阻塞**其他讲座预约；学校之后回填打卡结果时，下一次扫描自动计入。本地诊断 `attendance_unresolved` 记录当前未决数量，不进入终端、事件或邮件 |
 | `reservation_unconfirmed` / `reservation_unconfirmed_released` | 提交结果待核对／核对后保留原活动时间占位并恢复扫描；占位期间冲突候选跳过，解除与占位事件不发邮件 |
 | `reservation_hold_confirmed` / `reservation_hold_expired` | 占位期间出现明确成功证据并确认／占位到期释放；到期后可能重新允许冲突候选，证据在本地事件与诊断 |
 | `query_failure` / `query_recovered` | 持续故障／完整查询恢复；恢复不等于预约成功 |
@@ -365,12 +366,13 @@ Python 3.12、uv 和锁文件是开发入口；OCR 使用 ddddocr 自带模型�
 
 ## 验收记录
 
-截至 2026-10-30，最近一次完整离线测试记录为 **629 项通过、5 项平台限制跳过**（HTTP 简化前的版本），mypy 通过；HTTP 简化及后续审查修复后全量测试为 **645 通过、3 跳过**；管理员登录与单页改版（含直接配置管理员密码补充）本轮全量测试为 **667 通过、3 跳过**；改版实施后的只读审查修复新增 25 条回归，全量测试为 **692 通过、3 跳过**；设备信任逐次诊断补充 3 条回归后全量测试为 **695 通过、3 跳过**，结果见验收表首行。下表按验证发生时间保留历史；旧行中的频率、测试数及“未推送、未部署”均描述当时状态，当前行为以本文正文为准，提交状态以 Git 为准。
+截至 2026-10-30，最近一次完整离线测试记录为 **629 项通过、5 项平台限制跳过**（HTTP 简化前的版本），mypy 通过；HTTP 简化及后续审查修复后全量测试为 **645 通过、3 跳过**；管理员登录与单页改版（含直接配置管理员密码补充）本轮全量测试为 **667 通过、3 跳过**；改版实施后的只读审查修复新增 25 条回归，全量测试为 **692 通过、3 跳过**；设备信任逐次诊断补充 3 条回归后全量测试为 **695 通过、3 跳过**；已结束记录考勤未决不阻塞预约的重设计新增/改写 9 条回归后全量测试为 **705 通过、3 跳过**，结果见验收表首行。下表按验证发生时间保留历史；旧行中的频率、测试数及“未推送、未部署”均描述当时状态，当前行为以本文正文为准，提交状态以 Git 为准。
 
 2026-10-29 的[只读对照测试](acceptance/2026-10-29-read-only-probe.md)共 592 次活动列表查询成功，未观察到 429/限流或明显变慢，并完成原网关路径的一次人工短信登录。同日 17:00 的校园直连复测完成新版校内 CAS 真实登录（仍需短信），并以 0.10 秒列表 + 5 秒历史双只读会话并发 30 秒（列表 276 次、历史 6 次全部成功，无 429）；两次登录间隔约 90 秒时短信发送被拒。同日 19:00 的线上目标讲座已按活动 ID 预约成功，详见[本机实战日志](acceptance/2026-10-29-live-run.md)；多次开抢的真实命中率统计、长期稳定性和运行中短信恢复仍待验收。
 
 | 项目 | 当前证据及边界 |
 | --- | --- |
+| 2026-10-31 考勤未决不阻塞 | 已结束但学校尚无读考勤结果的记录（`SFDK` 为 0/空/未知；空 `SFWY` 视为未违约）不再报错或阻塞：不计已选听、不计待参加，学校回填后自动计入；未结束记录的缺失/非法考勤字段按待参加；结构错误仍暂停。以 2026-10-30 本机只读记录（3 条已结束，2 条未打卡）为依据，新增/改写 9 条回归；全量 **705 通过、3 跳过**，mypy 12 个源文件通过，详见[本轮验收](acceptance/2026-10-31-attendance-nonblocking.md) |
 | 2026-10-30 设备信任逐次诊断 | 管理台账号实测首次登录仍需一次短信（新状态目录、新设备指纹），随后同会话内 4 次重启均静默登录成功。补本地诊断 `trust_cookies_loaded`／`unavailable`、`trust_cookies_saved`／`save_failed`、`trust_silent_login_succeeded`／`failed`（只记数量与成败，不记 Cookie 值），并补 3 条离线回归；全量 **695 通过、3 跳过**，mypy 12 个源文件通过。跨学校会话过期（约 2 小时）是否免短信仍未验证 |
 | 2026-10-30 改版后审查修复 | 外部 CLI `--account` 持锁运行时管理台的启动/保存/停止/删除返回 `state_in_use` 且不进入重启预算与告警；登录限速只计失败、成功清除来源记录、429 带 `Retry-After`；启动只派生一次管理员密码哈希；`revision` 迁移容忍并发启动；OCR 失败清理新建检查点；补 25 条回归（含快照陈旧、页面不触发学校请求、重启清会话、隐藏策略、输入校验、静态资源）。完整离线 **692 通过、3 跳过**，mypy 12 个源文件通过，详见[改版验收·后续审查修复](acceptance/2026-10-30-console-redesign.md#后续审查修复2026-10-30) |
 | 2026-10-30 管理员登录与单页改版 | 配置的多管理员（支持直接密码与已有哈希）、12 小时会话、配置版本冲突、统一隐藏选项、精简预约快照及纯图案 Logo；完整离线 **667 通过、3 跳过**，mypy 12 个源文件通过，桌面与手机界面检查见[改版验收](acceptance/2026-10-30-console-redesign.md) |

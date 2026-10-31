@@ -208,9 +208,9 @@ def progress_rows(history: list[dict[str, Any]], holds: Mapping[str, Any] | None
     return rows
 
 
-# Structural errors that make a background "my activities" snapshot unusable. Semantic states
-# (attendance pending/unknown, record conflict, unknown category) are not format errors: the
-# synchronous query reports the same condition and pausing is the correct behaviour there.
+# Structural errors that make a background "my activities" snapshot unusable. Unresolved
+# attendance results no longer block: an ended lecture without a readable result is skipped until
+# the school updates it, so only format-level errors justify falling back to a synchronous query.
 HISTORY_ROW_FORMAT_ERRORS = frozenset({
     'activity_id_missing', 'publication_status_unknown', 'reservation_status_unknown',
     'time_missing', 'time_invalid', 'interval_invalid'})
@@ -527,6 +527,7 @@ def run(settings: Settings, *, session: Any = None,
     mail_blocked = False
     latest_progress: Progress | None = None
     progress_at = 0.0
+    unresolved_reported: frozenset[str] = frozenset()
     task: Task | None = None
     client = None
     activity_poller: ActivityPoller | None = None
@@ -1923,9 +1924,13 @@ def run(settings: Settings, *, session: Any = None,
                             emit_success(held_wid, 'history')
                 current = progress(progress_rows(history, hold_entries(), clock() + server_offset),
                                    clock() + server_offset)
+                if current.unresolved != unresolved_reported:
+                    unresolved_reported = current.unresolved
+                    diagnostic('attendance_unresolved', count=len(current.unresolved))
                 latest_progress, progress_at = current, mine_at
                 snapshot['progress'] = dict(completed=dict(current.completed), planned=dict(current.planned),
-                                            missing=sorted(current.missing), at=mine_at)
+                                            missing=sorted(current.missing), unresolved=len(current.unresolved),
+                                            at=mine_at)
                 if current.done:
                     newly_completed = task.data['status'] != 'done'
                     task.data.update(status='done', activity='')
@@ -2215,8 +2220,7 @@ def run(settings: Settings, *, session: Any = None,
                 reset_pending_checks()
                 reason = str(exc)
                 safe_reason = reason if isinstance(exc, RemoteError) or reason in (
-                    'attendance_result_pending', 'attendance_category_unknown',
-                    'attendance_status_unknown', 'attendance_record_conflict') else 'invalid_activity_data'
+                    'attendance_category_unknown', 'attendance_record_conflict') else 'invalid_activity_data'
                 record(safe_reason)
                 query_failed(scan_started)
                 # Never issue another request before a rate-limit wait: the probe exists only to

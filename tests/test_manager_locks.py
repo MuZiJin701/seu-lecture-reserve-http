@@ -4,6 +4,9 @@ The lock is taken with the real `Task` checkpoint object (same file lock the CLI
 supervisor is driven through the same fakes as tests/test_web.py; no process or network is used.
 """
 
+import os
+import subprocess
+import threading
 import time
 
 import pytest
@@ -254,3 +257,99 @@ def test_external_lock_taken_between_check_and_write_blocks_the_write(tmp_path, 
         assert saved['name'] == '持锁写入' and saved['revision'] == 1
     finally:
         manager.close()
+
+
+def test_saving_when_the_cli_takes_the_checkpoint_drops_the_start_intent(tmp_path, monkeypatch):
+    import seu_reserve.manager as module
+
+    accounts = Accounts(tmp_path)
+    account = accounts.create(account_data())
+    manager = Manager(accounts, {}, target=_real_locking_worker)
+    manager.start(account['id'])
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline and not task_running(accounts.state_dir(account['id'])):
+            time.sleep(0.05)
+
+        def cli_wins(_directory):
+            raise ValueError('state_in_use')
+
+        # The CLI takes the checkpoint after the worker stopped but before the configuration write.
+        monkeypatch.setattr(module, 'hold_checkpoint', cli_wins)
+        with pytest.raises(ValueError, match='state_in_use'):
+            manager.update(account['id'], account_data().model_copy(update={'name': '不应保存'}))
+        saved = accounts.get(account['id'])
+        assert saved['name'] == '测试账号 10001' and saved['revision'] == 0
+        # No worker and no retry would leave desired=True stuck; the intent must be dropped.
+        assert saved['desired'] is False and saved['error'] == 'state_in_use'
+        assert manager.workers == {} and manager.retry_at == {}
+        assert manager.retries.get(account['id'], 0) == 0
+    finally:
+        manager.close()
+
+
+def test_snapshot_reports_an_unsafe_account_directory_as_invalid(tmp_path):
+    accounts = Accounts(tmp_path)
+    account = accounts.create(account_data())
+    manager = make_manager(accounts)
+    target = tmp_path / 'elsewhere'
+    target.mkdir()
+    link = accounts.state_dir(account['id'])
+    if os.name == 'nt':
+        result = subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(target)],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            pytest.skip('creating a junction requires local command availability')
+    else:
+        link.symlink_to(target, target_is_directory=True)
+    # One broken account directory must not turn the whole account list into an error.
+    snapshot = manager.snapshot(account)
+    assert snapshot['status'] == 'invalid'
+    assert snapshot['running'] is False
+
+
+def test_delete_drops_the_account_bookkeeping(tmp_path):
+    accounts = Accounts(tmp_path)
+    account = accounts.create(account_data())
+    manager = make_manager(accounts)
+    manager.retries[account['id']] = 2
+    manager.retry_at[account['id']] = 999.0
+    manager.delete(account['id'])
+    assert account['id'] not in manager.operations
+    assert account['id'] not in manager.retries
+    assert account['id'] not in manager.retry_at
+
+
+def test_slow_alert_mail_does_not_block_stop(tmp_path, monkeypatch):
+    import seu_reserve.manager as module
+
+    accounts = Accounts(tmp_path)
+    account = accounts.create(account_data(recipient='only@example.com', mail_enabled=True))
+    sent = []
+
+    def slow_deliver(self, event, details=''):
+        time.sleep(2)
+        sent.append(event)
+
+    monkeypatch.setattr(module.Mailer, '__call__', slow_deliver)
+    manager = make_manager(accounts, MAIL_SHARED)
+    manager.start(account['id'])
+    thread = threading.Thread(target=manager._alert, args=(account,))
+    thread.start()
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                if 'task_failed' in (accounts.checkpoint(account['id']).get('alerts') or {}):
+                    break
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.02)
+        started = time.time()
+        manager.stop(account['id'])
+        assert time.time() - started < 1.0
+    finally:
+        thread.join(10)
+        manager.close()
+    assert sent == ['task_failed']
+    assert accounts.checkpoint(account['id'])['health']['last_mail_status'] == 'accepted'

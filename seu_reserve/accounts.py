@@ -57,6 +57,14 @@ class AccountInput(BaseModel):
     options: AccountOptions = Field(default_factory=AccountOptions)
     revision: int = Field(default=0, ge=0)
 
+    @field_validator('name')
+    @classmethod
+    def valid_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError('invalid_name')
+        return value
+
     @field_validator('recipient')
     @classmethod
     def valid_email(cls, value: str) -> str:

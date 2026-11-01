@@ -832,6 +832,72 @@ def test_connect_timeout_does_not_leave_the_task_pending(tmp_path):
     assert saved['status'] == 'scanning' and not saved['activity']
 
 
+def test_connect_timeout_does_not_consume_a_retry_of_the_original_activity(tmp_path):
+    class ConnectTimeoutSchool(School):
+        def request(self, method, url, **kwargs):
+            if url.endswith('addReservation.do'):
+                raise requests.exceptions.ConnectTimeout('SECRET connect timeout')
+            return super().request(method, url, **kwargs)
+    seed = School()
+    assert execute(seed, tmp_path) == 130
+    path = tmp_path / 'task.json'
+    saved = json.loads(path.read_text())
+    now = moment('2026-10-18 12:00:00').timestamp()
+    saved['holds'] = {'one': dict(start=moment('2030-01-01 10:00:00').timestamp(),
+                                  end=moment('2030-01-01 11:00:00').timestamp(),
+                                  since=now, until=now + 600, attempts=1, confirmed=False)}
+    path.write_text(json.dumps(saved))
+
+    school = ConnectTimeoutSchool()
+    school.activities = [lecture('one')]
+    assert execute(school, tmp_path) == 130
+    saved = json.loads(path.read_text())
+    assert saved['health']['last_error'] == 'connect_timeout'
+    # The request never left, so the retry budget of the original activity is unchanged.
+    assert saved['holds']['one']['attempts'] == 1
+    assert saved['status'] == 'scanning' and not saved['activity']
+
+
+def test_withdrawn_history_row_does_not_confirm_a_pending_submission(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    path = tmp_path / 'task.json'
+    saved = json.loads(path.read_text())
+    saved['retry_at'] = 0
+    path.write_text(json.dumps(saved))
+
+    school.submit_timeout = False
+    school.activities = []
+    # FBZT=-1 is excluded by progress(); it must not be success evidence for pending either.
+    school.mine = [{**lecture(), 'HD_WID': 'one', 'YYZT': '已预约', 'FBZT': '-1'}]
+    assert execute(school, tmp_path) == 130
+
+    saved = json.loads(path.read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+    assert saved.get('pending_checks') == 1
+    assert 'event=reservation_succeeded' not in (tmp_path / 'events.log').read_text()
+
+
+def test_resolve_pending_ignores_a_withdrawn_history_row(tmp_path):
+    school = School()
+    school.activities = [lecture()]
+    school.submit_timeout = True
+    assert execute(school, tmp_path) == 130
+    school.submit_timeout = False
+    school.mine = [{**lecture(), 'HD_WID': 'one', 'YYZT': '已预约', 'FBZT': '-1'}]
+    asked = []
+    assert resolve_pending(Settings(state_dir=tmp_path), session=school,
+                           environ={'SEU_USERNAME': 'test-user'},
+                           prompt=lambda question: asked.append(question) or 'cancel') == 1
+    assert len(asked) == 1  # it asked for manual confirmation instead of confirming by itself
+    events = (tmp_path / 'events.log').read_text()
+    assert 'event=pending_not_in_history' in events
+    assert 'event=pending_confirmed' not in events
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'pending'
+
+
 def test_resolve_pending_confirms_when_school_history_shows_it(tmp_path):
     school = School()
     school.activities = [lecture()]

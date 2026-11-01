@@ -17,8 +17,8 @@ import requests
 
 from .client import AuthenticationExpired, AuthenticationRejected, Client, RemoteError, has_code
 from .model import (COFFEE_CATEGORY, GOAL_CATEGORIES, Lecture, Progress, REQUIRED_CATEGORIES, SHANGHAI,
-                    activity_id, category_name, conflicting_records, interval, moment, progress,
-                    reservation_display, reserved, test_notice)
+                    activity_id, category_name, confirmed_reservation, conflicting_records, interval,
+                    moment, progress, reservation_display, reserved, test_notice)
 from .mail import Mailer, mail_failure_reason, mail_history
 from .poller import ActivityPoller, WaitGate
 from .state import FINGERPRINT_FILE, Task, open_nofollow
@@ -468,7 +468,7 @@ def resolve_pending(settings: Settings, *, session: Any = None,
                 # and make the operator inspect the school record again.
                 _state_event(settings, 'pending_check_failed')
                 return 1
-            booked = {activity_id(row) for row in history if reserved(row)}
+            booked = {activity_id(row) for row in history if confirmed_reservation(row)}
         except (RemoteError, ValueError):
             _state_event(settings, 'pending_check_failed')
             return 1
@@ -1689,7 +1689,8 @@ def run(settings: Settings, *, session: Any = None,
                     booked = set()
                     if pending_history is not None:
                         try:
-                            booked = {activity_id(row) for row in pending_history if reserved(row)}
+                            booked = {activity_id(row) for row in pending_history
+                                      if confirmed_reservation(row)}
                         except ValueError as exc:
                             abandon_check(exc)
                     if pending_wid not in booked and not confirmed:
@@ -1909,7 +1910,7 @@ def run(settings: Settings, *, session: Any = None,
                     booked_wids: set[str] = set()
                     for row in history:
                         try:
-                            if reserved(row):
+                            if confirmed_reservation(row):
                                 booked_wids.add(activity_id(row))
                         except ValueError:
                             continue
@@ -2089,6 +2090,10 @@ def run(settings: Settings, *, session: Any = None,
                             if str(exc) == 'connect_timeout':
                                 # The connection never formed, so this submission was not sent;
                                 # revert pending and retry rather than blocking the whole task.
+                                if isinstance(retry_hold, dict):
+                                    # No request left, so it must not consume a retry of the
+                                    # original activity either.
+                                    retry_hold['attempts'] = max(0, int(retry_hold.get('attempts', 0)) - 1)
                                 task.data.update(status='scanning', activity='')
                                 task.data.pop('pending_checks', None)
                                 task.data.pop('pending_since', None)

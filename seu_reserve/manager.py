@@ -209,13 +209,14 @@ class Manager:
                 worker = self.workers.get(identifier)
                 if worker is None:
                     # Another process (CLI `--account`) may own the checkpoint; a 200 here would
-                    # falsely promise a stop, so refuse instead of pretending success.
-                    if task_running(self.accounts.state_dir(identifier)):
-                        raise ValueError('state_in_use')
+                    # falsely promise a stop, so refuse instead of pretending success. Holding
+                    # the checkpoint lock across the check and the intent write closes the window
+                    # where a CLI could take it between those two steps.
                     self.accounts.get(identifier)
-                    self.retry_at.pop(identifier, None)
-                    if not preserve:
-                        self.accounts.runtime(identifier, desired=False)
+                    with hold_checkpoint(self.accounts.state_dir(identifier)):
+                        self.retry_at.pop(identifier, None)
+                        if not preserve:
+                            self.accounts.runtime(identifier, desired=False)
                     return
                 if not preserve:
                     self.accounts.get(identifier)
@@ -268,9 +269,17 @@ class Manager:
             # Hold the checkpoint lock across the configuration write: a check followed by a
             # separate write would let an external CLI take the lock in between, so the console
             # would save a configuration that the running CLI never saw.
-            with hold_checkpoint(self.accounts.state_dir(identifier)):
-                with self.lock:
-                    account = self.accounts.update(identifier, data)
+            try:
+                with hold_checkpoint(self.accounts.state_dir(identifier)):
+                    with self.lock:
+                        account = self.accounts.update(identifier, data)
+            except ValueError as exc:
+                if str(exc) == 'state_in_use':
+                    # The CLI took the checkpoint after the worker stopped: nothing was written,
+                    # so drop the start intent instead of leaving desired=True without a worker
+                    # and without a retry (the page would otherwise stay "running" forever).
+                    self._note_start_failure(identifier, exc)
+                raise
             if active:
                 try:
                     self.start(identifier)
@@ -288,6 +297,10 @@ class Manager:
             self.stop(identifier)
             with self.lock:
                 self.accounts.delete(identifier)
+                # The account is gone; do not keep its per-account bookkeeping forever.
+                self.operations.pop(identifier, None)
+                self.retries.pop(identifier, None)
+                self.retry_at.pop(identifier, None)
 
     def answer(self, identifier: str, challenge: str, answer: str) -> None:
         with self.lock:
@@ -391,17 +404,26 @@ class Manager:
             self._start_or_retry(identifier, manual=False)
 
     def _alert(self, account: dict[str, Any]) -> None:
+        """Send the fatal-error mail without holding the account operation gate.
+
+        SMTP can block for the socket timeout (and a DNS failure longer), so the gate is held
+        only to claim the cross-restart alert and to publish the result. Holding it for the
+        send would make stop/save/delete (and shutdown) wait on an unreachable mail server.
+        """
+        identifier = account['id']
+        mailer: Mailer | None = None
+        started = 0.0
         try:
-            with self.operation(account['id']):
+            with self.operation(identifier):
                 if self.closed.is_set():
                     return
                 try:
-                    current = self.accounts.get(account['id'])
+                    current = self.accounts.get(identifier)
                 except ValueError:
-                    # Deleted while the alert was queued: never recreate its directory or send.
+                    # Deleted before the alert started: never recreate its directory or send.
                     return
                 mailer = Mailer(account_environ(current, self.shared))
-                task = Task(self.accounts.state_dir(current['id']), current['username'])
+                task = Task(self.accounts.state_dir(identifier), current['username'])
                 try:
                     alerts = task.data.setdefault('alerts', {})
                     if 'task_failed' in alerts:
@@ -411,13 +433,28 @@ class Manager:
                     health.update(mail_status='sending', last_mail_status='sending', last_mail_at=time.time(),
                                   last_mail_error='none', last_mail_event='task_failed', last_mail_duration_seconds=None)
                     task.save()
-                    started = self.clock()
-                    try:
-                        mailer('task_failed')
-                        health.update(mail_status='accepted', last_mail_status='accepted')
-                    except Exception as exc:
-                        health.update(mail_status='failed', last_mail_status='failed', last_mail_error=mail_failure_reason(exc))
-                    health.update(last_mail_at=time.time(), last_mail_duration_seconds=max(0, self.clock() - started))
+                finally:
+                    task.close()
+                started = self.clock()
+            if mailer is None:  # unreachable: the gate above either returned or set mailer
+                return
+            try:
+                mailer('task_failed')
+                outcome, error = 'accepted', 'none'
+            except Exception as exc:
+                outcome, error = 'failed', mail_failure_reason(exc)
+            with self.operation(identifier):
+                try:
+                    current = self.accounts.get(identifier)
+                except ValueError:
+                    # Deleted while the alert was being sent: never recreate its state directory.
+                    return
+                task = Task(self.accounts.state_dir(identifier), current['username'])
+                try:
+                    health = task.data.setdefault('health', {})
+                    health.update(mail_status=outcome, last_mail_status=outcome, last_mail_error=error,
+                                  last_mail_at=time.time(),
+                                  last_mail_duration_seconds=max(0, self.clock() - started))
                     task.save()
                 finally:
                     task.close()
@@ -443,7 +480,9 @@ class Manager:
                 self._drain(worker)
             try:
                 external = worker is None and task_running(self.accounts.state_dir(identifier))
-            except OSError:
+            except (OSError, ValueError):
+                # A missing or unsafe (symlink/junction) account directory must hide this one
+                # account's external-run flag, never fail the whole account list.
                 external = False
             result.update(running=bool(worker and worker.process.is_alive()) or external,
                           external_running=external,
@@ -493,7 +532,8 @@ class Manager:
                     match = re.fullmatch(r'(\d+) event=([a-z_]{1,80})(?: [a-z_]+=[a-z_0-9.]+)*\n?', line)
                     if match:
                         events.append(dict(at=int(match[1]), event=match[2]))
-        except OSError:
+        except (OSError, ValueError):
+            # The account directory disappeared or was replaced while the event log was read.
             pass
         result['events'] = events
         healthy = not self.closed.is_set() and self.thread is not None and self.thread.is_alive()

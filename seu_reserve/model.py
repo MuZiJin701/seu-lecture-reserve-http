@@ -177,6 +177,15 @@ def reserved(row: dict[str, Any]) -> bool:
     raise ValueError('reservation_status_unknown')
 
 
+def confirmed_reservation(row: dict[str, Any]) -> bool:
+    """A reservation record that may stand as positive evidence of a real reservation.
+
+    Same caliber as ``progress``/``reservation_display``: a withdrawn or unpublished row
+    (``FBZT='-1'``) is not counted there, so it must not confirm a pending submission either.
+    """
+    return reserved(row) and row.get('FBZT') != '-1'
+
+
 def reservation_display(rows: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
     """Only the current reservations needed by the console, never the full school history."""
     if conflicting_records(rows):

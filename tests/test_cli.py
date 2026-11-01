@@ -453,6 +453,35 @@ def test_normal_run_rechecks_the_account_before_entering_the_engine(tmp_path, mo
     assert not accounts.state_dir(account['id']).exists()
 
 
+def test_configuration_reread_failure_removes_a_checkpoint_created_for_a_new_account(
+        tmp_path, monkeypatch, capsys):
+    from seu_reserve import accounts as module
+    from seu_reserve import cli
+    from seu_reserve.accounts import AccountInput, Accounts
+    config = tmp_path / '.env'
+    config.write_text('SEU_DATA_DIR=data\n', encoding='utf-8')
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(AccountInput(username='10001', name='重读失败', password='synthetic'))
+    directory = accounts.state_dir(account['id'])
+    assert not directory.exists()
+    original = module.account_settings
+    calls = []
+
+    def failing_reread(current, state_directory):
+        calls.append(1)
+        if len(calls) >= 2:
+            raise ValueError('invalid_filter_list')
+        return original(current, state_directory)
+
+    # The second call is the post-lock re-read; it must not leave a scanning checkpoint behind.
+    monkeypatch.setattr(module, 'account_settings', failing_reread)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('os.environ', {})
+    assert cli.main(['--config', str(config), '--account', '10001']) == 1
+    assert 'event=configuration_or_state_invalid' in capsys.readouterr().out
+    assert not directory.exists()
+
+
 def no_recognizer():
     raise ImportError('synthetic missing ddddocr')
 

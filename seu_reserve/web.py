@@ -26,8 +26,9 @@ ASSETS = Path(__file__).parent / 'web_assets'
 CAMPUSES = ['九龙湖校区', '四牌楼校区', '丁家桥校区', '无锡校区', '苏州校区']
 MAX_BODY_BYTES = 65536
 
-# Every response, including middleware early exits, carries the same browser hardening. Plain HTTP
-# has no TLS to rely on for these, so they are always set; HSTS is deliberately absent.
+# Normal responses, including middleware early exits, carry the same browser hardening. Plain HTTP
+# has no TLS to rely on for these, so they are always set; HSTS is deliberately absent. A 500 from
+# Starlette's outer ServerErrorMiddleware bypasses this middleware and is the documented exception.
 SECURITY_HEADERS = {
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',

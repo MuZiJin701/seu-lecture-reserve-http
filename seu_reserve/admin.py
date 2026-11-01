@@ -97,7 +97,9 @@ class Administrators:
             # Unknown names pay the same hash cost and return the same error as wrong passwords.
             encoded = self.admins.get(username, next(iter(self.admins.values())))
             match = HASH_PATTERN.fullmatch(encoded)
-            assert match is not None
+            if match is None:
+                # The constructor guarantees a full hash; never rely on asserts (stripped by -O).
+                raise ValueError('admin_configuration_invalid')
             actual = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(match[1]), ITERATIONS)
             correct = hmac.compare_digest(actual, bytes.fromhex(match[2]))
         except BaseException:

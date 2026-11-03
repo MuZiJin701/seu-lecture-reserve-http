@@ -90,7 +90,8 @@ function renderDetail(){
   $('category-progress').replaceChildren();metadata.categories.slice(0,3).forEach(value=>{$('category-progress').append(node('span','category-tag'+(progress&&!progress.missing.includes(value)?' covered':''),category(value)+(progress&&!progress.missing.includes(value)?' · 已覆盖':' · 待补齐')));});
   $('last-query').textContent=timestamp(health.last_query_at);$('next-check').textContent=timestamp(health.next_check_at);$('candidate-count').textContent=health.candidate_count??'未知';
   $('mail-state').textContent=!account?.mail_enabled?'未启用':({accepted:'SMTP 已接受',failed:'最近发送失败',sending:'正在发送',ready:'已配置',disabled:'未启用'}[health.mail_status]??'尚未发送');
-  $('account-error').textContent=account?.error&&account.error!=='restarting'?(errors[account.error]||'账号运行异常，请检查服务器。'):health.failure_count?'最近错误：'+health.last_error:'';
+  const errorActive=health.last_error_active===true;
+  $('account-error').textContent=account?.error&&account.error!=='restarting'?(errors[account.error]||'账号运行异常，请检查服务器。'):errorActive?'最近错误：'+health.last_error:'';
   $('protected-note').hidden=!account?.protected;
   $('start-button').disabled=!account||account.supervisor_healthy===false||account.running||account.desired||account.deleting;
   $('stop-button').disabled=!account||account.external_running||(!account.running&&!account.desired)||account.stopping;

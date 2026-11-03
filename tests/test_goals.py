@@ -68,9 +68,10 @@ def test_coverage_waits_cancellation_or_breach_is_replaced_and_attendance_finish
         KSSJ=f'2030-01-0{i + 1} 10:00:00', JSSJ=f'2030-01-0{i + 1} 11:00:00') for i in range(3)]
     school.activities = [lecture('replacement', HDLX_DISPLAY=OTHER,
                                 KSSJ='2030-01-04 10:00:00', JSSJ='2030-01-04 11:00:00')]
-    waits = []
+    waits, now = [], [1792296000.0]
     def wait(seconds):
         waits.append(seconds)
+        now[0] += 30
         if len(waits) == 1:
             assert not school.submitted
             if change == 'removed':
@@ -85,8 +86,8 @@ def test_coverage_waits_cancellation_or_breach_is_replaced_and_attendance_finish
                 row['SFDK'] = '1'
         else:
             pytest.fail('goal should finish after school confirms attendance')
-    assert execute(school, tmp_path, sleep=wait) == 0
-    assert waits == [10, 10]
+    assert execute(school, tmp_path, sleep=wait, clock=lambda: now[0]) == 0
+    assert len(waits) == 2 and all(4 <= wait <= 6 for wait in waits)
 
 
 def test_eight_attended_without_art_still_books_art(tmp_path):

@@ -11,7 +11,7 @@ import stat
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -35,6 +35,23 @@ FINGERPRINT_PATTERN = re.compile(r'[A-Za-z0-9_-]{8,128}')
 # and only the fixed cookie fields are stored (never headers, passwords or page content).
 TRUST_COOKIES_FILE = 'trust-cookies.json'
 TRUST_COOKIE_FIELDS = ('name', 'value', 'domain', 'path', 'secure', 'expires')
+
+
+def current_error_active(health: Mapping[str, Any]) -> bool:
+    """Whether a health snapshot describes a current failure, not a recovered historical one.
+
+    Newer snapshots carry ``last_error_active`` explicitly; older ones fall back to comparing the
+    error and last-query timestamps so a preserved old error is not shown as the current one.
+    """
+    flag = health.get('last_error_active')
+    if isinstance(flag, bool):
+        return flag
+    last_error_at = health.get('last_error_at')
+    last_query_at = health.get('last_query_at')
+    return (health.get('last_error') not in (None, 'none')
+            and isinstance(last_error_at, (int, float))
+            and isinstance(last_query_at, (int, float))
+            and last_error_at > last_query_at)
 
 
 def lock_file(fd: int) -> None:
@@ -262,6 +279,11 @@ class Task:
                     raise ValueError('state_in_use') from None
                 raise
             account = hashlib.sha256(username.encode()).hexdigest()
+            # Whether this open created task.json rather than loading one that already existed.
+            # The flag is decided under the checkpoint lock: a startup cleanup may remove only a
+            # checkpoint this process created, never one written by another instance before the
+            # lock was acquired.
+            self.created_checkpoint = False
             if self.path.exists() or self.path.is_symlink():
                 data = read_json(self.path)
                 if (not isinstance(data, dict) or type(data.get('version')) is not int or data['version'] not in (1, 2)
@@ -280,7 +302,10 @@ class Task:
                 alerts = data.get('alerts', {})
                 if (not isinstance(alerts, dict)
                         or any(key not in ('query_failure', 'authentication_required', 'task_failed',
-                                           'reservation_unconfirmed', 'reservation_step_failure')
+                                           'reservation_unconfirmed', 'reservation_step_failure',
+                                           # Legacy builds briefly persisted this key; normalize it
+                                           # to task_failed below so a bad login is recoverable.
+                                           'authentication_rejected')
                                for key in alerts)
                         or any(type(value) not in (int, float) or not math.isfinite(value)
                                or not 0 <= value <= 253402214400 for value in alerts.values())):
@@ -334,6 +359,10 @@ class Task:
                 if isinstance(data.get('health'), dict):
                     mail_history(data['health'])
                 self.data = data
+                legacy_alert = alerts.pop('authentication_rejected', None)
+                if legacy_alert is not None:
+                    alerts['task_failed'] = max(alerts.get('task_failed', 0), legacy_alert)
+                    self.save()
                 if data['version'] == 1:
                     data['version'] = 2
                     if data['status'] == 'done':
@@ -344,12 +373,14 @@ class Task:
                     raise ValueError('credentials_missing')
                 self.data = {'version': 2, 'account': account, 'status': 'scanning',
                              'activity': '', 'cooldowns': {}}
+                self.created_checkpoint = True
                 self.save()
         except BaseException:
             os.close(self.lock)
             raise
 
     data: dict[str, Any]
+    created_checkpoint: bool
 
     def save(self) -> None:
         fd, name = tempfile.mkstemp(prefix='.task-', dir=self.directory)

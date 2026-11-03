@@ -934,14 +934,26 @@ def test_reservation_snapshot_freshness_tracks_running_state_and_query_failures(
         assert fresh['reservations']['stale'] is False
         assert fresh['reservations']['items'][0]['wid'] == 'booked'
         task = Task(directory, account['username'])
-        task.data['health'] = {'failure_count': 1}
+        task.data['health'] = {'last_error': 'network_timeout', 'last_error_active': True,
+                               'failure_count': 0}
         task.save()
         task.close()
-        # A failing query keeps the last good display but marks it stale; items are not dropped.
+        # A current error keeps the last good display but marks it stale; items are not dropped.
         stale = manager.snapshot(account)
+        assert stale['health']['last_error_active'] is True
         assert stale['reservations']['stale'] is True
         assert stale['reservations']['at'] == now
         assert [row['wid'] for row in stale['reservations']['items']] == ['booked']
+
+        # Older checkpoints lack the explicit flag; the timestamp fallback must still surface it.
+        task = Task(directory, account['username'])
+        task.data['health'] = {'last_error': 'network_timeout', 'last_error_at': now + 1,
+                               'last_query_at': now, 'failure_count': 0}
+        task.save()
+        task.close()
+        legacy = manager.snapshot(account)
+        assert legacy['health']['last_error_active'] is True
+        assert legacy['reservations']['stale'] is True
     finally:
         manager.close()
 

@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import signal
 import sqlite3
 import sys
@@ -23,7 +22,7 @@ from dotenv.parser import parse_stream
 from .app import SELECTION_REASONS, Settings, resolve_pending, run
 from .mail import Mailer, mail_failure_reason, mail_history
 from .model import SHANGHAI
-from .state import Task, read_json, task_running
+from .state import Task, current_error_active, read_json, task_running
 
 
 def show_status(directory: Path) -> None:
@@ -73,6 +72,9 @@ def show_status(directory: Path) -> None:
         print(label + '=' + (str(max(0, round(time.time() - snapshot[key]))) if snapshot[key] else 'unknown'))
     for key in ('last_error', 'failure_count', 'mail_status', 'activity_count', 'candidate_count'):
         print(key + '=' + (str(snapshot[key]) if snapshot.get(key) is not None else 'unknown'))
+    # last_error is kept after recovery by design; use the shared current-failure helper, which
+    # also covers health files written before the explicit flag existed.
+    print('last_error_active=' + str(current_error_active(snapshot)).lower())
     for key in ('last_mail_status', 'last_mail_error', 'last_mail_event', 'last_mail_duration_seconds'):
         print(key + '=' + (str(history[key]) if history[key] is not None else 'unknown'))
     selection = saved.get('selection')
@@ -245,25 +247,33 @@ def main(argv: list[str] | None = None) -> int:
         if args.resolve_pending:
             return resolve_pending(settings, environ=environ)
         account_task: Task | None = None
-        had_directory = had_task = False
 
         def discard_checkpoint() -> None:
-            """Remove a checkpoint this process created but never handed to the engine."""
+            """Remove the checkpoint this process created, while its lock is still held.
+
+            Deleting after releasing the lock could remove a checkpoint another instance wrote in
+            the gap. ``Task.created_checkpoint`` is decided under the lock, so a checkpoint that
+            already existed there (including a pending submission written by a previous instance)
+            is never removed. The state directory may keep its lock file; an empty directory is
+            not a checkpoint.
+            """
             nonlocal account_task
-            if account_task is not None:
-                account_task.close()
-                account_task = None
-                if not had_directory:
-                    shutil.rmtree(settings.state_dir, ignore_errors=True)
-                elif not had_task:
-                    (settings.state_dir / 'task.json').unlink(missing_ok=True)
+            task, account_task = account_task, None
+            if task is None:
+                return
+            try:
+                if task.created_checkpoint:
+                    try:
+                        task.path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            finally:
+                task.close()
 
         if args.account and not args.check:
             # Hold the checkpoint lock from the lifecycle re-check through engine startup (OCR
             # loading included), so a delete cannot remove the account between the catalogue read
             # and the engine's own checkpoint open. The engine reuses this locked checkpoint.
-            had_directory = settings.state_dir.exists()
-            had_task = (settings.state_dir / 'task.json').exists()
             account_task = Task(settings.state_dir, environ['SEU_USERNAME'])
             try:
                 current = Accounts(data_root).get(account_identifier)

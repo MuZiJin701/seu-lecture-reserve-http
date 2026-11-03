@@ -23,7 +23,8 @@ def test_successful_scan_is_observable_while_running_and_after_stop(tmp_path, ca
         current = snapshot(tmp_path)
         assert current['phase'] == 'waiting'
         assert current['last_query_at'] == 1000
-        assert current['next_check_at'] == 1010
+        assert 1004 <= current['next_check_at'] <= 1006
+        assert current['next_check_at'] == 1000 + seconds
         assert current['activity_count'] == current['candidate_count'] == 0
         assert task_running(tmp_path)
         capsys.readouterr()
@@ -48,7 +49,7 @@ def test_status_displays_health_and_selection_snapshot_fields(tmp_path, capsys):
     assert all(key in output for key in (
         'status=scanning', 'process_running=false', 'phase=stopped', 'last_phase=stopped',
         'updated_at=', 'last_query_at=', 'last_error_at=', 'next_check_at=', 'last_mail_at=',
-        'last_error=none', 'failure_count=0', 'mail_status=disabled',
+        'last_error=none', 'failure_count=0', 'last_error_active=false', 'mail_status=disabled',
         'activity_count=1', 'candidate_count=0', 'last_mail_status=never',
         'last_mail_error=none', 'last_mail_event=none', 'last_mail_duration_seconds=unknown',
         'selection_updated_at=1970-01-01T08:16:40+08:00'))
@@ -71,6 +72,7 @@ def test_query_failure_mail_failure_and_recovery_are_visible_without_repeats(tmp
     assert execute(school, tmp_path, notify=notify, sleep=wait, clock=lambda: now) == 130
     assert messages == ['query_failure']
     assert [entry['failure_count'] for entry in states[:5]] == [1, 2, 3, 4, 5]
+    assert states[0]['last_error_active'] is True
     assert all(entry['phase'] == 'backoff' for entry in states)
     assert states[0]['last_query_at'] == 0
     assert any(entry['mail_status'] == 'failed' for entry in states)
@@ -86,6 +88,7 @@ def test_query_failure_mail_failure_and_recovery_are_visible_without_repeats(tmp
     assert 'event=query_recovered' in (tmp_path / 'events.log').read_text()
     recovered = snapshot(tmp_path)
     assert recovered['last_query_at'] == now and recovered['phase'] == 'stopped'
+    assert recovered['last_error_active'] is False
 
 
 @pytest.mark.parametrize('error, event', [(OSError, 'task_failed'), (RuntimeError, 'unexpected_failure')])

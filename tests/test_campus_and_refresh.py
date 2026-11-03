@@ -13,6 +13,49 @@ from test_app import (FakeHistoryPoller, FakePoller, School, execute, interrupte
                       lecture, native_activity, seed_opening_selection)
 
 
+def test_slower_phase_keeps_scheduled_snapshots_without_extra_queries(tmp_path, monkeypatch):
+    seed_opening_selection(tmp_path)
+    start = moment('2026-10-18 12:00:10').timestamp()
+    now = [start + 60]
+    school = School()
+    school.activities = [{**native_activity(opens='2026-10-18 12:00:10'), 'YYRS': '10', 'HDZRS': '10'}]
+    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
+    monkeypatch.setattr(app_module, 'new_history_poller', lambda query, **kw: FakeHistoryPoller(query, **kw))
+    monkeypatch.setattr(app_module.random, 'uniform', lambda low, high: high)
+    for key, value in dict(instances=[], rows_override=None, at_offset=-1.4,
+                           next_rows=school.activities, next_error=None,
+                           error_retry_after=0, error_server_directed=False,
+                           next_wake_once=False).items():
+        monkeypatch.setattr(FakePoller, key, value)
+    for key, value in dict(rows=[], error=None, retry_after=0,
+                           server_directed=False, seconds=0, events=[]).items():
+        monkeypatch.setattr(FakeHistoryPoller, key, value)
+
+    waits = []
+    def check_schedule(seconds):
+        assert seconds == 1.5
+        waits.append(seconds)
+        if len(waits) == 1:
+            now[0] += seconds
+            return
+        poller = FakePoller.instances[-1]
+        for offset, expected in [(-30, 1.5), (-5, .1), (9, 1.5), (300, 6)]:
+            now[0] = start + offset
+            assert poller.interval() == expected
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(FakePoller, 'on_timeout', check_schedule)
+    assert execute(school, tmp_path, clock=lambda: now[0], background_poller=True,
+                   sleep=interrupted, settings=Settings(state_dir=tmp_path, prewarm=False,
+                                                       captcha_prefetch=False)) == 130
+    queries = [url.rsplit('/', 1)[-1] for _, url, _ in school.requests
+               if url.endswith(('queryActivityList.do', 'queryMyActivityList.do'))]
+    assert waits == [1.5, 1.5]
+    assert queries == ['queryActivityList.do']  # Only the initial bootstrap, no stale fallback.
+    diagnostics = [json.loads(line) for line in (tmp_path / 'diagnostics.jsonl').read_text().splitlines()]
+    assert not any(row['event'] == 'opening_sync_fallback' for row in diagnostics)
+
+
 class CampusSchool(School):
     service = 'http://ehall.seu.edu.cn/gsapp/sys/yddjzxxtjappseu/*default/index.do'
 
@@ -188,7 +231,7 @@ def test_new_background_history_replaces_a_still_cached_history(tmp_path, monkey
                                      captcha_prefetch=False)) == 130
     assert not school.submitted
     assert intervals and all(interval == 5 for interval in intervals)
-    assert FakePoller.instances and all(poller.interval == .10 for poller in FakePoller.instances)
+    assert FakePoller.instances and all(.05 <= poller.interval() <= .10 for poller in FakePoller.instances)
     assert not any(url.endswith('queryMyActivityList.do') for _, url, _ in school.requests)
     saved = json.loads((tmp_path / 'task.json').read_text())
     assert saved['selection']['activities'][0]['reason'] == 'time_conflict'

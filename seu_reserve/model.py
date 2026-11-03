@@ -15,6 +15,14 @@ COFFEE_CATEGORY = '“SEU咖啡间”系列沙龙活动'
 GOAL_CATEGORIES = SERIES_CATEGORIES
 
 
+class AttendanceCategoryUnknown(ValueError):
+    """A reservation row has no usable category; the stable message keeps existing callers."""
+
+    def __init__(self, wid: str = ''):
+        super().__init__('attendance_category_unknown')
+        self.wid = wid
+
+
 def category_name(value: Any) -> Any:
     # The school response uses both ASCII and full-width closing quotes for the salon series.
     return COFFEE_CATEGORY if value == '“SEU咖啡间"系列沙龙活动' else value
@@ -70,11 +78,11 @@ def progress(rows: list[dict[str, Any]], now: float) -> Progress:
             continue
         category = category_name(row.get('JZXL_DISPLAY', row.get('HDLX_DISPLAY')))
         if not isinstance(category, str) or not category:
-            raise ValueError('attendance_category_unknown')
+            raise AttendanceCategoryUnknown(wid)
         if category == COFFEE_CATEGORY:
             continue
         if category not in GOAL_CATEGORIES:
-            raise ValueError('attendance_category_unknown')
+            raise AttendanceCategoryUnknown(wid)
         start, end = interval(row)
         checked, breached = row.get('SFDK'), row.get('SFWY')
         # The school omits SFWY when the reservation did not break the rules.
@@ -224,10 +232,20 @@ class Lecture:
     availability: str
     reservation_start: datetime | None
     reservation_end: datetime | None
+    taken: int | None = None
+    capacity: int | None = None
+
+    @property
+    def remaining(self) -> int | None:
+        """Seats left in the school's row at read time; None when either count is unusable."""
+        if self.taken is None or self.capacity is None:
+            return None
+        return max(0, self.capacity - self.taken)
 
     @classmethod
     def read(cls, row: dict[str, Any], *, now: float) -> 'Lecture':
         native = 'YYZT' not in row or any(key in row for key in ('JZMC', 'JZXL_DISPLAY', 'YYKSSJ', 'YYJSSJ'))
+        taken, capacity = headcount(row.get('YYRS')), headcount(row.get('HDZRS'))
         title = row.get('JZMC' if native else 'HDMC')
         category = category_name(row.get('JZXL_DISPLAY' if native else 'HDLX_DISPLAY'))
         location = row.get('JZDD')
@@ -257,7 +275,6 @@ class Lecture:
                     current = moment(server_now).timestamp() if server_now else now
                 except ValueError:
                     raise ValueError('lecture_schema_unknown') from None
-                taken, capacity = headcount(row.get('YYRS')), headcount(row.get('HDZRS'))
                 if current < opens.timestamp():
                     availability = 'reservation_not_started'
                 elif current > closes.timestamp():
@@ -281,4 +298,4 @@ class Lecture:
         match = re.match(r'^(.+?校区)', location)
         start, end = interval(row)
         return cls(wid, title, category, match[1] if match else location, online, start, end,
-                   availability, opens, closes)
+                   availability, opens, closes, taken, capacity)

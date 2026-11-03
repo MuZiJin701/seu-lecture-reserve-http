@@ -78,7 +78,9 @@ def test_read_only_diagnostics_match_actual_selection_without_side_effects(
     assert not tmp_path.joinpath('diagnostics.jsonl').exists()
     assert execute(school, tmp_path, settings=settings, clock=lambda: now) == 130
     assert not school.submitted
-    assert json.loads((tmp_path / 'task.json').read_text())['selection']['activities'] == result
+    stored = json.loads((tmp_path / 'task.json').read_text())['selection']['activities']
+    assert [{key: value for key, value in item.items() if key != 'wid'} for item in stored] == result
+    assert stored[0]['wid'] == 'native' and all('wid' not in item for item in result)
 
 
 def test_check_and_scan_report_conflicts_and_first_filter_reason(tmp_path, capsys):
@@ -260,7 +262,7 @@ def test_diagnostics_record_scan_timing_once_and_selection_only_on_change(tmp_pa
     assert len(timings) == 1
     timing = timings[0]
     assert timing['at'] == 1000 and timing['mode'] == 'normal'
-    assert timing['wait_seconds'] == 10 and timing['duration_seconds'] >= 0
+    assert 4 <= timing['wait_seconds'] <= 6 and timing['duration_seconds'] >= 0
     assert timing['history_reused'] is False
     assert sum(line['event'] == 'selection_changed' for line in lines) == 1
     assert 'PRIVATE TITLE' not in capsys.readouterr().out
@@ -319,4 +321,15 @@ def test_ocr_failures_cooldown_and_submission_reply_are_diagnosed(tmp_path):
     started = next(line for line in lines if line['event'] == 'submission_started')
     assert started['captcha_seconds'] >= 0
     assert started['ocr_seconds'] >= 0
+    assert started['yyrs'] is None and started['hdzrs'] is None
+    assert started['remaining'] is None and started['remaining_after'] is None
     assert 'PRIVATE' not in (other / 'diagnostics.jsonl').read_text()
+
+    counted = School()
+    counted.activities = [lecture(YYRS='3', HDZRS='10')]
+    counted_dir = tmp_path / 'counted'
+    assert execute(counted, counted_dir) == 130
+    counted_started = next(line for line in diagnostics(counted_dir)
+                           if line['event'] == 'submission_started')
+    assert (counted_started['yyrs'], counted_started['hdzrs'],
+            counted_started['remaining'], counted_started['remaining_after']) == (3, 10, 7, 6)

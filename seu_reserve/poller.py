@@ -96,14 +96,16 @@ class WaitGate:
 
 class ActivityPoller:
     def __init__(self, query: Callable[[], list[dict[str, Any]]], *,
-                 interval: float, clock: Callable[[], float] = time.monotonic,
+                 interval: float | Callable[[], float], clock: Callable[[], float] = time.monotonic,
                  gate: WaitGate | None = None,
-                 on_exit: Callable[[], None] | None = None):
+                 on_exit: Callable[[], None] | None = None,
+                 on_align: Callable[[float, float, float], None] | None = None):
         self._query = query
         self._interval = interval
         self._clock = clock
         self._gate = gate
         self._on_exit = on_exit
+        self._on_align = on_align
         self._exit_called = False
         self._lock = threading.Lock()
         self._snapshot: Snapshot | None = None
@@ -263,13 +265,28 @@ class ActivityPoller:
 
     def _run(self) -> None:
         try:
+            aligned_target: float | None = None
             while not self._stop.is_set():
                 # Check the shared deadline immediately before each request. The gate is updated
                 # by whichever thread received the 429, so the other reader stops even while the
                 # scan loop is blocked in a captcha or submission request.
                 if self._gate is not None and self._gate.remaining() > 0:
                     return
+                if aligned_target is not None:
+                    # Record alignment only here: the next query is actually about to start and
+                    # all stop/shared-wait checks above have passed. A stop that wakes the wait
+                    # must not produce a diagnostic for a request that never runs.
+                    actual = self._clock()
+                    callback = self._on_align
+                    if callback is not None:
+                        try:
+                            callback(aligned_target, actual, actual - aligned_target)
+                        except Exception:
+                            # A diagnostic callback must never take the poller down.
+                            pass
+                    aligned_target = None
                 started = self._clock()
+                interval = self._interval() if callable(self._interval) else self._interval
                 if not self.poll_once():
                     return
                 with self._lock:
@@ -283,14 +300,15 @@ class ActivityPoller:
                 # above could otherwise discard its wake: never enter the interval after a stop.
                 if self._stop.is_set():
                     return
-                wait = self._interval - (self._clock() - started)
+                wait = interval - (self._clock() - started)
                 target = self._take_align()
                 if target is not None:
                     now = self._clock()
-                    if now < target and target - now <= 2 * self._interval:
+                    if now < target and target - now <= 2 * interval:
                         # Exactly when the next poll must start; the target is consumed either
                         # way, so a missed opening cannot shift later polls.
                         wait = target - now
+                        aligned_target = target
                 if wait > 0:
                     if self._wake.wait(wait):
                         self._wake.clear()

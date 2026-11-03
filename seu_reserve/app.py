@@ -3,10 +3,12 @@
 import functools
 import json
 import os
+import random
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from getpass import getpass
@@ -16,9 +18,10 @@ from typing import Any
 import requests
 
 from .client import AuthenticationExpired, AuthenticationRejected, Client, RemoteError, has_code
-from .model import (COFFEE_CATEGORY, GOAL_CATEGORIES, Lecture, Progress, REQUIRED_CATEGORIES, SHANGHAI,
-                    activity_id, category_name, confirmed_reservation, conflicting_records, interval,
-                    moment, progress, reservation_display, reserved, test_notice)
+from .model import (COFFEE_CATEGORY, GOAL_CATEGORIES, AttendanceCategoryUnknown, Lecture, Progress,
+                    REQUIRED_CATEGORIES, SHANGHAI, activity_id, category_name,
+                    confirmed_reservation, conflicting_records, interval, moment, progress,
+                    reservation_display, reserved, test_notice)
 from .mail import Mailer, mail_failure_reason, mail_history
 from .poller import ActivityPoller, WaitGate
 from .state import FINGERPRINT_FILE, Task, open_nofollow
@@ -26,9 +29,9 @@ from .state import FINGERPRINT_FILE, Task, open_nofollow
 DEFAULT_CATEGORIES = GOAL_CATEGORIES + (COFFEE_CATEGORY,)
 QUERY_FAILURE_SECONDS = 5 * 60
 STEP_FAILURE_SECONDS = 5 * 60
-MAJOR_MAIL_EVENTS = {'authentication_required', 'query_failure', 'task_failed', 'unexpected_failure',
-                     'reservation_step_failure'}
-SCAN_INTERVAL = 10
+MAJOR_MAIL_EVENTS = {'authentication_required', 'authentication_rejected', 'query_failure', 'task_failed',
+                     'unexpected_failure', 'reservation_step_failure'}
+SCAN_INTERVAL = 5
 FAST_INTERVAL = 0.10
 FAST_RETRY_INTERVAL = 0.25
 # When the background reader is down, the 0.10 s fast loop would otherwise issue one synchronous
@@ -46,19 +49,119 @@ SELECTION_REASONS = {'candidate', 'reservation_not_started', 'reservation_ended'
 # checks. Automatic release keeps unattended operation possible; the local log keeps the evidence.
 PENDING_MISS_PAUSE = 2
 PENDING_AUTO_RELEASE_CHECKS = 3
+# The align callback runs in the poller thread and writes a diagnostic line; serialize the local
+# log appends so a background line cannot interleave with a main-loop line.
+_LOG_LOCK = threading.Lock()
 # After the first release, keep the original activity's time interval as a local hold so a
 # different lecture at the same time cannot be booked while the first submission is unresolved.
 PENDING_HOLD_SECONDS = 600
 PENDING_RETRY_LIMIT = 2
+
+
+class OpeningMissGuard:
+    """Count opening scans that could not use background data; one missing diagnostic per outage.
+
+    A long reader outage must not append the missing event on every fallback cycle: it is written
+    once per outage and the guard is reset only when fresh data is consumed again. The bounded
+    synchronous fallback is still allowed after ``OPENING_SYNC_FALLBACK_AFTER`` misses, so a
+    broken reader cannot freeze the scan loop.
+    """
+
+    def __init__(self, missing_event: str, fallback_event: str,
+                 diagnostic: Callable[..., None]):
+        self._missing_event = missing_event
+        self._fallback_event = fallback_event
+        self._diagnostic = diagnostic
+        self._rounds = 0
+        self._missing_reported = False
+
+    def reset(self) -> None:
+        self._rounds = 0
+        self._missing_reported = False
+
+    def miss(self) -> bool:
+        """Record one miss; return True when one bounded synchronous fallback is due."""
+        self._rounds += 1
+        if not self._missing_reported:
+            self._missing_reported = True
+            self._diagnostic(self._missing_event)
+        if self._rounds < OPENING_SYNC_FALLBACK_AFTER:
+            return False
+        self._rounds = 0
+        self._diagnostic(self._fallback_event,
+                         after_rounds=OPENING_SYNC_FALLBACK_AFTER)
+        return True
+
+
+@contextmanager
+def bounded_query_budget(target: Any, seconds: float, *, enabled: bool) -> Iterator[None]:
+    """Temporarily cap ``target.timeout`` so a synchronous fallback cannot hold the fast loop."""
+    if not enabled:
+        yield
+        return
+    saved = target.timeout
+    target.timeout = min(float(saved), seconds)
+    try:
+        yield
+    finally:
+        target.timeout = saved
+
+
+def pending_hold_until(start: float, now: float, *, offset_known: bool,
+                       server_offset: float) -> float:
+    """Local-clock hold deadline for an activity start expressed in school time.
+
+    ``start`` comes from the school rows (absolute school-time epoch) while ``now`` and the
+    stored deadline are host-clock based. Before the school clock is calibrated there is no
+    safe conversion, so keep the full local hold instead of expiring at a skewed activity start.
+    """
+    deadline = now + PENDING_HOLD_SECONDS
+    if offset_known:
+        deadline = min(deadline, float(start) - server_offset)
+    return max(deadline, now)
+
+
+def tighten_hold_deadlines(holds: Mapping[str, Any], *, offset_known: bool,
+                           server_offset: float) -> bool:
+    """Tighten stored local-clock hold deadlines once the school clock is known.
+
+    Hold ``start`` values are school-time epochs while ``until`` is host-clock. Before calibration
+    the hold keeps its full local fallback; afterwards it must not outlive the activity start by
+    more than the clock skew. Returns True when a deadline changed.
+    """
+    if not offset_known:
+        return False
+    changed = False
+    for entry in holds.values():
+        if not isinstance(entry, dict) or not isinstance(entry.get('start'), (int, float)):
+            continue
+        start_local = float(entry['start']) - server_offset
+        if start_local < float(entry.get('until', start_local)):
+            entry['until'] = start_local
+            changed = True
+    return changed
 # After the candidate appears, a slow successful submission must not be aborted by the fast list
 # timeout; captcha and submit keep a longer budget while the list stays fast.
 SUBMIT_TIMEOUT = 8
 # A list query during the opening window must survive a briefly overloaded server instead of
 # aborting at 3 s; the timeout still bounds a dead connection and the fast retry re-joins quickly.
 OPENING_QUERY_TIMEOUT = 6
+# Background list/history readers use a short budget during the opening: the golden window is
+# roughly the first second after opening, so a slower response is already too late and a stuck
+# reader must be rebuilt quickly. Normal responses are ~0.03–0.1 s; the observed opening poll
+# took ~0.36 s, which still fits this budget.
+OPENING_BACKGROUND_TIMEOUT = 0.5
+# Opening fast path: never wait for an in-flight background request. After this many consecutive
+# scans without a fresh snapshot, allow one bounded synchronous fallback instead.
+OPENING_SYNC_FALLBACK_AFTER = 3
+OPENING_SYNC_FALLBACK_TIMEOUT = 0.5
+# Ordinary poller failures during an opening are retried at the fast poll cadence (the reader
+# must be rebuilt before the next 0.1 s scan); a server-directed Retry-After still wins.
+OPENING_POLLER_RETRY = FAST_INTERVAL
 # During the opening window, reuse the history fetched immediately before it instead of
 # synchronously refreshing at the opening instant; the trade-off is bounded stale conflict data.
 OPENING_HISTORY_TTL = 60.0
+NORMAL_HISTORY_TTL = 30.0
 # A background read-only activity list fetched by the poller is used only while this fresh; a
 # stale snapshot falls back to a normal synchronous query.
 POLLER_SNAPSHOT_MAX_AGE = 0.75
@@ -66,12 +169,6 @@ POLLER_SNAPSHOT_MAX_AGE = 0.75
 # fetched before it may already be stale. Re-consume a newer poller snapshot above this age
 # difference before selecting candidates.
 HISTORY_LIST_REFRESH_AFTER = 0.5
-# A stale snapshot with a poll in flight is usually about to be replaced: wait briefly for that
-# poll instead of racing it with a duplicate synchronous list query.
-POLLER_FALLBACK_WAIT = 0.3
-# If the fallback wait times out while the reader is still querying, wait for that single
-# in-flight request instead of racing it with a duplicate synchronous list query.
-POLLER_INFLIGHT_WAIT = OPENING_QUERY_TIMEOUT
 # Background refresh of "my activities" during opening windows: keeps the history cache fresh so a
 # slow history query never sits between a candidate appearing and its submission. The main loop
 # only consumes a snapshot that is recent and error-free; a failed refresh simply ages out and the
@@ -86,6 +183,9 @@ HISTORY_REFRESH_MIN_INTERVAL = 2.0
 PREPARATION_MAX_UNCERTAINTY = 2.0
 # After a poller failure, do not recreate it for at least this long (server Retry-After wins).
 POLLER_RETRY_MIN_SECONDS = 5.0
+# The opening fast path retries a failed reader quickly; throttle its local diagnostic so a
+# persistent network fault cannot append one line every 0.1 s.
+BACKGROUND_READER_DIAG_INTERVAL = 5.0
 # Treat 502/503/504 as temporary service failures; they do not establish overload or rate limiting.
 # Explicit Retry-After still wins.
 OVERLOAD_RETRY_CAP = 5.0
@@ -193,7 +293,7 @@ def progress_rows(history: list[dict[str, Any]], holds: Mapping[str, Any] | None
             continue
         category = entry.get('category')
         if not isinstance(category, str) or not category:
-            raise ValueError('attendance_category_unknown')
+            raise AttendanceCategoryUnknown(wid)
         try:
             start = datetime.fromtimestamp(float(entry['start']), SHANGHAI)
             end = datetime.fromtimestamp(float(entry['end']), SHANGHAI)
@@ -247,19 +347,23 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
                       now: float, *, cooldown_clock_known: bool = True,
                       holds: list[Mapping[str, Any]] | None = None
                       ) -> tuple[list[Lecture], list[dict[str, Any]]]:
-    booked = {activity_id(row) for row in mine if reserved(row)}
-    conflicts = [interval(row) for row in mine if reserved(row)]
+    booked = {activity_id(row) for row in mine if confirmed_reservation(row)}
+    conflicts = [interval(row) for row in mine if confirmed_reservation(row)]
     candidates: list[Lecture] = []
     details: list[dict[str, Any]] = []
     seen: dict[str, dict[str, Any]] = {}
     categories = tuple(category_name(value) for value in settings.categories)
     for row in rows:
+        try:
+            identity = {'wid': activity_id(row)}
+        except ValueError:
+            identity = {}
         category = category_name(row.get('JZXL_DISPLAY', row.get('HDLX_DISPLAY')))
         if test_notice(row):
             title = row.get('JZMC', row.get('HDMC'))
             details.append(dict(title=title if isinstance(title, str) else '',
                                 reason='notice_test_only',
-                                reservation_start=None, reservation_end=None))
+                                reservation_start=None, reservation_end=None, **identity))
             continue
         if isinstance(category, str) and category.strip() and category not in categories:
             window: dict[str, str | None] = {}
@@ -271,7 +375,7 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
                     window[key] = None
             title = row.get('JZMC', row.get('HDMC'))
             details.append(dict(title=title if isinstance(title, str) else '',
-                                reason='category_not_allowed', **window))
+                                reason='category_not_allowed', **window, **identity))
             continue
         try:
             wid = activity_id(row)
@@ -287,7 +391,7 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
             window = {key: moment(row[field]).isoformat(timespec='seconds') if row.get(field) is not None else None
                       for key, field in (('reservation_start', 'YYKSSJ'), ('reservation_end', 'YYJSSJ'))}
             details.append(dict(title=row.get('JZMC', row.get('HDMC')),
-                                reason='invalid_activity_time', **window))
+                                reason='invalid_activity_time', **window, **identity))
             continue
         held = next((item for item in holds or [] if item.get('activity') == lecture.wid), None)
         hold_conflict = any(item.get('activity') != lecture.wid
@@ -295,9 +399,7 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
                             for item in holds or [])
         hold_retry = held is not None and (held.get('confirmed') is True
                                            or int(held.get('attempts', 0)) >= PENDING_RETRY_LIMIT)
-        if lecture.availability != 'candidate':
-            reason = lecture.availability
-        elif lecture.wid in booked:
+        if lecture.wid in booked or lecture.availability == 'already_reserved':
             reason = 'already_reserved'
         elif not current.needs(lecture.category):
             reason = 'category_not_needed'
@@ -317,10 +419,12 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
             reason = 'retry_limit'
         elif lecture.wid in cooldowns and (not cooldown_clock_known or cooldowns[lecture.wid] > now):
             reason = 'cooldown'
+        elif lecture.availability != 'candidate':
+            reason = lecture.availability
         else:
             reason = 'candidate'
             candidates.append(lecture)
-        details.append(dict(title=lecture.title, reason=reason,
+        details.append(dict(wid=lecture.wid, title=lecture.title, reason=reason,
             reservation_start=lecture.reservation_start.isoformat(timespec='seconds') if lecture.reservation_start else None,
             reservation_end=lecture.reservation_end.isoformat(timespec='seconds') if lecture.reservation_end else None))
     candidates.sort(key=lambda row: (row.category not in current.missing,
@@ -332,35 +436,67 @@ def opening_windows(details: list[dict[str, Any]]) -> list[tuple[float, float]]:
     openings: list[tuple[float, float]] = []
     for item in details if isinstance(details, list) else []:
         if not isinstance(item, dict) or item.get('reason') not in (
-                'reservation_not_started', 'candidate', 'capacity_full', 'not_reservable'):
+                'reservation_not_started', 'candidate', 'capacity_full'):
             continue
         try:
             start = datetime.fromisoformat(item['reservation_start'])
             end = (datetime.fromisoformat(item['reservation_end']) if item.get('reservation_end')
-                   else start + timedelta(minutes=10))
+                   else start + timedelta(minutes=5))
             if start.tzinfo is None or end.tzinfo is None or end <= start:
                 continue
-            openings.append((start.timestamp(), min(end.timestamp(), start.timestamp() + 600)))
+            openings.append((start.timestamp(), min(end.timestamp(), start.timestamp() + 300)))
         except (KeyError, TypeError, ValueError, OverflowError):
             continue
     return openings
 
 
-def merge_openings(known: list[tuple[float, float]], details: list[dict[str, Any]],
-                   now: float) -> list[tuple[float, float]]:
-    """Keep known, unexpired windows even when the latest valid list happens to be empty."""
-    merged = {window for window in known if window[1] >= now - 1}
-    merged.update(opening_windows(details))
-    return sorted(merged)[:128]
+def merge_openings(known: dict[str | int, dict[str, Any]], details: list[dict[str, Any]],
+                   now: float) -> dict[str | int, dict[str, Any]]:
+    """Keep missing targets, but retire targets with an explicit reservation/filter result."""
+    merged: dict[str | int, dict[str, Any]] = {}
+    for key, item in known.items():
+        windows = opening_windows([{**item, 'reason': 'candidate'}])
+        if windows and windows[0][1] >= now - 1:
+            merged[key] = item
+    for index, item in enumerate(details if isinstance(details, list) else []):
+        if not isinstance(item, dict) or item.get('reason') == 'invalid_activity_time':
+            continue
+        if not opening_windows([{**item, 'reason': 'candidate'}]):
+            continue
+        wid = item.get('wid')
+        if known and not isinstance(wid, str):
+            continue
+        key = wid if isinstance(wid, str) and wid else index
+        if isinstance(key, str) and key not in merged:
+            # Older selection snapshots lack IDs; bind one matching old row, including duplicates.
+            legacy = next((old for old, value in merged.items() if isinstance(old, int)
+                           and value.get('title') == item.get('title')
+                           and value.get('reservation_start') == item.get('reservation_start')
+                           and value.get('reservation_end') == item.get('reservation_end')), None)
+            if legacy is not None:
+                merged.pop(legacy)
+        merged[key] = item
+    return merged
+
+
+def opening_intervals(openings: list[tuple[float, float]], now: float) -> tuple[float, float] | None:
+    active = [(start, end) for start, end in openings
+              if start - 30 <= now < min(end, start + 300)]
+    if not active:
+        return None
+    return (0.05, 0.10) if any(start - 5 <= now < start + 9 for start, _ in active) else (0.5, 1.5)
 
 
 def scan_delay(details: list[dict[str, Any]], now: float, elapsed: float,
                interval: float, known: list[tuple[float, float]] | None = None) -> tuple[float, bool]:
     openings = opening_windows(details) if known is None else known
-    fast = any(start - 30 <= now <= end for start, end in openings)
-    delay = max(0, min(interval, FAST_INTERVAL) - elapsed) if fast else interval
-    boundaries = [start - 30 - now for start, _ in openings if start - 30 > now]
-    return min([delay, *boundaries]), fast
+    bounds = opening_intervals(openings, now)
+    target = random.uniform(*(bounds or (interval - 1, interval + 1)))
+    delay = max(0, target - elapsed) if bounds is not None else target
+    boundaries = [boundary - now for start, end in openings
+                  for boundary in (start - 30, start - 5, min(start + 9, end), min(end, start + 300))
+                  if boundary > now]
+    return min([delay, *boundaries]), bounds is not None
 
 
 def _school_offset(rows: list[dict[str, Any]], now: float) -> float | None:
@@ -475,7 +611,7 @@ def resolve_pending(settings: Settings, *, session: Any = None,
         if pending_wid in booked:
             task.data.update(status='scanning', activity='')
             for field in ('pending_checks', 'pending_since', 'pending_start', 'pending_end',
-                          'pending_category'):
+                          'pending_category', 'pending_unconfirmed_notified'):
                 task.data.pop(field, None)
             holds = task.data.get('holds')
             if isinstance(holds, dict):
@@ -522,6 +658,10 @@ def run(settings: Settings, *, session: Any = None,
         checkpoint: Task | None = None) -> int:
     environ = os.environ if environ is None else environ
     announced: set[str] = set()
+    # Alerts this process already recorded (even when a persisted alert suppressed the mail); the
+    # authentication-rejected fallback uses it to avoid writing a second event line when the
+    # client already announced (and recorded) it.
+    announced_here: set[str] = set()
     alerts: dict[str, float] = {}
     deferred_mail: list[str] = []
     mail_blocked = False
@@ -537,6 +677,12 @@ def run(settings: Settings, *, session: Any = None,
     # Completed-poll version consumed by the last list read: the opening wait only wakes for
     # polls newer than this.
     consumed_polls = 0
+    # True once a background list reader has actually started; a missing reader after that
+    # (recycled thread or rebuild cooldown) must go through the opening miss guard instead of
+    # taking the legacy synchronous path immediately.
+    poller_started_once = False
+    # Last time each background reader failure was written to diagnostics (throttled in opening).
+    reader_diag_logged_at: dict[str, float] = {}
     # Local time the last consumed list request started, for candidate data-age metrics.
     last_rows_started = 0.0
     # Local time the last synchronous list request started. Opening-window fallbacks are spaced by
@@ -558,11 +704,8 @@ def run(settings: Settings, *, session: Any = None,
     history_client: Client | None = None
     history_retry_at = 0.0
     history_refresh_at = 0.0
-    # Completed-poll version whose reaching satisfies the outstanding history refresh request
-    # (0: none pending). Recorded from request_refresh() instead of a counter snapshot taken
-    # before the call, so a poll completing around the request is not mistaken for "not pending".
-    history_refresh_target = 0
-    # Reader instance that produced the target: a recycled reader restarts its poll counter.
+    # Reader instance that produced the current refresh throttle window: a recycled reader must
+    # be allowed to refresh immediately instead of inheriting the old reader's throttle.
     history_refresh_poller: ActivityPoller | None = None
 
     def close_session(session: Any) -> None:
@@ -652,7 +795,8 @@ def run(settings: Settings, *, session: Any = None,
     final_phase = 'stopped'
     stage = 'configuration'
     snapshot: dict[str, Any] = dict(phase='starting', last_query_at=0, last_error='none',
-        last_error_at=0, failure_count=0, next_check_at=0, mail_status='disabled',
+        last_error_at=0, last_error_active=False, failure_count=0, next_check_at=0,
+        mail_status='disabled',
         last_mail_at=0, last_mail_status='never', last_mail_error='none', last_mail_event='none',
         last_mail_duration_seconds=None, activity_count=None, candidate_count=None)
     health_written_at = 0.0
@@ -676,6 +820,11 @@ def run(settings: Settings, *, session: Any = None,
         health_written_phase = snapshot['phase']
     def health(**changes: Any) -> None:
         nonlocal health_dirty
+        if 'last_error' in changes:
+            changes['last_error_active'] = changes['last_error'] != 'none'
+        elif changes.get('last_query_at'):
+            # A completed query clears the current-error flag while the old code/time remains.
+            changes['last_error_active'] = False
         snapshot.update(changes, updated_at=clock())
         if task is None:
             return
@@ -707,9 +856,11 @@ def run(settings: Settings, *, session: Any = None,
         if check_only:
             return
         try:
-            fd = open_nofollow(settings.state_dir / 'events.log', os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-            with os.fdopen(fd, 'a') as target:
-                target.write(f'{clock():.0f} event={event}\n')
+            with _LOG_LOCK:
+                fd = open_nofollow(settings.state_dir / 'events.log',
+                                   os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+                with os.fdopen(fd, 'a') as target:
+                    target.write(f'{clock():.0f} event={event}\n')
         except OSError:
             print('event=local_log_failed', flush=True)
     def diagnostic(event: str, **fields: Any) -> None:
@@ -717,13 +868,21 @@ def run(settings: Settings, *, session: Any = None,
         if check_only:
             return
         try:
-            fd = open_nofollow(settings.state_dir / 'diagnostics.jsonl',
-                               os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-            with os.fdopen(fd, 'a') as target:
-                target.write(json.dumps(dict(at=clock(), event=event, **fields),
-                                        ensure_ascii=False, allow_nan=False) + '\n')
+            line = json.dumps(dict(at=clock(), event=event, **fields),
+                              ensure_ascii=False, allow_nan=False)
+            with _LOG_LOCK:
+                fd = open_nofollow(settings.state_dir / 'diagnostics.jsonl',
+                                   os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+                with os.fdopen(fd, 'a') as target:
+                    target.write(line + '\n')
         except (OSError, ValueError):
             record('diagnostic_write_failed')
+    # Consecutive opening scans that could not consume fresh background data; the guard allows one
+    # bounded synchronous fallback after several misses and keeps its diagnostic to one per outage.
+    snapshot_guard = OpeningMissGuard('opening_snapshot_missing', 'opening_sync_fallback',
+                                      diagnostic)
+    history_guard = OpeningMissGuard('opening_history_missing',
+                                     'opening_history_sync_fallback', diagnostic)
     def load_recognizer() -> Callable[[bytes], str]:
         # Load the OCR model once before an opening: first use inside a submission path costs
         # roughly 1-2 s and is paid exactly at the worst moment.
@@ -784,7 +943,12 @@ def run(settings: Settings, *, session: Any = None,
             return
         if event not in MAJOR_MAIL_EVENTS:
             return
-        alert = 'task_failed' if event == 'unexpected_failure' else event
+        alert = ('task_failed' if event in ('unexpected_failure', 'authentication_rejected')
+                 else event)
+        # Record that this process already handled the alert before the persisted dedupe can return
+        # early: the authentication-rejected fallback must not write a second event line after a
+        # restart that reloaded the alert from task.json.
+        announced_here.add(alert)
         if alert in announced:
             return
         announced.add(alert)
@@ -857,9 +1021,11 @@ def run(settings: Settings, *, session: Any = None,
             raise ValueError('state_invalid')
         entry = holds.get(wid)
         if not isinstance(entry, dict):
-            until = min(float(start), clock() + PENDING_HOLD_SECONDS)
-            entry = dict(start=float(start), end=float(end), since=clock(),
-                         until=max(float(until), clock()), attempts=0, confirmed=False)
+            now = clock()
+            until = pending_hold_until(start, now, offset_known=offset_known,
+                                       server_offset=server_offset)
+            entry = dict(start=float(start), end=float(end), since=now,
+                         until=until, attempts=0, confirmed=False)
             holds[wid] = entry
         if category and not entry.get('category'):
             entry['category'] = category
@@ -960,9 +1126,16 @@ def run(settings: Settings, *, session: Any = None,
         task.data['reservations'] = dict(at=at, items=items)
         health_dirty = True
 
-    def query_mine() -> list[dict[str, Any]]:
+    def query_mine(*, bounded: bool = True) -> list[dict[str, Any]]:
         assert client is not None
-        rows = client.mine()
+        # In the opening window a synchronous history read must not hold the fast loop for
+        # seconds; the background refresher is the normal path, this is only a bounded fallback.
+        # Prewarm is the exception: it has its own deadline (never past the opening instant) and
+        # must not be squeezed to the 0.5 s fallback budget, or the documented 1.5 s prewarm
+        # budget could never be used on a slow history response.
+        with bounded_query_budget(client, OPENING_SYNC_FALLBACK_TIMEOUT,
+                                  enabled=bounded and opening_scan and background_poller):
+            rows = client.mine()
         remember_reservations(rows, clock())
         return rows
     try:
@@ -990,7 +1163,9 @@ def run(settings: Settings, *, session: Any = None,
             current = progress(mine, clock())
             stage = 'activities'
             _, selection_details = select_candidates(client.activities(), settings, current, mine, {}, clock())
-            print('activity_details=' + json.dumps(selection_details, ensure_ascii=False), flush=True)
+            public_details = [{key: value for key, value in item.items() if key != 'wid'}
+                              for item in selection_details]
+            print('activity_details=' + json.dumps(public_details, ensure_ascii=False), flush=True)
             stage = 'captcha'
             client.captcha()
             print('event=read_only_complete', flush=True)
@@ -1056,6 +1231,10 @@ def run(settings: Settings, *, session: Any = None,
         authenticated = False
         failures = 0
         unconfirmed_checks = 0
+        # The unconfirmed event is per pending episode. The marker lives in task.data: a fast-path
+        # miss resets pending_checks (absence is unproven) and a process restart reloads the state,
+        # so a process-local flag would announce the same episode again in both cases.
+        # It is cleared whenever a new pending episode starts and whenever one is resolved.
         last_timing_at = 0.0
         server_offset = 0.0
         offset_known = False
@@ -1166,44 +1345,26 @@ def run(settings: Settings, *, session: Any = None,
             starts; copying that would leave the background reader with a slower timeout forever.
             """
             clone = client.clone_readonly()
-            clone.timeout = OPENING_QUERY_TIMEOUT
+            clone.timeout = OPENING_BACKGROUND_TIMEOUT
             return clone
 
         def trigger_history_refresh() -> bool:
-            """Ask the history thread to refresh now, throttled; True when a request was sent.
-
-            The target version returned by the reader is kept separately from the throttle: a
-            throttled trigger must not forget a refresh that is already pending. Readers that
-            predate the versioned request (or test doubles) return ``None``; their next completed
-            poll is then treated as the satisfying one.
-            """
-            nonlocal history_refresh_at, history_refresh_target, history_refresh_poller
+            """Ask the history thread to refresh now, throttled; True when a request was sent."""
+            nonlocal history_refresh_at, history_refresh_poller
             poller = history_poller
             refresh = getattr(poller, 'request_refresh', None)
             if poller is None or not poller.running or not callable(refresh):
                 return False
             if poller is not history_refresh_poller:
-                # A recreated reader counts polls from zero; an old target would wait forever.
+                # A recreated reader must not inherit the old reader's throttle window.
                 history_refresh_poller = poller
-                history_refresh_target = 0
                 history_refresh_at = 0.0
             now = clock()
             if now - history_refresh_at < HISTORY_REFRESH_MIN_INTERVAL:
                 return False
             history_refresh_at = now
-            before = int(getattr(poller, 'polls', 0) or 0)
-            target = refresh()
-            if not isinstance(target, int) or isinstance(target, bool):
-                target = before + 1
-            history_refresh_target = max(history_refresh_target, target)
+            refresh()
             return True
-
-        def history_refresh_pending() -> bool:
-            """True while the requested refresh target has not been reached yet."""
-            poller = history_poller
-            return (poller is not None and poller is history_refresh_poller
-                    and poller.running and history_refresh_target > 0
-                    and int(getattr(poller, 'polls', 0) or 0) < history_refresh_target)
 
         def accept_background_history(snapshot: Any) -> bool:
             """Consume one fresh, structurally valid history snapshot; True when accepted."""
@@ -1230,8 +1391,13 @@ def run(settings: Settings, *, session: Any = None,
 
             Local-only: a recycled reader is not an event or mail-worthy condition, but without
             this it is invisible (``poller_polls`` resets and the scan falls back silently). The
-            fixed reason code keeps server text, titles and IDs out of the log.
+            fixed reason code keeps server text, titles and IDs out of the log. The opening fast
+            path recreates a failed reader every 0.1 s, so this diagnostic is throttled locally.
             """
+            now = clock()
+            if now - reader_diag_logged_at.get(reader, float('-inf')) < BACKGROUND_READER_DIAG_INTERVAL:
+                return
+            reader_diag_logged_at[reader] = now
             diagnostic('background_reader_stopped', reader=reader,
                        reason=getattr(snapshot, 'reason', None) or snapshot.error,
                        server_directed=snapshot.server_directed,
@@ -1240,6 +1406,7 @@ def run(settings: Settings, *, session: Any = None,
         def sync_poller(active: bool) -> None:
             """Run the read-only poller only while the opening window is active."""
             nonlocal activity_poller, poller_client, poller_retry_at, poller_allowed
+            nonlocal poller_started_once
             if shared_wait_pending():
                 stop_poller()
                 stop_history_poller()
@@ -1258,7 +1425,8 @@ def run(settings: Settings, *, session: Any = None,
                     reader_stopped('activities', snapshot)
                     poller_retry_at = max(
                         poller_retry_at,
-                        clock() + max(POLLER_RETRY_MIN_SECONDS, snapshot.retry_after))
+                        clock() + max(OPENING_POLLER_RETRY if active else POLLER_RETRY_MIN_SECONDS,
+                                      snapshot.retry_after))
                     absorb_poller_wait()
                 stop_poller()
             if clock() < poller_retry_at:
@@ -1267,9 +1435,14 @@ def run(settings: Settings, *, session: Any = None,
                 poller_client = background_client()
             session = getattr(poller_client, 'session', None)
             activity_poller = ActivityPoller(poller_client.activities,
-                                             interval=FAST_INTERVAL, clock=clock,
+                                             interval=query_interval, clock=clock,
                                              gate=wait_gate,
-                                             on_exit=functools.partial(close_session, session))
+                                             on_exit=functools.partial(close_session, session),
+                                             on_align=lambda target, actual, delta: diagnostic(
+                                                 'poller_aligned', target=round(target, 3),
+                                                 actual=round(actual, 3),
+                                                 delta_seconds=round(delta, 3)))
+            poller_started_once = True
             activity_poller.start()
             align_poller()
 
@@ -1294,7 +1467,8 @@ def run(settings: Settings, *, session: Any = None,
                     reader_stopped('history', snapshot)
                     history_retry_at = max(
                         history_retry_at,
-                        clock() + max(POLLER_RETRY_MIN_SECONDS, snapshot.retry_after))
+                        clock() + max(OPENING_POLLER_RETRY if active else POLLER_RETRY_MIN_SECONDS,
+                                      snapshot.retry_after))
                     absorb_history_wait()
                 stop_history_poller()
             if shared_wait_pending():
@@ -1316,6 +1490,15 @@ def run(settings: Settings, *, session: Any = None,
                                                 clock=clock, gate=wait_gate,
                                                 on_exit=functools.partial(close_session, session))
             history_poller.start()
+
+        def query_interval() -> float:
+            return scan_delay([], clock() + server_offset, 0, SCAN_INTERVAL, known_openings)[0]
+
+        def list_snapshot_max_age() -> float:
+            bounds = opening_intervals(known_openings, clock() + server_offset)
+            # A scheduled 1.5 s gap in the slower phase must not trigger extra fallback queries.
+            return max(POLLER_SNAPSHOT_MAX_AGE,
+                       bounds[1] + OPENING_BACKGROUND_TIMEOUT if bounds else 0)
 
         def list_rows() -> tuple[list[dict[str, Any]], float, str, float, float, float]:
             """Prefer a fresh poller snapshot; fall back to a synchronous query.
@@ -1339,7 +1522,8 @@ def run(settings: Settings, *, session: Any = None,
 
             snapshot, version = current_pair()
             if (poller is not None and snapshot is not None and snapshot.error is None
-                    and 0 <= clock() - snapshot.at <= POLLER_SNAPSHOT_MAX_AGE):
+                    and 0 <= clock() - snapshot.at <= list_snapshot_max_age()):
+                snapshot_guard.reset()
                 poller_allowed = True
                 consumed_polls = version
                 started = getattr(snapshot, 'started', 0.0) or snapshot.at
@@ -1347,46 +1531,19 @@ def run(settings: Settings, *, session: Any = None,
                 rows_snapshot_at = snapshot.at
                 return (snapshot.rows, 0.0, 'poller', max(0.0, clock() - snapshot.at),
                         getattr(snapshot, 'seconds', 0.0) or 0.0, max(0.0, clock() - started))
-            if snapshot is not None and snapshot.error is not None:
+            if opening_scan and background_poller and (poller is not None or poller_started_once):
+                # Opening fast path: the background reader owns the request, so never block the
+                # scan loop waiting for it. A missing reader (recycled or in rebuild cooldown)
+                # also counts as a miss instead of taking the legacy synchronous path immediately;
+                # returning 'none' keeps the phase cadence until the bounded fallback is due.
+                if snapshot is not None and snapshot.error is not None:
+                    absorb_poller_wait()
+                poller_wait_error()
+                if not snapshot_guard.miss():
+                    return [], 0.0, 'none', 0.0, 0.0, 0.0
+            elif snapshot is not None and snapshot.error is not None:
+                # A stale reader error must not be trusted when a synchronous read follows.
                 absorb_poller_wait()
-            else:
-                # A request is likely in flight; wait briefly for it instead of racing it with a
-                # duplicate synchronous query. Bounded, and only for the normal (non-error) case.
-                waiter = getattr(poller, 'wait_update', None)
-                if poller is not None and poller.running and waiter is not None:
-                    if waiter(POLLER_FALLBACK_WAIT, version):
-                        snapshot, version = current_pair()
-                        if (snapshot is not None and snapshot.error is None
-                                and 0 <= clock() - snapshot.at <= POLLER_SNAPSHOT_MAX_AGE):
-                            poller_allowed = True
-                            consumed_polls = version
-                            started = getattr(snapshot, 'started', 0.0) or snapshot.at
-                            last_rows_started = started
-                            rows_snapshot_at = snapshot.at
-                            return (snapshot.rows, 0.0, 'poller',
-                                    max(0.0, clock() - snapshot.at),
-                                    getattr(snapshot, 'seconds', 0.0) or 0.0,
-                                    max(0.0, clock() - started))
-                        if snapshot is not None and snapshot.error is not None:
-                            absorb_poller_wait()
-                    elif poller.running:
-                        # The reader is still querying: wait for that single in-flight request
-                        # rather than issuing a duplicate synchronous list query.
-                        if waiter(POLLER_INFLIGHT_WAIT, version):
-                            snapshot, version = current_pair()
-                            if (snapshot is not None and snapshot.error is None
-                                    and 0 <= clock() - snapshot.at <= POLLER_SNAPSHOT_MAX_AGE):
-                                poller_allowed = True
-                                consumed_polls = version
-                                started = getattr(snapshot, 'started', 0.0) or snapshot.at
-                                last_rows_started = started
-                                rows_snapshot_at = snapshot.at
-                                return (snapshot.rows, 0.0, 'poller',
-                                        max(0.0, clock() - snapshot.at),
-                                        getattr(snapshot, 'seconds', 0.0) or 0.0,
-                                        max(0.0, clock() - started))
-                            if snapshot is not None and snapshot.error is not None:
-                                absorb_poller_wait()
             # The server already told the background poller to wait; do not send another
             # list request inside that window just because the background thread stopped.
             poller_wait_error()
@@ -1402,7 +1559,10 @@ def run(settings: Settings, *, session: Any = None,
                 poller_wait_error()
             started = clock()
             last_sync_query_at = started
-            rows = client.activities()
+            # Bounded fallback: a slow server must not hold the fast loop for seconds.
+            with bounded_query_budget(client, OPENING_SYNC_FALLBACK_TIMEOUT,
+                                      enabled=opening_scan and background_poller):
+                rows = client.activities()
             duration = max(0, clock() - started)
             poller_allowed = True
             last_rows_started = started
@@ -1423,7 +1583,7 @@ def run(settings: Settings, *, session: Any = None,
             if snapshot is None or snapshot.error is not None:
                 return None
             age = clock() - snapshot.at
-            if not (0 <= age <= POLLER_SNAPSHOT_MAX_AGE):
+            if not (0 <= age <= list_snapshot_max_age()):
                 return None
             if version <= consumed_polls and snapshot.at <= rows_snapshot_at:
                 return None
@@ -1483,7 +1643,7 @@ def run(settings: Settings, *, session: Any = None,
                     started = clock()
                     try:
                         # Keep the submit session warm and refresh the history the opening reuses.
-                        history = query_mine()
+                        history = query_mine(bounded=False)
                         mine_at = clock()
                         mine_seconds = max(0, clock() - started)
                         refresh_mine = True
@@ -1550,14 +1710,15 @@ def run(settings: Settings, *, session: Any = None,
         previous_selection = task.data.get('selection')
         details: list[dict[str, Any]] = (previous_selection.get('activities', [])
                                          if isinstance(previous_selection, dict) else [])
-        known_openings: list[tuple[float, float]] = opening_windows(details)
+        known_targets = merge_openings({}, details, clock() + server_offset)
+        known_openings = sorted(set(opening_windows(list(known_targets.values()))))[:128]
         while True:
             try:
                 check_stopped()
                 scan_started = clock()
                 school_now = clock() + server_offset
                 known_openings = [window for window in known_openings if window[1] >= school_now - 1]
-                opening_scan = scan_delay(details, school_now, 0, SCAN_INTERVAL, known_openings)[1]
+                opening_scan = opening_intervals(known_openings, school_now) is not None
                 client.timeout = OPENING_QUERY_TIMEOUT if opening_scan else 10
                 mail_blocked = opening_scan
                 activities_source = 'query'
@@ -1597,16 +1758,24 @@ def run(settings: Settings, *, session: Any = None,
                                    and 0 <= clock() - mine_at < HISTORY_BACKGROUND_FRESH)
                     if not background_fresh and not cache_fresh:
                         trigger_history_refresh()
+                # Holds store local-clock deadlines. Once the school clock is known, tighten any
+                # hold created before calibration to the activity start converted into the host
+                # clock. This also runs while a submission is pending: a hold can outlive the
+                # pending check, and waiting for it to resolve would keep the full 600 s fallback.
+                holds_now = hold_entries()
+                adjusted = tighten_hold_deadlines(holds_now, offset_known=offset_known,
+                                                  server_offset=server_offset)
                 if task.data['status'] != 'pending':
-                    holds_now = hold_entries()
+                    now = clock()
                     expired = [wid for wid, entry in holds_now.items()
-                               if isinstance(entry, dict) and clock() >= float(entry.get('until', 0))]
+                               if isinstance(entry, dict) and now >= float(entry.get('until', 0))]
                     for wid in expired:
                         holds_now.pop(wid, None)
                         diagnostic('reservation_hold_expired', wid=wid)
                         record('reservation_hold_expired')
-                    if expired:
-                        task.save()
+                    adjusted = adjusted or bool(expired)
+                if adjusted:
+                    task.save()
                 confirmed = False
                 mine_seconds = 0.0
                 refresh_mine = False
@@ -1617,6 +1786,7 @@ def run(settings: Settings, *, session: Any = None,
                     # evidence here.
                     pending_wid = task.data['activity']
                     rows = None
+                    activities_source = 'none'
                     pending_history: list[dict[str, Any]] | None = None
                     pending_error: BaseException | None = None
                     confirmed_newly = False
@@ -1666,6 +1836,44 @@ def run(settings: Settings, *, session: Any = None,
                                            age_seconds=round(clock() - poller_snapshot.at, 3))
                             break
 
+                    # The two-source check cannot advance without a usable activity list. In the
+                    # opening fast path, probe that source before paying for a history query: with
+                    # no fresh snapshot it returns 'none' without a request (until the bounded
+                    # fallback is due), whereas querying history every 0.1 s round would multiply
+                    # requests while the check can never complete. A probe that actually fails is
+                    # different: history may still carry positive evidence, so fall through and let
+                    # the normal error handling abort the check.
+                    probed_rows: list[dict[str, Any]] | None = None
+                    probed_error: BaseException | None = None
+                    probed_source = 'none'
+                    probe_none = False
+                    if not confirmed and opening_scan and background_poller:
+                        try:
+                            probed_rows, _, activities_source, _, _, _ = list_rows()
+                            probed_source = activities_source
+                        except (RemoteError, ValueError) as exc:
+                            probed_rows = None
+                            probed_error = exc
+                            if server_wait_error(exc):
+                                # 429/Retry-After applies to every request: honour it before the
+                                # history query instead of sending one inside the requested wait.
+                                abandon_check(exc)
+                        else:
+                            probe_none = activities_source == 'none'
+                    if probe_none:
+                        # Nothing failed; the background reader just has no fresh snapshot yet.
+                        # Absence is unproven, so reset the saved count and keep the phase cadence.
+                        # The list probe above still runs, so the miss guard can reach its bounded
+                        # synchronous fallback while the history request stays off the fast path.
+                        if task.data.pop('pending_checks', None) is not None:
+                            task.save()
+                        unconfirmed_checks = 0
+                        delay = query_interval()
+                        health(phase='waiting', next_check_at=clock() + delay)
+                        sync_poller(True)
+                        sleep(delay)
+                        continue
+
                     if not confirmed:
                         health(phase='my_activities', next_check_at=0)
                         mine_started = clock()
@@ -1695,13 +1903,40 @@ def run(settings: Settings, *, session: Any = None,
                             abandon_check(exc)
                     if pending_wid not in booked and not confirmed:
                         health(phase='activities', next_check_at=0)
-                        try:
-                            rows, _, activities_source, _, _, _ = list_rows()
-                        except (RemoteError, ValueError) as exc:
-                            if server_wait_error(exc):
-                                abandon_check(exc)
-                            pending_error = pending_error or exc
-                            source_complete = False
+                        list_error: BaseException | None = None
+                        if probed_rows is not None or probed_error is not None:
+                            # Reuse the probe: neither reading the list twice nor falling back to
+                            # the legacy 'none' branch is needed here.
+                            rows = probed_rows
+                            activities_source = probed_source if probed_rows is not None else 'none'
+                            list_error = probed_error
+                            if list_error is not None:
+                                if server_wait_error(list_error):
+                                    abandon_check(list_error)
+                                pending_error = pending_error or list_error
+                                source_complete = False
+                        else:
+                            try:
+                                rows, _, activities_source, _, _, _ = list_rows()
+                            except (RemoteError, ValueError) as exc:
+                                rows = None
+                                list_error = exc
+                                if server_wait_error(exc):
+                                    abandon_check(exc)
+                                pending_error = pending_error or exc
+                                source_complete = False
+                        if activities_source == 'none' and list_error is None:
+                            # Defensive path for injected readers: nothing failed but the source is
+                            # unavailable, so the check cannot prove absence. Keep the original
+                            # no-fabricated-error behaviour.
+                            if task.data.pop('pending_checks', None) is not None:
+                                task.save()
+                            unconfirmed_checks = 0
+                            delay = query_interval()
+                            health(phase='waiting', next_check_at=clock() + delay)
+                            sync_poller(True)
+                            sleep(delay)
+                            continue
                         if rows is not None and conflicting_records(rows):
                             # The activity list cannot rule the pending activity in or out.
                             abandon_check(RemoteError('activity_schema_unknown'))
@@ -1738,8 +1973,9 @@ def run(settings: Settings, *, session: Any = None,
                             source = confirmed_override
                             need_emit = confirmed_newly
                         elif pending_history is not None and pending_wid in booked:
-                            entry = hold_entries().get(pending_wid)
-                            already = bool(isinstance(entry, dict) and entry.get('confirmed'))
+                            confirmed_entry = hold_entries().get(pending_wid)
+                            already = bool(isinstance(confirmed_entry, dict)
+                                           and confirmed_entry.get('confirmed'))
                             holds = task.data.get('holds')
                             if isinstance(holds, dict):
                                 holds.pop(pending_wid, None)
@@ -1750,7 +1986,8 @@ def run(settings: Settings, *, session: Any = None,
                             need_emit = confirmed_newly
                         task.data.update(status='scanning', activity='')
                         for field in ('pending_checks', 'pending_since', 'pending_start',
-                                      'pending_end', 'pending_category'):
+                                      'pending_end', 'pending_category',
+                                      'pending_unconfirmed_notified'):
                             task.data.pop(field, None)
                         task.save()
                         clear_alert('reservation_unconfirmed')
@@ -1776,9 +2013,16 @@ def run(settings: Settings, *, session: Any = None,
                             task.data['pending_since'] = clock()
                         unconfirmed_checks = int(task.data.get('pending_checks', 0)) + 1
                         task.data['pending_checks'] = unconfirmed_checks
+                        announce_unconfirmed = (unconfirmed_checks == 1
+                                                and not task.data.get('pending_unconfirmed_notified'))
+                        if announce_unconfirmed:
+                            # Persist the marker in the same save as the count so a restart or a
+                            # fast-path miss cannot announce the same episode twice; starting a
+                            # new pending episode clears it.
+                            task.data['pending_unconfirmed_notified'] = True
                         task.save()
                         diagnostic('reservation_checked', wid=pending_wid, checks=unconfirmed_checks)
-                        if unconfirmed_checks == 1:
+                        if announce_unconfirmed:
                             emit('reservation_unconfirmed')
                         if unconfirmed_checks >= PENDING_AUTO_RELEASE_CHECKS:
                             started = task.data.get('pending_start')
@@ -1792,7 +2036,8 @@ def run(settings: Settings, *, session: Any = None,
                                             save=False)
                                 task.data.update(status='scanning', activity='')
                                 for field in ('pending_checks', 'pending_since', 'pending_start',
-                                              'pending_end', 'pending_category'):
+                                              'pending_end', 'pending_category',
+                                              'pending_unconfirmed_notified'):
                                     task.data.pop(field, None)
                                 task.save()
                                 clear_alert('reservation_unconfirmed')
@@ -1811,6 +2056,15 @@ def run(settings: Settings, *, session: Any = None,
                 health(phase='activities')
                 rows, activities_seconds, activities_source, rows_age, rows_fetch_seconds, \
                     rows_data_age = list_rows()
+                if activities_source == 'none':
+                    # No fresh background snapshot: keep the phase cadence instead of blocking
+                    # this scan on a request the background reader already owns.
+                    delay = query_interval()
+                    health(phase='waiting', next_check_at=clock() + delay)
+                    sync_poller(True)
+                    sync_history_poller(task.data['status'] != 'pending')
+                    sleep(delay)
+                    continue
                 rows_fetched_at = clock()
                 # Start the list reader before the history step: if resolving history takes
                 # seconds, the scan can then consume a newer list snapshot instead of submitting
@@ -1861,9 +2115,19 @@ def run(settings: Settings, *, session: Any = None,
                 history_ttl = (HISTORY_BACKGROUND_FRESH
                                if settings.history_background and background_poller
                                else OPENING_HISTORY_TTL)
+                if not opening_scan:
+                    history_ttl = NORMAL_HISTORY_TTL
                 history_still_fresh = (
-                    history is not None and opening_scan
+                    history is not None
                     and 0 <= clock() - mine_at < history_ttl)
+                if history is not None and history_still_fresh and not opening_scan and not refresh_mine:
+                    cached_progress = progress(progress_rows(history, hold_entries(), clock() + server_offset),
+                                               clock() + server_offset)
+                    possible, _ = select_candidates(rows, settings, cached_progress, history,
+                        task.data['cooldowns'], clock() + server_offset,
+                        cooldown_clock_known=offset_known, holds=hold_views())
+                    if possible:
+                        history_still_fresh = False
                 used_background_history = False
                 if (opening_scan and not refresh_mine and background_history is not None
                         and (background_history.at > mine_at or not history_still_fresh
@@ -1872,26 +2136,32 @@ def run(settings: Settings, *, session: Any = None,
                     used_background_history = accept_background_history(background_history)
                     if not used_background_history:
                         history_still_fresh = False
+                if history_still_fresh or used_background_history:
+                    history_guard.reset()
                 if opening_scan and not refresh_mine and not history_still_fresh:
                     # Prefer the single background history query over a synchronous one: ask it
-                    # to refresh now and wait for its published snapshot, so the candidate path
-                    # never races the reader with a duplicate query.
+                    # to refresh now. The scan keeps its phase cadence across rounds instead of
+                    # blocking here; one bounded synchronous read is allowed after several misses.
                     if settings.history_background and background_poller:
                         trigger_history_refresh()
-                    if (not used_background_history and history_poller is not None
-                            and history_refresh_pending()):
-                        waiter = getattr(history_poller, 'wait_update', None)
-                        if waiter is not None:
-                            waiter(OPENING_QUERY_TIMEOUT, history_refresh_target - 1)
-                    # Always re-read the published snapshot after the request: a poll that
-                    # completed around it already satisfies the target, so the pending check
-                    # above may be false while the fresh rows only now become visible. Skipping
-                    # this read duplicates that query on the candidate path.
-                    if history_poller is not None:
-                        refreshed_history = history_poller.snapshot()
-                        if refreshed_history is not background_history:
-                            used_background_history = accept_background_history(
-                                refreshed_history)
+                        # Always re-read the published snapshot after the request: a poll that
+                        # completed around it already satisfies the target, so the pending check
+                        # above may be false while the fresh rows only now become visible.
+                        if history_poller is not None:
+                            refreshed_history = history_poller.snapshot()
+                            if refreshed_history is not background_history:
+                                used_background_history = accept_background_history(
+                                    refreshed_history)
+                        if used_background_history:
+                            history_guard.reset()
+                    if (not used_background_history
+                            and settings.history_background and background_poller):
+                        poller_wait_error()
+                        if not history_guard.miss():
+                            delay = query_interval()
+                            health(phase='waiting', next_check_at=clock() + delay)
+                            sleep(delay)
+                            continue
                 if not used_background_history and not refresh_mine and not history_still_fresh:
                     poller_wait_error()
                     health(phase='my_activities', next_check_at=0,
@@ -1901,6 +2171,7 @@ def run(settings: Settings, *, session: Any = None,
                     mine_at = clock()
                     mine_seconds = max(0, clock() - mine_started)
                     refresh_mine = True
+                    history_guard.reset()
                 assert history is not None
                 if conflicting_records(history):
                     # Contradictory duplicates must not confirm an unconfirmed hold before the
@@ -1947,15 +2218,20 @@ def run(settings: Settings, *, session: Any = None,
                     task.data.update(status='scanning', activity='')
                     task.save()
                 if not any(current.needs(category) for category in settings.categories):
+                    known_targets.clear()
+                    known_openings.clear()
                     opening_scan = False
+                    sync_poller(False)
+                    sync_history_poller(False)
                     mail_blocked = False
                     flush_mail()
                     failures = 0
+                    delay = random.uniform(SCAN_INTERVAL - 1, SCAN_INTERVAL + 1)
                     health(phase='waiting_for_attendance', last_query_at=clock(), failure_count=0,
-                           next_check_at=clock() + 10)
+                           next_check_at=clock() + delay)
                     query_recovered()
                     clear_alert('task_failed')
-                    pause(10)
+                    pause(delay)
                     continue
                 if clock() - rows_fetched_at > HISTORY_LIST_REFRESH_AFTER:
                     # Resolving history may have taken seconds; do not submit a candidate that the
@@ -1979,12 +2255,13 @@ def run(settings: Settings, *, session: Any = None,
                     # No submission step can be attempted in this scan; do not keep an old
                     # captcha/submit failure timer alive while only list queries run.
                     step_recovered()
-                known_openings = merge_openings(known_openings, details, clock() + server_offset)
-                opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL,
-                                          known_openings)[1]
+                known_targets = merge_openings(known_targets, details, clock() + server_offset)
+                known_openings = sorted(set(opening_windows(list(known_targets.values()))))[:128]
+                opening_scan = opening_intervals(known_openings, clock() + server_offset) is not None
                 mail_blocked = opening_scan
                 client.timeout = SUBMIT_TIMEOUT if opening_scan else 10
                 sync_poller(opening_scan)
+                sync_history_poller(opening_scan and task.data['status'] != 'pending')
                 previous_selection = task.data.get('selection')
                 if (not isinstance(previous_selection, dict)
                         or previous_selection.get('activities') != details):
@@ -2060,6 +2337,8 @@ def run(settings: Settings, *, session: Any = None,
                                          pending_start=lecture.start.timestamp(),
                                          pending_end=lecture.end.timestamp(),
                                          pending_category=lecture.category)
+                        # A new pending episode starts with a clean unconfirmed-event marker.
+                        task.data.pop('pending_unconfirmed_notified', None)
                         # One atomic save persists both the crash-recovery checkpoint and the
                         # 'submitting' health phase; a separate health write would fsync again.
                         set_health(phase='submitting')
@@ -2079,6 +2358,11 @@ def run(settings: Settings, *, session: Any = None,
                                    rows_age=round(rows_age, 3),
                                    rows_data_age=(round(clock() - last_rows_started, 3)
                                                   if last_rows_started else None),
+                                   yyrs=lecture.taken,
+                                   hdzrs=lecture.capacity,
+                                   remaining=lecture.remaining,
+                                   remaining_after=(None if lecture.remaining is None
+                                                    else max(0, lecture.remaining - 1)),
                                    precommit_save_seconds=round(persist_seconds, 3))
                         try:
                             reply = client.submit(lecture.wid, code)
@@ -2100,6 +2384,7 @@ def run(settings: Settings, *, session: Any = None,
                                 task.data.pop('pending_start', None)
                                 task.data.pop('pending_end', None)
                                 task.data.pop('pending_category', None)
+                                task.data.pop('pending_unconfirmed_notified', None)
                                 task.save()
                                 diagnostic('submission_connect_failed', wid=lecture.wid)
                                 break
@@ -2141,7 +2426,8 @@ def run(settings: Settings, *, session: Any = None,
                                 category=lecture.category, save=False)
                             task.data.update(status='scanning', activity='')
                             for field in ('pending_checks', 'pending_since', 'pending_start',
-                                          'pending_end', 'pending_category'):
+                                          'pending_end', 'pending_category',
+                                          'pending_unconfirmed_notified'):
                                 task.data.pop(field, None)
                             task.save()
                             if newly_confirmed:
@@ -2224,6 +2510,10 @@ def run(settings: Settings, *, session: Any = None,
                 unconfirmed_checks = 0
                 reset_pending_checks()
                 reason = str(exc)
+                if isinstance(exc, AttendanceCategoryUnknown):
+                    # Local-only detail: the history row had no usable category. The public error
+                    # code stays unchanged; the activity ID helps identify the lagging record.
+                    diagnostic('attendance_category_unknown', wid=exc.wid or None)
                 safe_reason = reason if isinstance(exc, RemoteError) or reason in (
                     'attendance_category_unknown', 'attendance_record_conflict') else 'invalid_activity_data'
                 record(safe_reason)
@@ -2244,8 +2534,7 @@ def run(settings: Settings, *, session: Any = None,
                         progress_at = mine_at
                     except (RemoteError, ValueError):
                         history = None
-                opening_scan = scan_delay(details, clock() + server_offset, 0, SCAN_INTERVAL,
-                                          known_openings)[1]
+                opening_scan = opening_intervals(known_openings, clock() + server_offset) is not None
                 quick = (opening_scan and authenticated and isinstance(exc, RemoteError)
                          and reason in FAST_RETRY_REASONS and not exc.retry_after)
                 retry = exc.retry_after if isinstance(exc, RemoteError) else 0
@@ -2286,7 +2575,12 @@ def run(settings: Settings, *, session: Any = None,
         if check_only:
             print('event=task_failed' + failure_details, flush=True)
         elif isinstance(exc, AuthenticationRejected):
-            record('task_failed')
+            # The client normally emitted authentication_rejected before raising. Emit again only
+            # when this process has not announced it yet (for example the credentials-missing
+            # path), so one rejection does not write a duplicate event line. A persisted alert
+            # still dedupes the mail: emit records the event but returns before notifying.
+            if 'task_failed' not in announced_here:
+                emit('authentication_rejected')
         else:
             emit('task_failed')
         if not check_only:

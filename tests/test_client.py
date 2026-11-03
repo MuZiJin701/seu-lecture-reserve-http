@@ -18,9 +18,9 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
-from urllib3.util import connection
-from urllib3.exceptions import ProtocolError
+from urllib3.exceptions import NameResolutionError, ProtocolError
 
+from seu_reserve import client as client_module
 from seu_reserve.client import (Client, DEADLINE_POOLS, ENTRY, GATEWAY, GatewayIPAdapter,
                                 RemoteError, install_deadline_pools)
 from seu_reserve.state import (FINGERPRINT_FILE, TRUST_COOKIES_FILE, load_trust_cookies,
@@ -95,7 +95,7 @@ def gateway_server(tmp_path, monkeypatch, request):
     server.socket = context.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    create_connection = connection.create_connection
+    create_connection = client_module._bounded_create_connection
     getaddrinfo = socket.getaddrinfo
 
     def connect(address, *args, **kwargs):
@@ -109,7 +109,7 @@ def gateway_server(tmp_path, monkeypatch, request):
             raise socket.gaierror('simulated DNS failure; offline tests cannot resolve remote hosts')
         return getaddrinfo(host, *args, **kwargs)
 
-    monkeypatch.setattr(connection, 'create_connection', connect)
+    monkeypatch.setattr(client_module, '_bounded_create_connection', connect)
     monkeypatch.setattr(socket, 'getaddrinfo', resolve)
     monkeypatch.setenv('REQUESTS_CA_BUNDLE', str(cert_path))
     for variable in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'):
@@ -175,6 +175,165 @@ def test_empty_gateway_ip_keeps_the_default_adapter():
         adapter = session.get_adapter(GATEWAY + '/')
         Client(session, {'SEU_VPN_IP': ''}, input, lambda _: None)
         assert session.get_adapter(GATEWAY + '/') is adapter
+
+
+def test_bounded_dns_resolution_stops_at_the_request_deadline(monkeypatch):
+    """A stalled resolver must not block past the request budget."""
+    calls = []
+    original = socket.getaddrinfo
+
+    def slow_resolve(host, *args, **kwargs):
+        calls.append(host)
+        time.sleep(0.3)
+        return original('127.0.0.1', *args, **kwargs)
+
+    monkeypatch.setattr(socket, 'getaddrinfo', slow_resolve)
+    connection = client_module._DeadlineHTTPSConnection(
+        'bounded-dns.invalid', 443, timeout=5)
+    client_module.REQUEST_DEADLINE.value = time.monotonic() + 0.05
+    try:
+        started = time.monotonic()
+        with pytest.raises(NameResolutionError) as error:
+            connection.connect()
+        elapsed = time.monotonic() - started
+    finally:
+        client_module.REQUEST_DEADLINE.value = None
+    assert calls == ['bounded-dns.invalid']
+    assert elapsed < 0.25          # unbounded resolver would take the full 0.3 s
+    assert 'dns resolution timed out' in str(error.value)
+    reason = error.value._reason
+    assert isinstance(reason, socket.gaierror) and reason.errno == socket.EAI_AGAIN
+
+
+def test_client_request_bounds_dns_with_the_request_budget(monkeypatch):
+    """A stalled resolver surfaces as a retryable connection failure, not a stalled request."""
+    original = socket.getaddrinfo
+
+    def slow_resolve(host, *args, **kwargs):
+        time.sleep(0.3)
+        return original('127.0.0.1', *args, **kwargs)
+
+    monkeypatch.setattr(socket, 'getaddrinfo', slow_resolve)
+    for variable in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy',
+                     'all_proxy'):
+        monkeypatch.delenv(variable, raising=False)
+    with requests.Session() as session:
+        client = Client(session, {}, input, lambda _: None)
+        client.timeout = 0.05
+        started = time.monotonic()
+        with pytest.raises(RemoteError) as error:
+            client.request('GET', ENTRY)
+        elapsed = time.monotonic() - started
+    assert str(error.value) == 'connection_failure'
+    assert elapsed < 0.25
+
+
+def test_dns_resolution_cache_avoids_repeated_lookups(monkeypatch):
+    calls = []
+    host = 'dns-cache-test.invalid'
+
+    def fake_resolve(name, port, *args, **kwargs):
+        calls.append(name)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port))]
+
+    monkeypatch.setattr(socket, 'getaddrinfo', fake_resolve)
+    client_module._drop_dns_cache(host, 443)
+    try:
+        first = client_module._resolve_within(host, 443, time.monotonic() + 1)
+        second = client_module._resolve_within(host, 443, time.monotonic() + 1)
+    finally:
+        client_module._drop_dns_cache(host, 443)
+    assert first == second
+    assert calls == [host]
+
+
+def test_dns_result_is_cached_after_the_requesting_call_times_out(monkeypatch):
+    """A slow resolver that finishes after the deadline must still warm the cache."""
+    host = 'dns-timeout-cache.invalid'
+    calls = []
+
+    def slow_resolve(name, port, *args, **kwargs):
+        calls.append(name)
+        time.sleep(0.3)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port))]
+
+    monkeypatch.setattr(socket, 'getaddrinfo', slow_resolve)
+    client_module._drop_dns_cache(host, 443)
+    try:
+        with pytest.raises(socket.gaierror) as error:
+            client_module._resolve_within(host, 443, time.monotonic() + 0.05)
+        assert error.value.errno == socket.EAI_AGAIN
+        # The abandoned resolver thread still publishes its result, so the next request reuses it
+        # instead of starting another lookup and timing out again.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with client_module._DNS_CACHE_LOCK:
+                cached = client_module._DNS_CACHE.get((host, 443))
+            if cached is not None:
+                break
+            time.sleep(0.01)
+        assert cached is not None
+        started = time.monotonic()
+        addresses = client_module._resolve_within(host, 443, time.monotonic() + 1)
+        elapsed = time.monotonic() - started
+    finally:
+        client_module._drop_dns_cache(host, 443)
+    assert calls == [host]
+    assert addresses and addresses[0][4][1] == 443
+    assert elapsed < 0.1
+
+
+def test_dns_resolver_slot_limit_fails_fast(monkeypatch):
+    monkeypatch.setattr(client_module, '_DNS_RESOLVER_SLOTS', threading.BoundedSemaphore(0))
+
+    def never(host, *args, **kwargs):  # pragma: no cover - must not run when no slot is free
+        raise AssertionError('resolution must not start without a free slot')
+
+    monkeypatch.setattr(socket, 'getaddrinfo', never)
+    started = time.monotonic()
+    with pytest.raises(socket.gaierror) as error:
+        client_module._resolve_within('dns-slot-test.invalid', 443, time.monotonic() + 1)
+    assert error.value.errno == socket.EAI_AGAIN
+    assert time.monotonic() - started < 0.2
+
+
+def test_dns_resolver_slot_is_released_when_thread_start_fails(monkeypatch):
+    """A thread that never starts must not consume one of the eight resolver slots."""
+    host = 'dns-slot-start-failure.invalid'
+    semaphore = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(client_module, '_DNS_RESOLVER_SLOTS', semaphore)
+    client_module._drop_dns_cache(host, 443)
+
+    class FailingThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError('cannot start thread')
+
+    monkeypatch.setattr(threading, 'Thread', FailingThread)
+    with pytest.raises(RuntimeError):
+        client_module._resolve_within(host, 443, time.monotonic() + 1)
+    assert semaphore.acquire(blocking=False)
+    semaphore.release()
+
+
+def test_dns_resolver_slot_is_released_when_thread_construction_fails(monkeypatch):
+    """A thread that cannot even be constructed must not consume a resolver slot."""
+    host = 'dns-slot-construction-failure.invalid'
+    semaphore = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(client_module, '_DNS_RESOLVER_SLOTS', semaphore)
+    client_module._drop_dns_cache(host, 443)
+
+    class UnconstructibleThread:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError('cannot create thread')
+
+    monkeypatch.setattr(threading, 'Thread', UnconstructibleThread)
+    with pytest.raises(RuntimeError):
+        client_module._resolve_within(host, 443, time.monotonic() + 1)
+    assert semaphore.acquire(blocking=False)
+    semaphore.release()
 
 
 @pytest.mark.parametrize('failure', [

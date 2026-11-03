@@ -8,6 +8,7 @@ import re
 import select
 import socket
 import ssl
+import sys
 import threading
 import time
 import uuid
@@ -26,7 +27,9 @@ from urllib3.connection import HTTPConnection as Urllib3HTTPConnection
 from urllib3.connection import HTTPSConnection as Urllib3HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool as Urllib3HTTPConnectionPool
 from urllib3.connectionpool import HTTPSConnectionPool as Urllib3HTTPSConnectionPool
-from urllib3.exceptions import ReadTimeoutError
+from urllib3.exceptions import (ConnectTimeoutError, NameResolutionError, NewConnectionError,
+                                ReadTimeoutError)
+from urllib3.util.connection import create_connection as _urllib3_create_connection
 
 from .state import (load_or_create_device_fingerprint, load_trust_cookies,
                     save_trust_cookies)
@@ -108,7 +111,172 @@ class _DeadlineSocket:
         self._sock._decref_socketios()
 
 
-class _DeadlineHTTPConnection(Urllib3HTTPConnection):
+# urllib3 resolves the host inside create_connection() before any socket timeout applies, so a
+# stalled system resolver can block far past the request budget. Resolve in a daemon thread and
+# wait only for the remaining budget; a short cache and a resolver-task cap keep repeated opening
+# fallbacks from piling up threads during a DNS outage.
+DNS_CACHE_SECONDS = 60.0
+DNS_RESOLVER_LIMIT = 8
+_DNS_CACHE: dict[tuple[str, int], tuple[float, tuple[Any, ...]]] = {}
+# Bumped whenever a cached address is dropped, so a resolver thread started before the drop cannot
+# publish its stale result afterwards.
+_DNS_GENERATION: dict[tuple[str, int], int] = {}
+_DNS_CACHE_LOCK = threading.Lock()
+_DNS_RESOLVER_SLOTS = threading.BoundedSemaphore(DNS_RESOLVER_LIMIT)
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ip_address(host.strip('[]'))
+        return True
+    except ValueError:
+        return False
+
+
+def _drop_dns_cache(host: str, port: int) -> None:
+    with _DNS_CACHE_LOCK:
+        key = (host, port)
+        _DNS_CACHE.pop(key, None)
+        _DNS_GENERATION[key] = _DNS_GENERATION.get(key, 0) + 1
+
+
+def _store_dns_cache(host: str, port: int, generation: int,
+                     addresses: list[Any]) -> None:
+    if not addresses:
+        return
+    key = (host, port)
+    with _DNS_CACHE_LOCK:
+        if _DNS_GENERATION.get(key, 0) != generation:
+            return
+        _DNS_CACHE[key] = (time.monotonic() + DNS_CACHE_SECONDS, tuple(addresses))
+
+
+def _resolve_within(host: str, port: int, deadline: float) -> tuple[Any, ...]:
+    """Resolve ``host`` without blocking past ``deadline`` (monotonic seconds)."""
+    key = (host, port)
+    now = time.monotonic()
+    with _DNS_CACHE_LOCK:
+        cached = _DNS_CACHE.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        generation = _DNS_GENERATION.get(key, 0)
+    remaining = deadline - now
+    if remaining <= 0:
+        raise socket.gaierror(socket.EAI_AGAIN, 'dns resolution budget exhausted')
+    if not _DNS_RESOLVER_SLOTS.acquire(blocking=False):
+        raise socket.gaierror(socket.EAI_AGAIN, 'dns resolver slot limit reached')
+    resolved: list[Any] = []
+    failures: list[BaseException] = []
+    done = threading.Event()
+
+    def worker() -> None:
+        try:
+            result = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+            resolved.extend(result)
+            # The caller may already have timed out; the resolver still publishes its result so
+            # the next request can reuse it instead of hitting the same slow DNS again.
+            _store_dns_cache(host, port, generation, list(result))
+        except BaseException as exc:  # re-raised on the requesting thread if it is still waiting
+            failures.append(exc)
+        finally:
+            done.set()
+            _DNS_RESOLVER_SLOTS.release()
+
+    worker_thread = None
+    try:
+        # Thread construction can fail before the worker ever runs, so it shares the slot-release
+        # path with a failed start instead of leaking one of the eight resolver slots.
+        worker_thread = threading.Thread(target=worker, name='bounded-dns', daemon=True)
+        worker_thread.start()
+    except BaseException:
+        # The worker never ran, so its ``finally`` cannot release the slot; release it here
+        # instead of leaking one of the eight resolver slots for the rest of the process.
+        _DNS_RESOLVER_SLOTS.release()
+        raise
+    if not done.wait(max(0.0, remaining)):
+        raise socket.gaierror(socket.EAI_AGAIN, 'dns resolution timed out')
+    if failures:
+        exc = failures[0]
+        if isinstance(exc, socket.gaierror):
+            raise exc
+        raise socket.gaierror(socket.EAI_FAIL, 'dns resolution failed') from exc
+    if not resolved:
+        raise socket.gaierror(socket.EAI_NONAME, 'dns resolution returned no addresses')
+    return tuple(resolved)
+
+
+def _bounded_create_connection(address: tuple[str, int], timeout: Any = None,
+                               source_address: tuple[str, int] | None = None,
+                               socket_options: Any = None, *,
+                               deadline: float | None = None) -> socket.socket:
+    """urllib3's create_connection, with hostname resolution bounded by ``deadline``."""
+    host, port = address
+    if deadline is None or _is_ip_literal(host):
+        return _urllib3_create_connection(address, timeout, source_address, socket_options)
+    addresses = _resolve_within(host, port, deadline)
+    last_error: OSError | None = None
+    for family, socktype, proto, _canonname, sockaddr in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            for option in socket_options or ():
+                sock.setsockopt(*option)
+            limited = remaining if timeout is None else min(float(timeout), remaining)
+            sock.settimeout(max(limited, 0.001))
+            if source_address is not None:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+                sock = None
+    # A cached address that failed to accept a connection must not be reused blindly.
+    _drop_dns_cache(host, port)
+    if last_error is not None:
+        raise last_error
+    raise socket.timeout('response deadline exceeded')
+
+
+class _BoundedDNSConnection:
+    """Resolve DNS inside the request deadline before urllib3's normal connect path."""
+
+    host: str
+    port: int
+    timeout: Any
+    source_address: tuple[str, int] | None
+    socket_options: Any
+
+    def _new_conn(self) -> Any:
+        deadline = _current_request_deadline()
+        host = getattr(self, '_dns_host', '') or self.host
+        connection: Any = self
+        try:
+            sock = _bounded_create_connection(
+                (host, self.port), self.timeout,
+                source_address=getattr(self, 'source_address', None),
+                socket_options=getattr(self, 'socket_options', None),
+                deadline=deadline)
+        except socket.gaierror as exc:
+            raise NameResolutionError(self.host, connection, exc) from None
+        except socket.timeout:
+            raise ConnectTimeoutError(
+                connection, f'Connection to {self.host} timed out. '
+                            f'(connect timeout={self.timeout})') from None
+        except OSError as exc:
+            raise NewConnectionError(
+                connection, f'Failed to establish a new connection: {exc}') from None
+        # urllib3's normal create_connection fires this audit event; the bounded replacement
+        # bypasses it, so keep the same observable behaviour for audit hooks.
+        sys.audit('http.client.connect', self, self.host, self.port)
+        return sock
+
+
+class _DeadlineHTTPConnection(_BoundedDNSConnection, Urllib3HTTPConnection):
     _response_deadline: float | None = None
 
     def request(self, *args: Any, **kwargs: Any) -> None:
@@ -151,7 +319,7 @@ class _DeadlineHTTPConnection(Urllib3HTTPConnection):
         return response
 
 
-class _DeadlineHTTPSConnection(Urllib3HTTPSConnection):
+class _DeadlineHTTPSConnection(_BoundedDNSConnection, Urllib3HTTPSConnection):
     _response_deadline: float | None = None
 
     def request(self, *args: Any, **kwargs: Any) -> None:

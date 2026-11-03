@@ -45,6 +45,35 @@ def test_native_open_activity_is_submitted_then_confirmed_by_activity_id(tmp_pat
     assert saved['status'] == 'scanning' and not saved['activity']
 
 
+def test_confirmed_target_ends_the_opening_window_while_other_categories_are_needed(tmp_path, monkeypatch):
+    import seu_reserve.app as app_module
+    from seu_reserve.poller import Snapshot
+    from test_app import FakeHistoryPoller, FakePoller
+    school = ActivitySchool()
+    school.activities = [activity()]
+    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
+    monkeypatch.setattr(FakePoller, 'instances', [])
+    monkeypatch.setattr(FakePoller, 'snapshot', lambda self: Snapshot(rows=school.activities, at=OPEN))
+    monkeypatch.setattr(FakeHistoryPoller, 'snapshot', lambda self: Snapshot(rows=[], at=OPEN))
+    readers = []
+    def history_reader(query, **kwargs):
+        reader = FakeHistoryPoller(query, **kwargs)
+        readers.append(reader)
+        return reader
+    monkeypatch.setattr(app_module, 'new_history_poller', history_reader)
+    waits = []
+    def stop(seconds):
+        waits.append(seconds)
+        assert FakePoller.instances and readers
+        assert not any(reader.running for reader in [*FakePoller.instances, *readers])
+        raise KeyboardInterrupt
+    assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop, background_poller=True) == 130
+    assert len(waits) == 1 and 4 <= waits[0] <= 6
+    saved = json.loads((tmp_path / 'task.json').read_text())
+    assert saved['selection']['activities'][0]['reason'] == 'already_reserved'
+    assert saved['health']['progress']['missing']
+
+
 @pytest.mark.parametrize('now, available', [(OPEN - 1, False), (OPEN, True),
                                           (CLOSE, True), (CLOSE + 1, False)])
 def test_native_reservation_window_boundaries(tmp_path, now, available):
@@ -222,7 +251,7 @@ def test_known_opening_survives_a_valid_empty_list(tmp_path):
             raise KeyboardInterrupt
     assert execute(empty, tmp_path, clock=lambda: OPEN - 1, sleep=stop) == 130
     # The retained window keeps the opening cadence even though the latest list was empty.
-    assert waits == [0.10, 0.10]
+    assert len(waits) == 2 and all(.05 <= wait <= .10 for wait in waits)
 
 
 def test_slow_captcha_path_submits_without_an_extra_list_query(tmp_path):
@@ -277,7 +306,7 @@ def test_opening_scan_reuses_history_until_cache_expires(tmp_path):
             raise KeyboardInterrupt
     assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop) == 130
     assert sum(url.endswith('queryMyActivityList.do') for _, url, _ in school.requests) == 1
-    assert waits == [0.10, 0.10, 0.10]
+    assert len(waits) == 3 and all(.5 <= wait <= 1.5 for wait in waits)
 
 
 def test_overload_503_uses_short_bounded_backoff_in_opening(tmp_path):

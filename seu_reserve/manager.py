@@ -20,7 +20,8 @@ from typing import Any, Callable, Mapping
 from .accounts import MAIL_KEYS, AccountInput, Accounts, account_environ, account_settings, public_account
 from .app import SELECTION_REASONS, run
 from .mail import Mailer, mail_failure_reason
-from .state import Task, hold_checkpoint, lock_file, open_nofollow, read_json, task_running
+from .state import (Task, current_error_active, hold_checkpoint, lock_file, open_nofollow,
+                    read_json, task_running)
 
 FATAL_ERRORS = {'authentication_rejected', 'credentials_missing', 'configuration_or_state_invalid',
                 'state_invalid', 'account_already_running', 'mail_configuration_invalid', 'ocr_unavailable'}
@@ -492,9 +493,16 @@ class Manager:
         try:
             state = self.accounts.checkpoint(identifier)
             health = state.get('health', {})
+            error_active = False
+            if isinstance(health, dict):
+                # Older checkpoints do not have the explicit flag; normalize it once here so both
+                # the page and the stale marker use the same current-error semantics.
+                error_active = current_error_active(health)
+                health = {**health, 'last_error_active': error_active}
             result['status'] = state.get('status', 'not_started')
             result['protected'] = bool(state.get('status') == 'pending' or state.get('holds') or state.get('hold'))
-            keys = ('phase', 'updated_at', 'last_query_at', 'next_check_at', 'last_error', 'failure_count',
+            keys = ('phase', 'updated_at', 'last_query_at', 'next_check_at', 'last_error', 'last_error_at',
+                    'last_error_active', 'failure_count',
                     'activity_count', 'candidate_count', 'mail_status', 'last_mail_at', 'last_mail_status',
                     'last_mail_error', 'last_mail_event', 'last_mail_duration_seconds', 'progress')
             result['health'] = {key: health[key] for key in keys if isinstance(health, dict) and key in health}
@@ -507,7 +515,7 @@ class Manager:
                     and 0 < display['at'] <= 253402214400 and isinstance(display.get('items'), list)):
                 fields = ('wid', 'title', 'category', 'location', 'online', 'start', 'end', 'status')
                 result['reservations'] = dict(at=display['at'], stale=(not result['running']
-                    or time.time() - display['at'] > 30 or bool(health.get('failure_count'))),
+                    or time.time() - display['at'] > 30 or error_active),
                     items=[{key: row.get(key) for key in fields} for row in display['items']
                            if isinstance(row, dict) and type(row.get('end')) in (int, float)
                            and row['end'] > time.time()])

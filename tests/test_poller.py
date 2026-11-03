@@ -7,6 +7,31 @@ from seu_reserve.client import RemoteError
 from seu_reserve.poller import ActivityPoller, WaitGate
 
 
+def test_dynamic_poll_interval_is_resampled_and_includes_request_time():
+    now = [0.0]
+    starts, waits = [], []
+    intervals = iter([.1, .75, .05])
+
+    def query():
+        starts.append(now[0])
+        now[0] += .15 if len(starts) == 1 else .2
+        if len(starts) == 3:
+            poller._stop.set()
+        return []
+
+    class Wake:
+        def wait(self, seconds):
+            waits.append(seconds)
+            now[0] += seconds
+            return False
+
+    poller = ActivityPoller(query, interval=lambda: next(intervals), clock=lambda: now[0])
+    poller._wake = Wake()
+    poller._run()
+    assert starts == pytest.approx([0, .15, .9])
+    assert waits == pytest.approx([.55])
+
+
 def test_poll_once_stores_rows_and_timestamp():
     clock = [100.0]
     poller = ActivityPoller(lambda: [{'WID': 'one'}], interval=0.25, clock=lambda: clock[0])
@@ -205,6 +230,47 @@ def test_align_at_places_the_next_poll_near_the_target():
     # The first poll runs immediately; the one-shot alignment puts the next one on target.
     assert len(starts) >= 2
     assert target - 0.05 <= starts[1] <= target + 0.3
+
+
+def test_align_callback_reports_the_honored_target_and_actual_start():
+    starts, aligns = [], []
+
+    def query():
+        starts.append(time.monotonic())
+        return []
+
+    poller = ActivityPoller(query, interval=0.5, clock=time.monotonic,
+                            on_align=lambda target, actual, delta: aligns.append((target, actual, delta)))
+    target = time.monotonic() + 0.15
+    poller.align_at(target)
+    poller.start()
+    try:
+        assert _wait_for_polls(poller, 3) >= 3
+    finally:
+        poller.stop()
+    assert aligns
+    assert abs(aligns[0][0] - target) < 0.01
+    assert aligns[0][2] >= -0.05
+
+
+def test_alignment_is_not_recorded_when_stop_interrupts_the_wait():
+    starts, aligns = [], []
+
+    def query():
+        starts.append(time.monotonic())
+        return []
+
+    poller = ActivityPoller(query, interval=1.0, clock=time.monotonic,
+                            on_align=lambda target, actual, delta: aligns.append((target, actual, delta)))
+    poller.align_at(time.monotonic() + 0.25)
+    poller.start()
+    try:
+        assert _wait_for_polls(poller, 1) >= 1
+        time.sleep(0.05)
+    finally:
+        poller.stop()
+    assert starts  # the first poll did run
+    assert aligns == []
 
 
 def test_align_at_is_one_shot():

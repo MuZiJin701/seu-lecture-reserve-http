@@ -450,7 +450,8 @@ def test_normal_run_rechecks_the_account_before_entering_the_engine(tmp_path, mo
     assert cli.main(['--config', str(config), '--account', '10001']) == 1
     assert 'event=account_not_found' in capsys.readouterr().out
     assert called == []
-    assert not accounts.state_dir(account['id']).exists()
+    # The lock file may remain, but no checkpoint may be left behind.
+    assert not (accounts.state_dir(account['id']) / 'task.json').exists()
 
 
 def test_configuration_reread_failure_removes_a_checkpoint_created_for_a_new_account(
@@ -479,7 +480,7 @@ def test_configuration_reread_failure_removes_a_checkpoint_created_for_a_new_acc
     monkeypatch.setattr('os.environ', {})
     assert cli.main(['--config', str(config), '--account', '10001']) == 1
     assert 'event=configuration_or_state_invalid' in capsys.readouterr().out
-    assert not directory.exists()
+    assert not (directory / 'task.json').exists()
 
 
 def no_recognizer():
@@ -500,7 +501,9 @@ def test_ocr_unavailable_removes_a_checkpoint_created_for_a_new_account(tmp_path
     monkeypatch.setattr(cli, 'load_recognizer', no_recognizer)
     assert cli.main(['--config', str(config), '--account', '10001']) == 1
     assert 'event=ocr_unavailable' in capsys.readouterr().out
-    assert not directory.exists()
+    # The failed startup must not leave a checkpoint. The lock file may remain in an otherwise
+    # empty state directory; that is not a checkpoint.
+    assert not (directory / 'task.json').exists()
 
 
 def test_ocr_unavailable_leaves_an_existing_directory_without_a_task(tmp_path, monkeypatch, capsys):
@@ -540,6 +543,85 @@ def test_ocr_unavailable_keeps_a_preexisting_checkpoint(tmp_path, monkeypatch, c
     assert cli.main(['--config', str(config), '--account', '10001']) == 1
     assert 'event=ocr_unavailable' in capsys.readouterr().out
     assert (accounts.state_dir(account['id']) / 'task.json').read_bytes() == before
+
+
+def test_ocr_failure_keeps_a_pending_checkpoint_written_before_the_lock(tmp_path, monkeypatch, capsys):
+    """A previous instance may finish between the lifecycle read and our lock acquisition.
+
+    The checkpoint must be judged as pre-existing under the lock, so an OCR failure cannot delete
+    the pending submission evidence another instance just wrote.
+    """
+    from seu_reserve import cli, state
+    from seu_reserve.accounts import AccountInput, Accounts
+    config = tmp_path / '.env'
+    config.write_text('SEU_DATA_DIR=data\n', encoding='utf-8')
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(AccountInput(username='10001', name='先写后取锁', password='synthetic'))
+    directory = accounts.state_dir(account['id'])
+    real_task = state.Task
+
+    def racing_task(path, username):
+        # Simulate another instance completing and releasing the lock after the caller last read
+        # the filesystem state but before this open acquired the checkpoint lock.
+        waiting = real_task(path, username)
+        try:
+            waiting.data.update(status='pending', activity='one')
+            waiting.save()
+        finally:
+            waiting.close()
+        return real_task(path, username)
+
+    monkeypatch.setattr(cli, 'Task', racing_task)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('os.environ', {})
+    monkeypatch.setattr(cli, 'load_recognizer', no_recognizer)
+    assert cli.main(['--config', str(config), '--account', '10001']) == 1
+    assert 'event=ocr_unavailable' in capsys.readouterr().out
+    saved = json.loads((directory / 'task.json').read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'one'
+
+
+def test_failed_startup_cleanup_does_not_delete_a_checkpoint_written_after_unlock(
+        tmp_path, monkeypatch, capsys):
+    """Cleanup happens under the lock; a checkpoint written after release must survive."""
+    from seu_reserve import cli, state
+    from seu_reserve.accounts import AccountInput, Accounts
+    config = tmp_path / '.env'
+    config.write_text('SEU_DATA_DIR=data\n', encoding='utf-8')
+    accounts = Accounts(tmp_path / 'data')
+    account = accounts.create(AccountInput(username='10001', name='解锁后写入', password='synthetic'))
+    directory = accounts.state_dir(account['id'])
+    original_close = state.Task.close
+    writing = [False]
+
+    def close_then_write(self):
+        if writing[0]:
+            original_close(self)
+            return
+        original_close(self)
+        # The next instance acquires the lock right after this process releases it.
+        writing[0] = True
+        try:
+            later = state.Task(self.directory, '10001')
+            try:
+                later.data.update(status='pending', activity='two')
+                later.save()
+            finally:
+                later.close()
+        finally:
+            writing[0] = False
+
+    monkeypatch.setattr(state.Task, 'close', close_then_write)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('os.environ', {})
+    monkeypatch.setattr(cli, 'load_recognizer', no_recognizer)
+    try:
+        assert cli.main(['--config', str(config), '--account', '10001']) == 1
+    finally:
+        monkeypatch.setattr(state.Task, 'close', original_close)
+    assert 'event=ocr_unavailable' in capsys.readouterr().out
+    saved = json.loads((directory / 'task.json').read_text())
+    assert saved['status'] == 'pending' and saved['activity'] == 'two'
 
 
 def test_account_mode_forces_the_managed_settings_before_the_engine_starts(tmp_path, monkeypatch):

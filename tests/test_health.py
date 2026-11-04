@@ -75,7 +75,7 @@ def test_query_failure_mail_failure_and_recovery_are_visible_without_repeats(tmp
     assert states[0]['last_error_active'] is True
     assert all(entry['phase'] == 'backoff' for entry in states)
     assert states[0]['last_query_at'] == 0
-    assert any(entry['mail_status'] == 'failed' for entry in states)
+    assert snapshot(tmp_path)['mail_status'] == 'failed'
     assert 'SECRET' not in (tmp_path / 'task.json').read_text()
     saved = json.loads((tmp_path / 'task.json').read_text())
     saved['retry_at'] = 0
@@ -137,7 +137,7 @@ def test_default_mailer_is_available_for_task_initialization_failure(tmp_path, m
         def send_message(self, message):
             messages.append(message)
     monkeypatch.setattr('smtplib.SMTP_SSL', SMTP)
-    assert run(Settings(state_dir=tmp_path), session=School(), environ={
+    assert run(Settings(state_dir=tmp_path), background_poller=False, session=School(), environ={
         'SEU_USERNAME': 'test-user', 'SMTP_USERNAME': 'sender@gmail.com', 'SMTP_PASSWORD': 'SECRET'}) == 1
     assert len(messages) == 1
     assert '任务异常退出' in messages[0]['Subject']

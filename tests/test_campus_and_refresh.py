@@ -51,7 +51,7 @@ def test_slower_phase_keeps_scheduled_snapshots_without_extra_queries(tmp_path, 
     queries = [url.rsplit('/', 1)[-1] for _, url, _ in school.requests
                if url.endswith(('queryActivityList.do', 'queryMyActivityList.do'))]
     assert waits == [1.5, 1.5]
-    assert queries == ['queryActivityList.do']  # Only the initial bootstrap, no stale fallback.
+    assert queries == []  # Both queries belong to the constructed readers, including bootstrap.
     diagnostics = [json.loads(line) for line in (tmp_path / 'diagnostics.jsonl').read_text().splitlines()]
     assert not any(row['event'] == 'opening_sync_fallback' for row in diagnostics)
 
@@ -230,7 +230,7 @@ def test_new_background_history_replaces_a_still_cached_history(tmp_path, monkey
                    settings=Settings(state_dir=tmp_path, prewarm=False,
                                      captcha_prefetch=False)) == 130
     assert not school.submitted
-    assert intervals and all(interval == 5 for interval in intervals)
+    assert intervals and all(interval() == 5 for interval in intervals)
     assert FakePoller.instances and all(.05 <= poller.interval() <= .10 for poller in FakePoller.instances)
     assert not any(url.endswith('queryMyActivityList.do') for _, url, _ in school.requests)
     saved = json.loads((tmp_path / 'task.json').read_text())

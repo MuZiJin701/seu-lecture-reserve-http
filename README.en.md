@@ -1,18 +1,24 @@
 # SEU Literacy Lecture Reservation Console
 
+[Thread coordination and polling strategy by phase (Chinese diagrams and tables)](docs/thread-query-strategy.md)
+
 [中文](README.md)
 
 A multi-account lecture reservation tool with a Chinese console and the existing CLI. The console uses plain HTTP with administrator username/password login and must run only on a trusted LAN or VPN. Administrators share full access to the same school accounts. Each account independently authenticates, reserves, verifies results and tracks attendance progress. Requests to the university still use certificate-validated HTTPS.
 
 The goal remains **8 attended humanities and scientific literacy lectures, including law, art and mental health**. Enabled salons can be reserved but do not count. Test activities and ticket notices are excluded. The university makes the final assessment.
 
-Polling uses random intervals by phase: wait 4–6 seconds after each ordinary scan; target activity-list request starts 0.05–0.10 seconds apart from five seconds before opening until nine seconds after it. Other periods within the opening window (30 seconds before to five minutes after) use 0.5–1.5 seconds. Ordinary polling resumes afterwards, or earlier once no targets remain and no submission is pending. Ordinary history is cached for at most 30 seconds and rechecked when a submittable candidate appears. Opening intervals include request time; random timing does not guarantee avoiding automation detection. See the [polling guide](docs/usage.md#开抢与拥塞恢复).
+Every phase retains a main task thread, an activity-list reader, a history reader and an optional mail sender; one on-demand CAPTCHA worker handles prefetch, fresh images and rejected-code retries. Activity-list request starts target random intervals of 4–6 seconds ordinarily, 0.05–0.10 seconds from five seconds before opening until nine seconds after, and 0.5–1.5 seconds elsewhere in the opening window (30 seconds before to five minutes after). History refreshes about every 25 seconds with a 30-second freshness limit ordinarily, and every 5 seconds with a 10-second limit during openings; an ordinary candidate requests another history check. Intervals include request time. With no remaining target or pending submission, polling slows while both readers stay alive. Random timing does not guarantee avoiding automation detection. See the [polling guide](docs/usage.md#开抢与拥塞恢复).
 
 Ordinary polling may reflect manual cancellations, attendance changes and new reservations about 30 seconds later, plus a scan and request time. Check the reservation snapshot timestamp for freshness. Update the code and restart the CLI process or management service to activate this policy.
 
 ![Web console offline demo](docs/images/console-desktop.jpg)
 
 The screenshot uses offline synthetic accounts and state, not live school records.
+
+Both readers own queries and retries, with 10-second ordinary and 2-second opening budgets. The main thread uses versioned notifications and absolute wait deadlines, consumes snapshots, authenticates, dispatches CAPTCHA jobs and submits serially. The CAPTCHA worker temporarily owns the main session; authentication and submission wait for its return. Before submitting, existing reliable snapshots revalidate the candidate and conflicts without another query. Jobs carry increasing IDs and authentication generations; stale results are discarded and no CAPTCHA is fetched while idle. Checkpoints remain synchronous and owned by the main thread; mail queues independently. Private logs reuse safely opened descriptors; server disk measurements did not trigger additional writer threads. See the [unified CAPTCHA worker checks](docs/acceptance/2026-11-04-captcha-worker.md) and earlier [P0/P1/P2 implementation and checks](docs/acceptance/2026-11-04-event-preparation.md). Real opening validation remains pending and production is unchanged. Earlier evidence remains in the [unified-worker checks](docs/acceptance/2026-11-03-unified-workers.md) and [19:00 incident](docs/acceptance/2026-11-03-opening-recovery.md).
+
+Both opening phases accept successful list snapshots for two seconds after completion; an explicit query failure still blocks new reservations. See the [snapshot policy checks](docs/acceptance/2026-11-04-opening-snapshot-2s.md).
 
 ## Install
 
@@ -81,8 +87,8 @@ The [2026-10-31 review fixes and follow-up](docs/acceptance/2026-10-31-review-fi
 
 The [2026-11-03 random polling acceptance](docs/acceptance/2026-11-03-random-polling.md) records the earlier version: **748 offline tests passed, with 3 platform skips**, and mypy passed. Short read-only samples against the real university server succeeded **36/36 and 7/7** in the two scheduling phases; an isolated ordinary engine run stopped normally after about 25 seconds. This schedule has not been deployed or validated during a real opening.
 
-The latest [query-reduction acceptance](docs/acceptance/2026-11-03-query-reduction.md) covers the five-second-before to nine-second-after burst, early return to ordinary polling when no targets remain, a 30-second ordinary history cache, and a fresh history check before submitting cached candidates. **754 offline tests passed, with 3 skips**; mypy passed. Real read-only samples succeeded **38/38 and 5/5**, and an isolated ordinary engine queried history once in about 25 seconds. This change has not been deployed or tested in a real opening.
+The latest [query-recovery acceptance](docs/acceptance/2026-11-03-opening-recovery.md) covers read budgets, independent recovery, endpoint handoff and failure-stage diagnostics. Offline checks: **765 passed, 3 skipped**, with mypy passing. A temporary copy of the new modules completed **12/12 real read-only queries** on the same server. Production still runs the previous code; the fix has not been deployed or tested at a real opening. Earlier scheduling changes are recorded in the [query-reduction acceptance](docs/acceptance/2026-11-03-query-reduction.md).
 
-Existing 429/`Retry-After`, short backoff and fallback handling is retained. The earlier claim that the school actively throttles requests was an unsupported assumption and has been withdrawn. [Existing measurements](docs/acceptance/2026-10-29-read-only-probe.md) observed no business-API throttling; that assumption must not explain failures or set polling rates. Single-account samples do not establish multi-account capacity.
+Existing 429/`Retry-After` handling and short backoff are retained; query owners replace synchronous fallbacks. The earlier claim that the school actively throttles requests was an unsupported assumption and has been withdrawn. [Existing measurements](docs/acceptance/2026-10-29-read-only-probe.md) observed no business-API throttling; that assumption must not explain failures or set polling rates. Single-account samples do not establish multi-account capacity.
 
 Maintainer: [MuZiJin701](https://github.com/MuZiJin701) · [Requirements](docs/requirements.md) · [Glossary](GLOSSARY.md) · [Historical promotional assets](docs/promo/usage.md)

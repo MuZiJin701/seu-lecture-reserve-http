@@ -54,7 +54,7 @@ def test_confirmed_target_ends_the_opening_window_while_other_categories_are_nee
     monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
     monkeypatch.setattr(FakePoller, 'instances', [])
     monkeypatch.setattr(FakePoller, 'snapshot', lambda self: Snapshot(rows=school.activities, at=OPEN))
-    monkeypatch.setattr(FakeHistoryPoller, 'snapshot', lambda self: Snapshot(rows=[], at=OPEN))
+    monkeypatch.setattr(FakeHistoryPoller, 'snapshot', lambda self: Snapshot(rows=list(school.mine), at=OPEN))
     readers = []
     def history_reader(query, **kwargs):
         reader = FakeHistoryPoller(query, **kwargs)
@@ -65,7 +65,7 @@ def test_confirmed_target_ends_the_opening_window_while_other_categories_are_nee
     def stop(seconds):
         waits.append(seconds)
         assert FakePoller.instances and readers
-        assert not any(reader.running for reader in [*FakePoller.instances, *readers])
+        assert all(reader.running for reader in [*FakePoller.instances, *readers])
         raise KeyboardInterrupt
     assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop, background_poller=True) == 130
     assert len(waits) == 1 and 4 <= waits[0] <= 6

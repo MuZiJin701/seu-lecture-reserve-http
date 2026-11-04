@@ -12,7 +12,8 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from http.client import RemoteDisconnected
 from ipaddress import ip_address
 from pathlib import Path
@@ -212,8 +213,10 @@ def _bounded_create_connection(address: tuple[str, int], timeout: Any = None,
     """urllib3's create_connection, with hostname resolution bounded by ``deadline``."""
     host, port = address
     if deadline is None or _is_ip_literal(host):
-        return _urllib3_create_connection(address, timeout, source_address, socket_options)
-    addresses = _resolve_within(host, port, deadline)
+        with _request_stage('tcp'):
+            return _urllib3_create_connection(address, timeout, source_address, socket_options)
+    with _request_stage('dns'):
+        addresses = _resolve_within(host, port, deadline)
     last_error: OSError | None = None
     for family, socktype, proto, _canonname, sockaddr in addresses:
         remaining = deadline - time.monotonic()
@@ -228,7 +231,8 @@ def _bounded_create_connection(address: tuple[str, int], timeout: Any = None,
             sock.settimeout(max(limited, 0.001))
             if source_address is not None:
                 sock.bind(source_address)
-            sock.connect(sockaddr)
+            with _request_stage('tcp'):
+                sock.connect(sockaddr)
             return sock
         except OSError as exc:
             last_error = exc
@@ -312,7 +316,8 @@ class _DeadlineHTTPConnection(_BoundedDNSConnection, Urllib3HTTPConnection):
         wrapped = _DeadlineSocket(sock, deadline)
         setattr(self, 'sock', wrapped)
         try:
-            response = Urllib3HTTPConnection.getresponse(self)
+            with _request_stage('headers'):
+                response = Urllib3HTTPConnection.getresponse(self)
         finally:
             if getattr(self, 'sock', None) is wrapped:
                 setattr(self, 'sock', sock)
@@ -355,7 +360,8 @@ class _DeadlineHTTPSConnection(_BoundedDNSConnection, Urllib3HTTPSConnection):
         wrapped = _DeadlineSocket(sock, deadline)
         setattr(self, 'sock', wrapped)
         try:
-            response = Urllib3HTTPSConnection.getresponse(self)
+            with _request_stage('headers'):
+                response = Urllib3HTTPSConnection.getresponse(self)
         finally:
             if getattr(self, 'sock', None) is wrapped:
                 setattr(self, 'sock', sock)
@@ -383,6 +389,37 @@ def _current_request_deadline() -> float | None:
 # Written by the deadline-aware connection classes only when a request opens a new connection,
 # and saved/cleared by Client.request so each request reports its own connection setup cost.
 REQUEST_CONNECT = threading.local()
+REQUEST_TIMING = threading.local()
+
+
+@contextmanager
+def _request_stage(stage: str) -> Iterator[None]:
+    trace = getattr(REQUEST_TIMING, 'value', None)
+    if trace is None:
+        yield
+        return
+    previous = trace['stage']
+    trace['stage'] = stage
+    durations = trace['durations']
+    nested_before = sum(durations.get(key, 0.0) for key in ('dns', 'tcp'))
+    started = time.monotonic()
+    try:
+        yield
+    except BaseException as exc:
+        if 'failed_stage' not in trace:
+            trace.update(failed_stage=stage, exception_type=type(exc).__name__)
+        raise
+    else:
+        # A successful enclosing stage may have recovered from an earlier address failure.
+        trace.pop('failed_stage', None)
+        trace.pop('exception_type', None)
+    finally:
+        duration = time.monotonic() - started
+        if stage == 'tls':
+            duration -= sum(durations.get(key, 0.0) for key in ('dns', 'tcp')) - nested_before
+        if stage != previous:
+            durations[stage] = durations.get(stage, 0.0) + max(0.0, duration)
+        trace['stage'] = previous
 
 
 def _connect_and_measure(connect: Callable[[Any], None], connection: Any) -> None:
@@ -393,7 +430,8 @@ def _connect_and_measure(connect: Callable[[Any], None], connection: Any) -> Non
     """
     started = time.monotonic()
     try:
-        connect(connection)
+        with _request_stage('tls' if isinstance(connection, Urllib3HTTPSConnection) else 'connect'):
+            connect(connection)
     finally:
         REQUEST_CONNECT.value = time.monotonic() - started
 
@@ -530,6 +568,7 @@ class Client:
         # cost of the connection that attempt opened, if any.
         self.requests_made = 0
         self.last_connect_seconds: float | None = None
+        self.request_role = 'main'
         address = environ.get('SEU_VPN_IP', '').strip()
         self.gateway_adapter = GatewayIPAdapter(address) if address else None
         self.initial_authentication = True
@@ -685,21 +724,43 @@ class Client:
         cookies = getattr(self.session, 'cookies', None)
         if cookies is not None:
             session.cookies.update(cookies)
-        clone = Client(session, self.environ, self.prompt, self.notify)
+        clone = Client(session, self.environ, self.prompt, self.notify, diagnostic=self.diagnostic)
         clone.timeout = self.timeout
+        clone.request_role = 'background'
         return clone
 
     def request(self, method: str, url: str, **kwargs: Any) -> Any:
         # Keep the bookkeeping around every attempt, including local rejections and failures:
         # the connection classes report a handshake in REQUEST_CONNECT on this thread only.
         previous_connect = getattr(REQUEST_CONNECT, 'value', None)
+        previous_timing = getattr(REQUEST_TIMING, 'value', None)
+        trace: dict[str, Any] = dict(stage='request', durations={})
+        REQUEST_TIMING.value = trace if self.diagnostic is not None else None
+        started = time.monotonic()
         REQUEST_CONNECT.value = None
         self.requests_made += 1
         try:
             return self._request(method, url, **kwargs)
+        except RemoteError as exc:
+            parsed = urlsplit(url)
+            endpoint = parsed.path.rsplit('/', 1)[-1]
+            if endpoint not in {'queryActivityList.do', 'queryMyActivityList.do', 'vcode.do',
+                                'addReservation.do', 'deleteReservation.do'}:
+                endpoint = 'other'
+            self._diagnose('request_failed',
+                reader=self.request_role if self.request_role in ('main', 'activities', 'history', 'background') else 'main',
+                endpoint=endpoint, stage=trace.get('failed_stage', 'request'),
+                exception_type=trace.get('exception_type', type(exc).__name__),
+                reason=str(exc) if re.fullmatch('[a-z_]+', str(exc)) else type(exc).__name__,
+                budget_seconds=float(self.timeout), duration_seconds=round(time.monotonic() - started, 6),
+                **{stage + '_seconds': round(trace['durations'][stage], 6)
+                   if stage in trace['durations'] else None
+                   for stage in ('dns', 'tcp', 'tls', 'headers', 'body')})
+            raise
         finally:
             self.last_connect_seconds = getattr(REQUEST_CONNECT, 'value', None)
             REQUEST_CONNECT.value = previous_connect
+            REQUEST_TIMING.value = previous_timing
 
     def _request(self, method: str, url: str, **kwargs: Any) -> Any:
         parsed = urlsplit(url)
@@ -741,7 +802,8 @@ class Client:
                 # A single Requests/urllib3 timeout is reset between reads; read the body with
                 # the remaining wall-clock budget as the per-read socket timeout so a slow-drip
                 # response cannot overshoot the total response deadline.
-                response._content = self._read_body(response, deadline)
+                with _request_stage('body'):
+                    response._content = self._read_body(response, deadline)
                 response._content_consumed = True
                 response.close()
         except ReadTimeoutError:
@@ -842,7 +904,8 @@ class Client:
                 try:
                     # decode_content matches Requests' own body reads; the raw flag defaults to
                     # False and would otherwise return compressed bytes to JSON parsing.
-                    chunk = read1(RESPONSE_CHUNK_SIZE, decode_content=True)
+                    with _request_stage('body'):
+                        chunk = read1(RESPONSE_CHUNK_SIZE, decode_content=True)
                 except (ReadTimeoutError, TimeoutError):
                     raise RemoteError('network_timeout') from None
                 except Exception:

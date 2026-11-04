@@ -1,11 +1,15 @@
 """Optional SMTP notifications and aggregate progress, without credentials or lecture details."""
 
 import math
+import queue
 import re
 import smtplib
 import socket
 import ssl
-from collections.abc import Mapping
+import threading
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from email.message import EmailMessage
 from typing import Any
@@ -47,6 +51,66 @@ MAIL_FAILURES = {
     OSError: 'network_failed',
 }
 MAIL_ERROR_REASONS = {'none', 'unknown', *MAIL_FAILURES.values()}
+
+
+@dataclass(frozen=True)
+class MailResult:
+    event: str
+    status: str
+    track: bool
+    duration: float | None = None
+    reason: str = 'none'
+
+
+class MailWorker:
+    """One sender; results are applied by the task owner, never by this thread."""
+
+    def __init__(self, send: Callable[[str, str, float | None], None],
+                 on_update: Callable[[], None]):
+        self._send = send
+        self._on_update = on_update
+        self._jobs: queue.Queue[tuple[str, str, bool, float | None] | None] = queue.Queue()
+        self._results: queue.Queue[MailResult] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name='mail-sender', daemon=True)
+        self._thread.start()
+
+    def submit(self, event: str, details: str, *, track: bool = True,
+               at: float | None = None) -> None:
+        """Queue one immutable job; ``at`` is the enqueue time frozen by the task owner."""
+        self._jobs.put((event, details, track, at))
+
+    def results(self) -> list[MailResult]:
+        results = []
+        while True:
+            try:
+                results.append(self._results.get_nowait())
+            except queue.Empty:
+                return results
+
+    def _publish(self, result: MailResult) -> None:
+        self._results.put(result)
+        self._on_update()
+
+    def _run(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            event, details, track, at = job
+            self._publish(MailResult(event, 'sending', track))
+            started = time.monotonic()
+            reason = 'none'
+            try:
+                self._send(event, details, at)
+            except Exception as exc:
+                reason = mail_failure_reason(exc)
+            self._publish(MailResult(event, 'accepted' if reason == 'none' else 'failed',
+                                     track, round(max(0.0, time.monotonic() - started), 3), reason))
+
+    def close(self, timeout: float = 5) -> bool:
+        self._jobs.put(None)
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
 
 
 def mail_history(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -97,14 +161,16 @@ class Mailer:
                 or bool(self.username) != bool(self.password)):
             raise ValueError('mail_configuration_invalid')
 
-    def __call__(self, event: str, details: str = '') -> None:
+    def __call__(self, event: str, details: str = '', *, at: float | None = None) -> None:
         message = EmailMessage()
         message['From'] = self.sender
         message['To'] = self.recipient
         title, explanation = MESSAGES.get(event, ('运行通知', '请查看本地运行状态。'))
         message['Subject'] = '东南大学讲座预约：' + title
+        created = (datetime.fromtimestamp(at, SHANGHAI) if at is not None
+                   else datetime.now(SHANGHAI))
         message.set_content(explanation + '\n\n' + (details + '\n\n' if details else '')
-                            + '时间：' + datetime.now(SHANGHAI).isoformat(timespec='seconds')
+                            + '时间：' + created.isoformat(timespec='seconds')
                             + '\n事件：' + event + '\n本地状态命令：uv run main.py --status\n')
         with smtplib.SMTP_SSL(self.host, self.port, timeout=20, context=ssl.create_default_context()) as smtp:
             if self.username:

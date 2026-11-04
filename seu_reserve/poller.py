@@ -1,6 +1,6 @@
-"""Background read-only activity-list polling used during opening windows.
+"""Background read-only activity-list and history polling in every phase.
 
-The poller only issues the read-only activity-list query on its own authenticated
+The poller only issues its read-only query on its own authenticated
 session. It never submits, updates task state or sends alerts: the scan loop still
 owns every decision and every write. Snapshot freshness is judged by the caller.
 """
@@ -26,8 +26,7 @@ class Snapshot:
     reason: str | None = None
     retry_after: float = 0.0
     # When the error carried a usable server-directed wait (429/Retry-After or the
-    # server_backoff code), the scan loop must observe the same pause instead of falling
-    # back to a synchronous query.
+    # server_backoff code), the scan loop must observe the same pause before new requests.
     failed_at: float = 0.0
     server_directed: bool = False
     # When the query that produced this snapshot started, and how long it took. Callers can then
@@ -96,32 +95,38 @@ class WaitGate:
 
 class ActivityPoller:
     def __init__(self, query: Callable[[], list[dict[str, Any]]], *,
-                 interval: float | Callable[[], float], clock: Callable[[], float] = time.monotonic,
+                 interval: float | Callable[[], float | None] | None,
+                 clock: Callable[[], float] = time.monotonic,
                  gate: WaitGate | None = None,
                  on_exit: Callable[[], None] | None = None,
-                 on_align: Callable[[float, float, float], None] | None = None):
+                 on_align: Callable[[float, float, float], None] | None = None,
+                 on_update: Callable[[], None] | None = None,
+                 retry_delay: Callable[[int, Snapshot | None], float] | None = None,
+                 name: str = 'activity-poller'):
         self._query = query
         self._interval = interval
         self._clock = clock
         self._gate = gate
         self._on_exit = on_exit
         self._on_align = on_align
+        self._on_update = on_update
+        self._retry_delay = retry_delay
+        self._name = name
         self._exit_called = False
         self._lock = threading.Lock()
         self._snapshot: Snapshot | None = None
         self._stop = threading.Event()
-        # Set after every completed poll (success or failure) so the scan loop can sleep
-        # until the next read instead of re-checking wall-clock freshness.
-        self._updated = threading.Event()
         # Wakes the interval wait early for an on-demand refresh (and for stop). A refresh
         # requested while a query is already in flight is satisfied by that query: the target
         # version records which completed poll makes the request redundant.
         self._wake = threading.Event()
+        self._policy_changed = threading.Event()
         self._refresh_target = 0
         # One-shot start-of-poll target, consumed by the next wait computation. Targets
         # already in the past are dropped so alignment can never rewind or busy-wait.
         self._align: float | None = None
         self._polls = 0
+        self._in_flight_since: float | None = None
         self._thread: threading.Thread | None = None
 
     def snapshot(self) -> Snapshot | None:
@@ -144,30 +149,15 @@ class ActivityPoller:
         return thread is not None and thread.is_alive()
 
     @property
+    def in_flight_since(self) -> float | None:
+        with self._lock:
+            return self._in_flight_since
+
+    @property
     def polls(self) -> int:
         """Completed query attempts, successful and failed."""
         with self._lock:
             return self._polls
-
-    def wait_update(self, timeout: float, since: int | None = None) -> bool:
-        """Sleep until a poll completes after ``since``; False on timeout or while not running.
-
-        ``since`` is the ``polls`` version the caller last consumed (0 when unsure). Checking the
-        version *before* clearing the pulse and again *after* clearing closes the race where a
-        poll completes between the version read and the clear: that update is reported instead of
-        being silently dropped until the timeout expires.
-        """
-        with self._lock:
-            version = self._polls
-        if since is None or since > version:
-            since = version
-        if version != since:
-            return True
-        self._updated.clear()
-        with self._lock:
-            if self._polls != since:
-                return True
-        return self._updated.wait(timeout)
 
     def align_at(self, when: float | None) -> None:
         """One-shot: retarget the next wait computation so the following poll starts at
@@ -197,6 +187,11 @@ class ActivityPoller:
             self._wake.set()
             return target
 
+    def reschedule(self) -> None:
+        """Re-evaluate a changed phase without requesting an extra poll."""
+        self._policy_changed.set()
+        self._wake.set()
+
     def _call_exit(self) -> None:
         if self._exit_called:
             return
@@ -204,9 +199,20 @@ class ActivityPoller:
         if self._on_exit is not None:
             self._on_exit()
 
+    def _publish(self) -> None:
+        if self._on_update is not None:
+            try:
+                self._on_update()
+            except Exception:
+                pass
+
     def poll_once(self) -> bool:
         """One query; store the result (or the error type, Retry-After and wait class)."""
         started = self._clock()
+        with self._lock:
+            if self._stop.is_set():
+                return False
+            self._in_flight_since = started
         try:
             rows = self._query()
         except Exception as exc:
@@ -226,16 +232,23 @@ class ActivityPoller:
                     reason=error_reason(exc),
                     retry_after=retry_after,
                     failed_at=failed_at,
-                    server_directed=server_directed)
+                    server_directed=server_directed, started=started,
+                    seconds=max(0.0, failed_at - started))
                 self._polls += 1
-            self._updated.set()
+                self._in_flight_since = None
+            self._publish()
             return False
+        except BaseException:
+            with self._lock:
+                self._in_flight_since = None
+            raise
         with self._lock:
             finished = self._clock()
             self._snapshot = Snapshot(rows=rows, at=finished, started=started,
                                       seconds=max(0.0, finished - started))
             self._polls += 1
-        self._updated.set()
+            self._in_flight_since = None
+        self._publish()
         return True
 
     def start(self) -> None:
@@ -243,8 +256,9 @@ class ActivityPoller:
             return
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._policy_changed.clear()
         self._refresh_target = 0
-        self._thread = threading.Thread(target=self._run, name='activity-poller', daemon=True)
+        self._thread = threading.Thread(target=self._run, name=self._name, daemon=True)
         self._thread.start()
 
     def stop(self, *, join: bool = True) -> None:
@@ -266,12 +280,17 @@ class ActivityPoller:
     def _run(self) -> None:
         try:
             aligned_target: float | None = None
+            failures = 0
             while not self._stop.is_set():
                 # Check the shared deadline immediately before each request. The gate is updated
                 # by whichever thread received the 429, so the other reader stops even while the
                 # scan loop is blocked in a captcha or submission request.
                 if self._gate is not None and self._gate.remaining() > 0:
-                    return
+                    if self._retry_delay is None:
+                        return
+                    self._wake.wait(self._gate.remaining())
+                    self._wake.clear()
+                    continue
                 if aligned_target is not None:
                     # Record alignment only here: the next query is actually about to start and
                     # all stop/shared-wait checks above have passed. A stop that wakes the wait
@@ -288,7 +307,12 @@ class ActivityPoller:
                 started = self._clock()
                 interval = self._interval() if callable(self._interval) else self._interval
                 if not self.poll_once():
-                    return
+                    if self._retry_delay is None or self._stop.is_set():
+                        return
+                    failures += 1
+                    self._stop.wait(self._retry_delay(failures, self.snapshot()))
+                    continue
+                failures = 0
                 with self._lock:
                     if (self._refresh_target > 0
                             and self._polls >= self._refresh_target):
@@ -300,6 +324,10 @@ class ActivityPoller:
                 # above could otherwise discard its wake: never enter the interval after a stop.
                 if self._stop.is_set():
                     return
+                if interval is None:
+                    self._wake.wait()
+                    self._wake.clear()
+                    continue
                 wait = interval - (self._clock() - started)
                 target = self._take_align()
                 if target is not None:
@@ -309,9 +337,22 @@ class ActivityPoller:
                         # way, so a missed opening cannot shift later polls.
                         wait = target - now
                         aligned_target = target
-                if wait > 0:
-                    if self._wake.wait(wait):
-                        self._wake.clear()
+                while wait > 0 and not self._stop.is_set():
+                    if not self._wake.wait(wait):
+                        break
+                    self._wake.clear()
+                    if not self._policy_changed.is_set():
+                        break
+                    self._policy_changed.clear()
+                    with self._lock:
+                        if self._refresh_target > self._polls:
+                            break
+                    interval = self._interval() if callable(self._interval) else self._interval
+                    if interval is None:
+                        break
+                    wait = interval - (self._clock() - started)
+                    if aligned_target is not None:
+                        wait = aligned_target - self._clock()
         finally:
             self._call_exit()
 

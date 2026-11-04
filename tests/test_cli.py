@@ -300,7 +300,8 @@ def test_one_dotenv_supplies_credentials_filters_and_mail_without_shell_exports(
     monkeypatch.setattr('ddddocr.DdddOcr', lambda **kwargs: SimpleNamespace(classification=lambda _: '1234'))
     school.close = lambda: None
     monkeypatch.setattr('seu_reserve.cli.run', lambda settings, **options:
-                        run_application(settings, **options, sleep=interrupted, prompt=interrupted, clock=lambda: 1000))
+                        run_application(settings, **options, background_poller=False,
+                                        sleep=interrupted, prompt=interrupted, clock=lambda: 1000))
     assert main([]) == 1
     assert school.submitted == ['chosen']
     assert len(messages) == 1

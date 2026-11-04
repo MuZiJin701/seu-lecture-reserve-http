@@ -1308,3 +1308,46 @@ def test_trust_diagnostics_never_break_authentication(tmp_path):
                     trust_device=True, fingerprint_dir=tmp_path, diagnostic=broken_sink)
     client._load_trust_cookies()
     assert client._trust_cookies_loaded is False
+@pytest.mark.parametrize('gateway_server', ['vpn.seu.edu.cn'], indirect=True)
+@pytest.mark.parametrize(('path', 'stage'), [('/slow-headers', 'headers'), ('/slow-gzip', 'body')])
+def test_failure_diagnostic_identifies_the_slow_stage_without_secrets(
+        gateway_server, monkeypatch, path, stage):
+    diagnostics = []
+    with requests.Session() as session:
+        client = Client(session, {'SEU_VPN_IP': '127.0.0.1'}, input, lambda _: None,
+                        diagnostic=lambda event, **fields: diagnostics.append(dict(event=event, **fields)))
+        monkeypatch.setattr(client, '_authenticate', lambda: client.get(GATEWAY + '/public'))
+        client.authenticate()
+        diagnostics.clear()
+        client.timeout = .2
+        with pytest.raises(RemoteError, match='network_timeout'):
+            client.request('GET', GATEWAY + path, headers={'Authorization': 'never-log-this'})
+    failed = [r for r in diagnostics if r['event'] == 'request_failed']
+    assert len(failed) == 1
+    assert failed[0]['stage'] == stage
+    assert failed[0]['budget_seconds'] == .2
+    assert failed[0]['duration_seconds'] >= .15
+    assert failed[0][stage + '_seconds'] > 0
+    assert 'never-log-this' not in json.dumps(failed)
+    assert GATEWAY not in json.dumps(failed)
+
+
+def test_readonly_clone_inherits_safe_failure_diagnostics(monkeypatch):
+    diagnostics = []
+    with requests.Session() as session:
+        client = Client(session, {}, input, lambda _: None,
+                        diagnostic=lambda event, **fields: diagnostics.append(dict(event=event, **fields)))
+        clone = client.clone_readonly()
+        clone.request_role = 'history'
+        def timeout(*args, **kwargs):
+            raise requests.Timeout('SECRET response or credential')
+        monkeypatch.setattr(clone.session, 'request', timeout)
+        try:
+            with pytest.raises(RemoteError, match='network_timeout'):
+                clone.request('POST', client_module.BASE + '/modules/hdyy/queryMyActivityList.do?ticket=SECRET')
+        finally:
+            clone.session.close()
+    assert len(diagnostics) == 1
+    assert diagnostics[0]['reader'] == 'history'
+    assert diagnostics[0]['endpoint'] == 'queryMyActivityList.do'
+    assert 'SECRET' not in json.dumps(diagnostics)

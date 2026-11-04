@@ -26,6 +26,7 @@ def smtp(monkeypatch):
 
 
 def mailed_run(school, directory, **options):
+    options.setdefault('background_poller', False)
     options.setdefault('sleep', interrupted)
     options.setdefault('clock', lambda: 1000)
     options.setdefault('prompt', interrupted)
@@ -287,7 +288,7 @@ def test_alert_unknown_progress_is_not_zero_and_pending_never_submits(tmp_path, 
 
 def test_disabled_mail_read_only_and_completed_tasks_do_not_mail(tmp_path, smtp):
     now = lambda: moment('2026-10-18 21:00:00').timestamp()
-    assert run(Settings(state_dir=tmp_path / 'disabled'), session=School(),
+    assert run(Settings(state_dir=tmp_path / 'disabled'), background_poller=False, session=School(),
                environ={'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
                clock=now, sleep=interrupted) == 130
     assert mailed_run(School(), tmp_path / 'check', check_only=True,

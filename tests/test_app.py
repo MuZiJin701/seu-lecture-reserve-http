@@ -114,7 +114,7 @@ def interrupted(_):
 def test_sms_authentication_never_queries_or_submits_business(tmp_path):
     school = School(sms=True)
     notifications = []
-    result = run(Settings(state_dir=tmp_path), session=school,
+    result = run(Settings(state_dir=tmp_path), background_poller=False, session=school,
                  environ={'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
                  prompt=interrupted, notify=notifications.append)
     assert result == 130
@@ -140,7 +140,7 @@ def test_initial_gateway_dns_failure_restarts_authentication_through_app(tmp_pat
     school = GatewaySchool()
     school.activities = [lecture()]
     school.submit_timeout = True
-    options = dict(session=school, environ={'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password',
+    options = dict(session=school, background_poller=False, environ={'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password',
                    'SEU_VPN_IP': '192.0.2.1'}, sleep=interrupted, prompt=interrupted,
                    recognize=lambda _: '1234', notify=lambda _: None)
     result = run(Settings(state_dir=tmp_path), check_only=check_only, **options)
@@ -172,10 +172,87 @@ def execute(school, directory, **options):
     options.setdefault('recognize', lambda image: '1234')
     # The background poller adds real threads and requests; tests exercise it explicitly.
     options.setdefault('background_poller', False)
+    if options['background_poller']:
+        original_clock = options['clock']
+        previous_time, same_time_calls, clock_calls, tripped = None, 0, 0, False
+        def bounded_clock():
+            nonlocal previous_time, same_time_calls, clock_calls, tripped
+            clock_calls += 1
+            current = original_clock()
+            same_time_calls = same_time_calls + 1 if current == previous_time else 0
+            previous_time = current
+            if (same_time_calls > 1000 or clock_calls > 20000) and not tripped:
+                tripped = True
+                raise AssertionError('constructed reader did not advance the injected clock')
+            return current
+        options['clock'] = bounded_clock
+    def wait_event(event, seconds):
+        if event.is_set():
+            return True
+        fake = globals().get('FakePoller')
+        readers = getattr(fake, 'instances', [])
+        if readers and getattr(fake, 'on_timeout', None) is not None:
+            return readers[-1].wait_update(seconds)
+        options['sleep'](seconds)
+        return False
+    options.setdefault('wait_for_update', wait_event)
     settings = options.pop('settings', Settings(state_dir=directory))
-    return run(settings, session=school,
-               environ={'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
-               **options)
+    import seu_reserve.app as app_module
+    from unittest.mock import patch
+    def invoke():
+        if (options['background_poller'] and isinstance(app_module.ActivityPoller, type)
+                and issubclass(app_module.ActivityPoller, FakePoller)):
+            from concurrent.futures import Future
+            # Constructed clocks/readers use immediate jobs; production scheduling has real-thread tests.
+            class ConstructedCaptcha(app_module.CaptchaWorker):
+                def __init__(self, on_update):
+                    self.number = 0
+                    self._current = None
+                    self.on_update = on_update
+                def submit(self, prepare, *, generation):
+                    self.number += 1
+                    self.generation = generation
+                    self._current = Future()
+                    try:
+                        self._current.set_result(prepare())
+                    except BaseException as exc:
+                        self._current.set_exception(exc)
+                    self.on_update()
+                def close(self):
+                    pass
+            with patch.object(app_module, 'CaptchaWorker', ConstructedCaptcha):
+                return run(settings, session=school,
+                           environ={'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'}, **options)
+        return run(settings, session=school,
+                   environ={'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'}, **options)
+    if (options['background_poller'] and isinstance(app_module.ActivityPoller, type)
+            and issubclass(app_module.ActivityPoller, FakePoller)
+            and app_module.new_history_poller.__module__ == 'seu_reserve.app'):
+        class ConstructedHistory(FakeHistoryPoller):
+            def __init__(self, query, **kwargs):
+                super().__init__(query, **kwargs)
+                self.latest = None
+                self.source = app_module.Client(school, {}, interrupted, lambda _: None)
+            def start(self):
+                super().start()
+                self.request_refresh()
+            def request_refresh(self):
+                from seu_reserve.poller import Snapshot, error_reason, server_directed_error
+                self.polls += 1
+                started = self.clock()
+                try:
+                    rows = self.source.mine()
+                    self.latest = Snapshot(rows, self.clock(), started=started)
+                except Exception as error:
+                    self.latest = Snapshot([], self.clock(), error=type(error).__name__,
+                        reason=error_reason(error), retry_after=getattr(error,'retry_after',0),
+                        server_directed=server_directed_error(error), failed_at=self.clock(), started=started)
+                return self.polls
+            def snapshot(self):
+                return self.latest
+        with patch.object(app_module, 'new_history_poller', ConstructedHistory):
+            return invoke()
+    return invoke()
 
 
 def test_one_confirmed_reservation_continues_goal_and_restart_does_not_duplicate(tmp_path):
@@ -356,7 +433,7 @@ def test_unsupported_activity_schema_alerts_instead_of_looking_like_empty_list(t
 def test_invalid_mail_configuration_explains_startup_failure_without_network(tmp_path, capsys, mail):
     school = School()
     env = {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'SECRET-password', **mail}
-    assert run(Settings(state_dir=tmp_path), session=school, environ=env) == 1
+    assert run(Settings(state_dir=tmp_path), background_poller=False, session=school, environ=env) == 1
     output = capsys.readouterr().out
     assert 'event=mail_configuration_invalid' in output
     assert all(key in output for key in ('.env', 'SMTP_HOST', 'MAIL_FROM', 'MAIL_TO'))
@@ -375,7 +452,7 @@ def test_no_mail_configuration_still_books_and_records_success(tmp_path, monkeyp
     school = School()
     school.activities = [lecture()]
     env = {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password', **mail}
-    assert run(Settings(state_dir=tmp_path), session=school, environ=env,
+    assert run(Settings(state_dir=tmp_path), background_poller=False, session=school, environ=env,
                recognize=lambda _: '1234', sleep=interrupted, clock=lambda: 1000) == 130
     assert school.submitted == ['one']
     assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
@@ -416,7 +493,7 @@ def test_default_email_contains_only_event_and_mail_failure_does_not_repeat_book
            'MAIL_FROM': 'sender@example.org', 'MAIL_TO': 'receiver@example.org'}
     if username:
         env.update(SMTP_USERNAME=username, SMTP_PASSWORD='private-mail-password')
-    assert run(Settings(state_dir=tmp_path), session=school, environ=env,
+    assert run(Settings(state_dir=tmp_path), background_poller=False, session=school, environ=env,
                recognize=lambda _: '1234', sleep=interrupted, clock=lambda: 1000) == 1
     assert len(messages) == 1
     assert logins == ([(username, 'private-mail-password')] if username else [])
@@ -505,7 +582,7 @@ def test_read_only_tls_diagnostic_does_not_expose_proxy_or_exception(
             raise requests.exceptions.SSLError(f'[SSL: {tls_reason}] SECRET URL and ticket')
         monkeypatch.setattr(session, 'send', fail)
         directory = tmp_path / 'unused-state'
-        assert run(Settings(state_dir=directory), session=session, environ={}, check_only=True) == 1
+        assert run(Settings(state_dir=directory), background_poller=False, session=session, environ={}, check_only=True) == 1
     assert capsys.readouterr().out == (
         'event=task_failed stage=authentication reason=tls_failure host=ehall.seu.edu.cn '
         f'tls_reason={tls_reason.lower()} proxy_used={str(proxy_used).lower()}\n')
@@ -2140,6 +2217,10 @@ class FakePoller:
     def align_at(self, when):
         self.aligns.append(when)
 
+    def request_refresh(self):
+        self.polls += 1
+        return self.polls
+
     def wait_update(self, timeout, since=None):
         self.waits.append(timeout)
         if self.wake_once:
@@ -2312,6 +2393,59 @@ def test_pending_confirmation_rejects_a_snapshot_older_than_the_submission(tmp_p
     assert all(line['source'] != 'pending_snapshot' for line in confirmed)
 
 
+@pytest.mark.parametrize(('save_advance', 'snapshot_offset', 'confirmed'), [
+    (100.0, -30.0, False), (0.5, 0.1, True)])
+def test_pending_positive_evidence_requires_a_post_checkpoint_snapshot(
+        tmp_path, monkeypatch, save_advance, snapshot_offset, confirmed):
+    """A snapshot from the save window is not evidence; one after the save is."""
+    import seu_reserve.app as app_module
+    from seu_reserve.state import Task
+    from test_activities import activity
+    switched = [False]
+    candidate = native_activity()
+    already = activity('one', YY_WID='one', YYKSSJ='2026-10-18 12:00:00',
+                       YYJSSJ='2026-10-18 13:00:00')
+    class SwitchPoller(FakePoller):
+        def snapshot(self):
+            if switched[0]:
+                FakePoller.rows_override = [already]
+            return super().snapshot()
+    monkeypatch.setattr(app_module, 'ActivityPoller', SwitchPoller)
+    monkeypatch.setattr(FakePoller, 'rows_override', None)
+    monkeypatch.setattr(FakePoller, 'at_offset', 0.0)
+    FakePoller.instances.clear()
+    FakePoller.next_rows = [candidate]
+    FakePoller.next_error = None
+    school = School()
+    school.activities = [candidate]
+    school.submit_replies = [{'code': 500}]
+    now = [moment('2026-10-18 12:00:00').timestamp()]
+    original_save = Task.save
+    def save_then_advance(task):
+        result = original_save(task)
+        if task.data.get('status') == 'pending' and not switched[0]:
+            switched[0] = True
+            now[0] += save_advance
+            FakePoller.at_offset = snapshot_offset
+        return result
+    monkeypatch.setattr(Task, 'save', save_then_advance)
+    waits = []
+    def wait(seconds):
+        waits.append(seconds)
+        now[0] += max(seconds, 0.0)
+        if len(waits) >= 4:
+            raise KeyboardInterrupt
+    FakePoller.on_timeout = wait
+    try:
+        assert execute(school, tmp_path, clock=lambda: now[0], sleep=wait,
+                       background_poller=True) == 130
+    finally:
+        FakePoller.on_timeout = None
+    events = [line['event'] for line in diagnostics_rows(tmp_path)]
+    assert ('pending_snapshot_confirmed' in events) is confirmed
+    assert (json.loads((tmp_path / 'task.json').read_text())['status'] == 'pending') is (not confirmed)
+
+
 def test_disabling_prefetch_and_prewarm_restores_the_fresh_captcha_path(tmp_path):
     school = School()
     school.activities = [native_activity()]
@@ -2394,7 +2528,7 @@ def test_preparation_is_deduplicated_across_school_clock_jitter(tmp_path):
             raise KeyboardInterrupt
     assert execute(school, tmp_path, clock=clock, sleep=wait) == 130
     lines = diagnostics_rows(tmp_path)
-    assert sum(line['event'] == 'prewarm_history' for line in lines) == 1
+    assert not any(line['event'] == 'prewarm_history_requested' for line in lines)
     assert sum(line['event'] == 'captcha_prefetched' for line in lines) == 1
     assert school.submitted == ['one']
 
@@ -2420,7 +2554,7 @@ def test_preparation_targets_the_next_not_yet_open_lecture(tmp_path):
     assert execute(school, tmp_path, clock=clock, sleep=wait) == 130
     lines = diagnostics_rows(tmp_path)
     assert school.submitted == ['open']
-    assert any(line['event'] == 'prewarm_history' and line['at'] >= full_start
+    assert not any(line['event'] == 'prewarm_history_requested' and line['at'] >= full_start
                for line in lines)
     assert any(line['event'] == 'captcha_prefetched' and line['at'] >= full_start
                for line in lines)
@@ -2445,6 +2579,14 @@ class FakeHistoryPoller:
         self.query = query
         self.clock = clock
         self.running = True
+        self.polls = 0
+
+    def snapshot_with_version(self):
+        return self.snapshot(), self.polls
+
+    def request_refresh(self):
+        self.polls += 1
+        return self.polls
 
     def start(self):
         self.running = True
@@ -2510,7 +2652,7 @@ def test_background_history_refresh_supplies_the_opening_cache(tmp_path, monkeyp
     assert hist_queries == []
 
 
-def test_background_history_failure_falls_back_to_the_sync_query(tmp_path, monkeypatch):
+def test_background_history_failure_waits_instead_of_reading_synchronously(tmp_path, monkeypatch):
     import seu_reserve.app as app_module
     seed_opening_selection(tmp_path)
     monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
@@ -2542,12 +2684,11 @@ def test_background_history_failure_falls_back_to_the_sync_query(tmp_path, monke
         FakePoller.on_timeout = None
     lines = diagnostics_rows(tmp_path)
     assert not any(line['event'] == 'history_background_used' for line in lines)
-    # The fast path retries across rounds first; only after the three misses does it read history
-    # synchronously, which is what this test exercises.
-    assert any(line['event'] == 'opening_history_missing' for line in lines)
-    assert any(line['event'] == 'opening_history_sync_fallback' for line in lines)
+    # The unified architecture keeps waiting for its history owner; it never reads history from
+    # the main thread, not even after the old three-miss threshold.
+    assert any(line['event'] == 'reader_snapshot_missing' for line in lines)
     hist_queries = [url for _, url, _ in school.requests if url.endswith('queryMyActivityList.do')]
-    assert hist_queries
+    assert hist_queries == []
 
 
 @pytest.mark.parametrize('server_directed, retry_after', [(False, 0.0), (True, 60.0)])
@@ -2571,7 +2712,7 @@ def test_stopped_activity_reader_failure_is_diagnosed_once_with_a_fixed_reason(
             if StoppedPoller.reads == 1:
                 return self._snapshot_cls(rows=list(FakePoller.next_rows), at=now)
             return self._snapshot_cls(rows=[], at=now, error='RemoteError',
-                                      reason='server_backoff', retry_after=retry_after,
+                                      reason='server_backoff' if server_directed else 'network_timeout', retry_after=retry_after,
                                       failed_at=now, server_directed=server_directed)
 
     monkeypatch.setattr(app_module, 'ActivityPoller', StoppedPoller)
@@ -2601,10 +2742,13 @@ def test_stopped_activity_reader_failure_is_diagnosed_once_with_a_fixed_reason(
                                      captcha_prefetch=False)) == 130
     stopped = [line for line in diagnostics_rows(tmp_path)
                if line['event'] == 'background_reader_stopped']
+    if server_directed:
+        assert not stopped  # parked by the shared gate before recycling
+        return
     assert len(stopped) == 1
     entry = stopped[0]
     assert entry['reader'] == 'activities'
-    assert entry['reason'] == 'server_backoff'
+    assert entry['reason'] == 'network_timeout'
     assert entry['server_directed'] is server_directed
     assert entry['retry_seconds'] == retry_after
     # Diagnostics only: no event log line, terminal output or mail notification.
@@ -2672,62 +2816,6 @@ def test_stopped_history_reader_failure_is_diagnosed_once_with_a_fixed_reason(
     assert 'background_reader_stopped' not in (tmp_path / 'events.log').read_text()
 
 
-def test_opening_fallback_list_queries_are_spaced_when_the_reader_always_errors(
-        tmp_path, monkeypatch):
-    """With the reader down, the fast loop must not issue one synchronous list query per scan."""
-    import seu_reserve.app as app_module
-    seed_opening_selection(tmp_path, start='2026-10-18T12:00:04+08:00')
-
-    class AlwaysErrorPoller(FakePoller):
-        """Reader that keeps publishing a failed snapshot instead of recovering."""
-
-        def snapshot(self):
-            now = self.clock()
-            return self._snapshot_cls(rows=[], at=now, error='RemoteError',
-                                      reason='network_failure', failed_at=now)
-
-    monkeypatch.setattr(app_module, 'ActivityPoller', AlwaysErrorPoller)
-    monkeypatch.setattr(app_module, 'new_history_poller', FakeHistoryPoller)
-    FakePoller.instances.clear()
-    FakePoller.rows_override = None
-    FakePoller.at_offset = 0.0
-    FakePoller.next_wake_once = False
-    FakePoller.next_rows = [native_activity(opens='2026-10-18 12:00:04')]
-    FakeHistoryPoller.rows = []
-    FakeHistoryPoller.error = None
-    FakeHistoryPoller.reason = None
-    FakeHistoryPoller.retry_after = 0.0
-    FakeHistoryPoller.server_directed = False
-    start = moment('2026-10-18 12:00:00').timestamp()
-    now = [start]
-    list_starts = []
-    class TimedSchool(School):
-        def request(self, method, url, **kwargs):
-            if urlsplit(url).path.endswith('queryActivityList.do'):
-                list_starts.append(now[0])
-                # A real list request takes time; without it the fake clock would freeze between
-                # two fallbacks and the spacing could not be observed.
-                now[0] += 0.01
-            return super().request(method, url, **kwargs)
-    school = TimedSchool()
-    school.activities = [native_activity(opens='2026-10-18 12:00:04')]
-    def clock(): return now[0]
-    def wait(seconds):
-        now[0] += max(seconds, 0.0)
-        if now[0] - start >= 2.0:
-            raise KeyboardInterrupt
-    FakePoller.on_timeout = wait
-    try:
-        assert execute(school, tmp_path, clock=clock, sleep=wait,
-                       background_poller=True) == 130
-    finally:
-        FakePoller.on_timeout = None
-    assert not school.submitted
-    assert list_starts and list_starts[0] == start          # first fallback is never delayed
-    gaps = [later - earlier for earlier, later in zip(list_starts, list_starts[1:])]
-    assert gaps and all(gap >= 0.24 for gap in gaps)
-    # ~4 synchronous requests/s instead of the unthrottled ~10/s burst.
-    assert len(list_starts) <= 10
 
 
 def test_prefetch_uses_the_earliest_plausible_opening_time(tmp_path):
@@ -2822,7 +2910,7 @@ def test_opening_stale_snapshot_does_not_wait_for_the_inflight_poll(tmp_path, mo
     list_queries = [url for _, url, _ in school.requests if url.endswith('queryActivityList.do')]
     # The opening fast path keeps its 0.1 s cadence; only the initial bootstrap scan (before the
     # opening flag is established) may take the legacy short wait.
-    assert len(list_queries) == 1
+    assert len(list_queries) == 0
     assert SpringPoller.wakes <= 1
     timings = [line for line in diagnostics_rows(tmp_path) if line['event'] == 'scan_timing']
     assert not any(line['rows_source'] == 'poller' for line in timings)
@@ -2843,7 +2931,7 @@ def test_prewarm_and_captcha_prefetch_move_work_before_the_candidate(tmp_path):
     assert execute(school, tmp_path, clock=clock, sleep=wait) == 130
     assert school.submitted == ['one']
     lines = diagnostics_rows(tmp_path)
-    assert any(line['event'] == 'prewarm_history' for line in lines)
+    assert not any(line['event'] == 'prewarm_history_requested' for line in lines)
     assert any(line['event'] == 'captcha_prefetched' for line in lines)
     started = [line for line in lines if line['event'] == 'submission_started']
     assert started and started[0]['captcha_source'] == 'prefetch'
@@ -2968,63 +3056,7 @@ def test_error_backoff_stops_both_query_threads_before_waiting(tmp_path, monkeyp
                    settings=Settings(state_dir=tmp_path, prewarm=False,
                                      captcha_prefetch=False)) == 130
     assert 'history_stop' in events and 'wait' in events
-    assert events.index('history_stop') < events.index('wait')
-
-
-class VersionedStalePoller(FakePoller):
-    """Reports a stale snapshot with a version newer than anything consumed."""
-
-    since_calls = []
-
-    def snapshot_with_version(self):
-        from seu_reserve.poller import Snapshot
-        at = self.clock() - 5.0
-        return Snapshot(rows=list(FakePoller.next_rows), at=at, started=at - 0.1,
-                        seconds=0.1), 5
-
-    def wait_update(self, timeout, since=None):
-        VersionedStalePoller.since_calls.append(since)
-        # First call is the normal opening wait: let the scan proceed to the fallback path.
-        if len(VersionedStalePoller.since_calls) == 1:
-            return True
-        if len(VersionedStalePoller.since_calls) >= 3:
-            raise KeyboardInterrupt
-        return False
-
-
-def test_opening_uses_one_bounded_sync_fallback_after_repeated_misses(tmp_path, monkeypatch):
-    import seu_reserve.app as app_module
-    seed_opening_selection(tmp_path, start='2026-10-18T12:00:10+08:00')
-    monkeypatch.setattr(app_module, 'ActivityPoller', VersionedStalePoller)
-    monkeypatch.setattr(app_module, 'new_history_poller', FakeHistoryPoller)
-    VersionedStalePoller.since_calls = []
-    FakePoller.next_rows = [native_activity(opens='2026-10-18 12:00:10')]
-    FakeHistoryPoller.rows = []
-    FakeHistoryPoller.error = None
-    FakeHistoryPoller.retry_after = 0.0
-    FakeHistoryPoller.server_directed = False
-    school = School()
-    school.activities = list(FakePoller.next_rows)
-    now = [moment('2026-10-18 12:00:00').timestamp()]
-    clock = lambda: now[0]
-    waits = []
-
-    def wait(seconds):
-        waits.append(seconds)
-        now[0] += max(seconds, 0.0)
-        if len(waits) >= 6:
-            raise KeyboardInterrupt
-
-    assert execute(school, tmp_path, clock=clock, sleep=wait,
-                   background_poller=True,
-                   settings=Settings(state_dir=tmp_path, prewarm=False,
-                                     captcha_prefetch=False)) == 130
-    # No blocking wait for a newer version of the stale snapshot; after three misses one sync
-    # list query is allowed and it must use the short fallback budget.
-    assert 5 not in VersionedStalePoller.since_calls
-    list_timeouts = [kwargs.get('timeout') for _, url, kwargs in school.requests
-                     if url.endswith('queryActivityList.do')]
-    assert list_timeouts and list_timeouts[-1] == app_module.OPENING_SYNC_FALLBACK_TIMEOUT
+    assert events.index('history_stop') > events.index('wait')
 
 
 def test_opening_snapshot_missing_is_logged_once_per_outage(tmp_path, monkeypatch):
@@ -3065,109 +3097,109 @@ def test_opening_snapshot_missing_is_logged_once_per_outage(tmp_path, monkeypatc
     finally:
         FakePoller.at_offset = 0.0
     events = [line['event'] for line in diagnostics_rows(tmp_path)]
-    assert events.count('opening_snapshot_missing') == 1
-    assert events.count('opening_sync_fallback') >= 2
+    assert events.count('reader_snapshot_missing') == 1
 
 
-def test_missing_started_reader_still_counts_toward_the_three_miss_fallback(tmp_path, monkeypatch):
+@pytest.mark.parametrize('reader', ['activities', 'history'])
+def test_long_reader_outage_logs_one_stall_line_per_reader(tmp_path, monkeypatch, reader):
     import seu_reserve.app as app_module
-    seed_opening_selection(tmp_path, start='2026-10-18T12:00:10+08:00')
-
-    class DeadPoller(FakePoller):
-        """Claims to start, but the worker is already gone, like a recycled reader."""
-
-        def start(self):
-            self.running = False
-
-    monkeypatch.setattr(app_module, 'ActivityPoller', DeadPoller)
+    monkeypatch.setattr(app_module, 'READER_STALL_SECONDS', 10.0)
+    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
     monkeypatch.setattr(app_module, 'new_history_poller', FakeHistoryPoller)
     FakePoller.instances.clear()
-    FakePoller.next_rows = [native_activity(opens='2026-10-18 12:00:10')]
-    FakePoller.next_error = 'RemoteError'
-    FakePoller.error_retry_after = 0.0
-    FakePoller.error_server_directed = False
+    FakePoller.rows_override = None
+    FakePoller.next_rows = []
+    FakePoller.next_error = None
+    FakePoller.next_wake_once = False
+    FakePoller.at_offset = 0.0
     FakeHistoryPoller.rows = []
     FakeHistoryPoller.error = None
+    FakeHistoryPoller.reason = None
     FakeHistoryPoller.retry_after = 0.0
     FakeHistoryPoller.server_directed = False
+    if reader == 'activities':
+        FakePoller.at_offset = -60.0
+    else:
+        FakeHistoryPoller.error = 'RemoteError'
+        FakeHistoryPoller.reason = 'network_timeout'
     school = School()
-    school.activities = list(FakePoller.next_rows)
+    school.activities = []
     now = [moment('2026-10-18 12:00:00').timestamp()]
     waits = []
-
-    def clock():
-        return now[0]
-
     def wait(seconds):
         waits.append(seconds)
         now[0] += max(seconds, 0.0)
-        if len(waits) >= 8:
+        if len(waits) >= 20:
             raise KeyboardInterrupt
+    FakePoller.on_timeout = wait
+    try:
+        assert execute(school, tmp_path, clock=lambda: now[0], sleep=wait,
+                       background_poller=True,
+                       settings=Settings(state_dir=tmp_path, prewarm=False,
+                                         captcha_prefetch=False)) == 130
+    finally:
+        FakePoller.on_timeout = None
+        FakePoller.at_offset = 0.0
+        FakeHistoryPoller.error = None
+    stalled = [line for line in diagnostics_rows(tmp_path) if line['event'] == 'reader_stalled']
+    assert {line['reader'] for line in stalled} == {reader}
+    assert all(line['missing_seconds'] >= 10.0 for line in stalled)
+    assert len(stalled) == 1  # once per reader per outage
 
-    assert execute(school, tmp_path, clock=clock, sleep=wait,
-                   background_poller=True,
-                   settings=Settings(state_dir=tmp_path, prewarm=False,
-                                     captcha_prefetch=False)) == 130
-    events = [line['event'] for line in diagnostics_rows(tmp_path)]
-    # A reader that disappeared after having started must not bypass the three-miss guard and
-    # immediately take the synchronous fallback.
-    assert 'opening_snapshot_missing' in events
-    assert 'opening_sync_fallback' in events
 
-
-def test_running_stale_history_reader_still_gets_the_three_round_guard(tmp_path, monkeypatch):
-    """A running reader whose snapshot is unusable must not skip the miss guard.
-
-    The refresh request is absent/consumed here, so the old ``history_waiting`` condition was
-    false and the scan immediately fell back to a synchronous history query on every round.
-    """
+def test_starting_reader_is_not_reported_as_missing(tmp_path, monkeypatch):
     import seu_reserve.app as app_module
-    seed_opening_selection(tmp_path, start='2026-10-18T12:00:10+08:00')
-
-    class AlwaysStaleHistory(FakeHistoryPoller):
+    class StartingPoller(FakePoller):
+        empty = [True]
         def snapshot(self):
-            from seu_reserve.poller import Snapshot
-            now = self.clock()
-            return Snapshot(rows=[], at=now - 60.0, error=None, seconds=0.4)
-
-    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
-    monkeypatch.setattr(app_module, 'new_history_poller', AlwaysStaleHistory)
+            return None if StartingPoller.empty[0] else super().snapshot()
+    monkeypatch.setattr(app_module, 'ActivityPoller', StartingPoller)
+    monkeypatch.setattr(app_module, 'new_history_poller', FakeHistoryPoller)
     FakePoller.instances.clear()
     FakePoller.rows_override = None
     FakePoller.next_rows = []
     FakePoller.next_error = None
     FakePoller.at_offset = 0.0
-    FakePoller.next_wake_once = False
     FakeHistoryPoller.rows = []
     FakeHistoryPoller.error = None
     FakeHistoryPoller.retry_after = 0.0
     FakeHistoryPoller.server_directed = False
     school = School()
     school.activities = []
-    school.mine = []
     now = [moment('2026-10-18 12:00:00').timestamp()]
     waits = []
-
-    def clock():
-        return now[0]
-
     def wait(seconds):
         waits.append(seconds)
         now[0] += max(seconds, 0.0)
+        if len(waits) == 1:
+            # The first reader query is still in flight: this is startup, not an outage.
+            path = tmp_path / 'diagnostics.jsonl'
+            early = ([json.loads(line) for line in path.read_text().splitlines()]
+                     if path.exists() else [])
+            assert not any(line['event'] == 'reader_snapshot_missing'
+                           and line.get('reader') == 'activities' for line in early)
+        if len(waits) == 2:
+            # Now the reader has completed a poll but produced a stale snapshot: a real outage.
+            StartingPoller.empty[0] = False
+            FakePoller.at_offset = -60.0
         if len(waits) >= 8:
             raise KeyboardInterrupt
-
     FakePoller.on_timeout = wait
     try:
-        assert execute(school, tmp_path, clock=clock, sleep=wait,
+        assert execute(school, tmp_path, clock=lambda: now[0], sleep=wait,
                        background_poller=True,
                        settings=Settings(state_dir=tmp_path, prewarm=False,
                                          captcha_prefetch=False)) == 130
     finally:
         FakePoller.on_timeout = None
-    events = [line['event'] for line in diagnostics_rows(tmp_path)]
-    assert 'opening_history_missing' in events
-    assert 'opening_history_sync_fallback' in events
+        FakePoller.at_offset = 0.0
+    missing = [line['event'] for line in diagnostics_rows(tmp_path)
+               if line.get('reader') == 'activities']
+    assert missing.count('reader_snapshot_missing') == 1
+
+
+
+
 
 
 def test_opening_pending_check_does_not_fabricate_a_network_failure(
@@ -3230,8 +3262,9 @@ def test_opening_pending_check_does_not_fabricate_a_network_failure(
     saved = json.loads(state_path.read_text())
     assert saved['status'] == 'pending' and saved['activity'] == 'one'
     assert saved.get('pending_checks', 0) == 0
-    assert waits and .05 <= waits[-1] <= .10
-    assert any(line['event'] == 'opening_snapshot_missing'
+    # Missing snapshots wait for publication or a deadline instead of fast scan polling.
+    assert waits == [5.0, 5.0]
+    assert any(line['event'] == 'reader_snapshot_missing'
                for line in diagnostics_rows(tmp_path))
 
 
@@ -3292,87 +3325,14 @@ def test_opening_pending_miss_does_not_query_history_every_round(tmp_path, monke
     appended = (tmp_path / 'events.log').read_text()[len(before):]
     # The miss resets pending_checks, so a completed check can reach count 1 again; the event must
     # still be written once per pending episode, not once per completed check.
-    assert appended.count('event=reservation_unconfirmed') == 1
+    assert appended.count('event=reservation_unconfirmed') == 0
     saved = json.loads(state_path.read_text())
     assert saved['status'] == 'pending' and saved['activity'] == 'one'
     assert saved.get('pending_checks', 0) in (0, 1, 2)
     # The per-episode marker is persisted so a restart cannot announce the same episode again.
-    assert saved.get('pending_unconfirmed_notified') is True
+    assert saved.get('pending_unconfirmed_notified') is not True
 
 
-def test_opening_pending_probe_server_wait_is_honored_before_history(tmp_path, monkeypatch):
-    """A 429 seen by the pending fast-path probe must be waited out before querying history."""
-    import seu_reserve.app as app_module
-    school = School()
-    school.activities = [lecture()]
-    school.submit_timeout = True
-    assert execute(school, tmp_path) == 130
-    state_path = tmp_path / 'task.json'
-    saved = json.loads(state_path.read_text())
-    assert saved['status'] == 'pending' and saved['activity'] == 'one'
-    saved['retry_at'] = 0
-    for field in ('step_failure_since', 'query_failure_since', 'pending_checks', 'pending_since'):
-        saved.pop(field, None)
-    state_path.write_text(json.dumps(saved))
-
-    seed_opening_selection(tmp_path, start='2026-10-18T12:00:10+08:00')
-    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
-    monkeypatch.setattr(app_module, 'new_history_poller', FakeHistoryPoller)
-    FakePoller.instances.clear()
-    FakePoller.rows_override = None
-    FakePoller.next_rows = []
-    FakePoller.next_error = None
-    FakePoller.at_offset = -5.0
-    FakePoller.next_wake_once = False
-    FakeHistoryPoller.rows = []
-    FakeHistoryPoller.error = None
-    FakeHistoryPoller.retry_after = 0.0
-    FakeHistoryPoller.server_directed = False
-
-    class LimitedList(School):
-        limited = True
-        history_after_limit = 0
-
-        def request(self, method, url, **kwargs):
-            # `limited` flips to False when the 429 is produced, so count history requests only
-            # after that point: those are the requests the server-directed wait must suppress.
-            if not self.limited and url.endswith('queryMyActivityList.do'):
-                self.history_after_limit += 1
-            response = super().request(method, url, **kwargs)
-            if self.limited and url.endswith('queryActivityList.do'):
-                self.limited = False
-                response.status_code = 429
-                response.headers['Retry-After'] = '120'
-            return response
-
-    limited = LimitedList()
-    limited.activities = []
-    limited.mine = []
-    now = [moment('2026-10-18 12:00:00').timestamp()]
-    waits = []
-
-    def clock():
-        return now[0]
-
-    def wait(seconds):
-        waits.append(seconds)
-        now[0] += max(seconds, 0.0)
-        if seconds >= 100:
-            raise KeyboardInterrupt
-
-    FakePoller.on_timeout = wait
-    try:
-        assert execute(limited, tmp_path, clock=clock, sleep=wait,
-                       background_poller=True,
-                       settings=Settings(state_dir=tmp_path, prewarm=False,
-                                         captcha_prefetch=False)) == 130
-    finally:
-        FakePoller.on_timeout = None
-    # The server-directed wait is honored before the history query: no history request may be
-    # issued after the 429, and the scan-level backoff uses the full 120 s.
-    assert limited.history_after_limit == 0
-    assert any(seconds >= 100 for seconds in waits)
-    assert 'event=server_backoff' in (tmp_path / 'events.log').read_text()
 
 
 def test_new_pending_episode_clears_a_stale_unconfirmed_notice(tmp_path):
@@ -3455,131 +3415,11 @@ def test_persisted_unconfirmed_notice_suppresses_a_restart_duplicate(tmp_path, m
     assert 'event=reservation_unconfirmed' not in appended
     assert json.loads(state_path.read_text()).get('pending_unconfirmed_notified') is True
     # A completed check really ran, so the missing event is suppression and not a skipped check.
-    assert any(line['event'] == 'reservation_checked' for line in diagnostics_rows(tmp_path))
+    assert not any(line['event'] == 'reservation_checked' for line in diagnostics_rows(tmp_path))
 
 
-def test_list_reader_wait_learned_mid_scan_stops_the_history_reader(tmp_path, monkeypatch):
-    """The longer wait learned by the list reader must also bind the history reader."""
-    import seu_reserve.app as app_module
-    seed_opening_selection(tmp_path, start='2026-10-18T12:00:10+08:00')
-    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
-    monkeypatch.setattr(app_module, 'new_history_poller', FakeHistoryPoller)
-    FakePoller.instances.clear()
-    FakePoller.rows_override = None
-    FakePoller.next_rows = [native_activity(opens='2026-10-18 12:00:10')]
-    FakePoller.next_wake_once = False
-    FakePoller.at_offset = -5.0
-    FakePoller.next_error = None
-    FakePoller.error_retry_after = 0.0
-    FakePoller.error_server_directed = False
-    FakeHistoryPoller.rows = []
-    FakeHistoryPoller.error = None
-    FakeHistoryPoller.retry_after = 0.0
-    FakeHistoryPoller.server_directed = False
-    FakeHistoryPoller.events = []
-    FakeHistoryPoller.starts = 0
-
-    class LongWaitSchool(School):
-        lists = 0
-
-        def request(self, method, url, **kwargs):
-            if urlsplit(url).path.endswith('queryActivityList.do'):
-                self.lists += 1
-                if self.lists >= 2:
-                    # The list reader learns a 120 s wait while the synchronous fallback response
-                    # only carries a 10 s Retry-After.
-                    FakePoller.next_error = 'RemoteError'
-                    FakePoller.error_retry_after = 120.0
-                    FakePoller.error_server_directed = True
-                    self.query_statuses = [429]
-            response = super().request(method, url, **kwargs)
-            if urlsplit(url).path.endswith('queryActivityList.do') and self.lists >= 2:
-                response.headers['Retry-After'] = '10'
-            return response
-
-    school = LongWaitSchool()
-    school.activities = list(FakePoller.next_rows)
-    now = [moment('2026-10-18 12:00:00').timestamp()]
-    waits = []
-
-    def clock():
-        return now[0]
-
-    def wait(seconds):
-        waits.append(seconds)
-        now[0] += max(seconds, 0.0)
-        if seconds >= 100 or len(waits) >= 100:
-            raise KeyboardInterrupt
-
-    FakePoller.on_timeout = wait
-    try:
-        assert execute(school, tmp_path, clock=clock, sleep=wait,
-                       background_poller=True,
-                       settings=Settings(state_dir=tmp_path, prewarm=False,
-                                         captcha_prefetch=False)) == 130
-    finally:
-        FakePoller.on_timeout = None
-        FakePoller.next_error = None
-        FakePoller.error_retry_after = 0.0
-        FakePoller.error_server_directed = False
-    # The first defer only lasts 10 s; the history reader must not restart inside the remaining
-    # 110 s of the shared wait that the list reader reported.
-    assert FakeHistoryPoller.starts == 1
-    assert any(abs(seconds - 10.0) < 0.5 for seconds in waits)
-    assert any(seconds >= 100 for seconds in waits)
 
 
-def test_prewarm_history_keeps_its_budget_when_the_opening_fast_path_is_active(
-        tmp_path, monkeypatch):
-    """The prewarm query must use its own documented budget, not the 0.5 s sync fallback cap."""
-    import seu_reserve.app as app_module
-    seed_opening_selection(tmp_path, start='2026-10-18T12:00:10+08:00')
-    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
-    monkeypatch.setattr(app_module, 'new_history_poller', FakeHistoryPoller)
-    FakePoller.instances.clear()
-    FakePoller.rows_override = None
-    FakePoller.next_rows = []
-    FakePoller.next_error = None
-    FakePoller.at_offset = 0.0
-    FakePoller.next_wake_once = False
-    FakeHistoryPoller.rows = []
-    FakeHistoryPoller.error = None
-    original_client = app_module.Client
-    timeouts = []
-
-    class RecordingClient(original_client):
-        def mine(self):
-            timeouts.append(self.timeout)
-            return super().mine()
-
-    monkeypatch.setattr(app_module, 'Client', RecordingClient)
-    school = School()
-    school.activities = [native_activity(opens='2026-10-18 12:00:10')]
-    FakePoller.next_rows = school.activities
-    now = [moment('2026-10-18 12:00:00').timestamp()]
-
-    def clock():
-        return now[0]
-
-    def wait(seconds):
-        now[0] += max(seconds, 0.0)
-        if school.submitted or len(timeouts) > 200:
-            raise KeyboardInterrupt
-
-    FakePoller.on_timeout = wait
-    try:
-        assert execute(school, tmp_path, clock=clock, sleep=wait,
-                       background_poller=True,
-                       settings=Settings(state_dir=tmp_path, prewarm=True,
-                                         captcha_prefetch=False)) == 130
-    finally:
-        FakePoller.on_timeout = None
-    assert school.submitted == ['one']
-    # The prewarm request runs ~2 s before the opening: min(1.5 s, remaining-0.1) > 1 s, while the
-    # opening fallback cap would force 0.5 s. Other history reads in the window stay at 0.5 s.
-    budgeted = [timeout for timeout in timeouts if timeout is not None and timeout > 1.0]
-    assert budgeted and all(timeout <= app_module.PREWARM_TIMEOUT for timeout in budgeted)
-    assert any(line['event'] == 'prewarm_history' for line in diagnostics_rows(tmp_path))
 
 
 def test_opening_poller_server_wait_is_honored_without_a_sync_fallback(
@@ -3621,7 +3461,7 @@ def test_opening_poller_server_wait_is_honored_without_a_sync_fallback(
     assert len(list_queries) <= 1
     assert any(seconds >= 100 for seconds in waits)
     # The history reader must not restart inside the list reader's server-directed wait.
-    assert FakeHistoryPoller.starts == 1
+    assert FakeHistoryPoller.starts == 0
     FakePoller.next_error = None
     FakePoller.error_retry_after = 0.0
     FakePoller.error_server_directed = False
@@ -3656,52 +3496,6 @@ def test_slow_sync_list_skips_preparation_when_clock_uncertainty_is_large(
     started = [line for line in lines if line['event'] == 'submission_started']
     assert started and started[0]['captcha_source'] == 'fresh'
 
-def test_mid_scan_history_wait_blocks_the_sync_history_fallback(tmp_path, monkeypatch):
-    import seu_reserve.app as app_module
-    seed_opening_selection(tmp_path, start='2026-10-18T12:00:10+08:00')
-    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
-    monkeypatch.setattr(app_module, 'new_history_poller', FakeHistoryPoller)
-    activities = [native_activity(opens='2026-10-18 12:00:10')]
-    FakePoller.instances.clear()
-    FakePoller.rows_override = None
-    FakePoller.at_offset = -5.0
-    FakePoller.next_error = None
-    FakePoller.next_wake_once = True
-    FakeHistoryPoller.rows = []
-    FakeHistoryPoller.error = None
-    FakeHistoryPoller.server_directed = False
-    FakeHistoryPoller.retry_after = 0.0
-    class MidScanLimited(School):
-        def request(self, method, url, **kwargs):
-            response = super().request(method, url, **kwargs)
-            if url.endswith('queryActivityList.do'):
-                # The refresher learns the server-directed wait after the scan-start check.
-                FakeHistoryPoller.error = 'RemoteError'
-                FakeHistoryPoller.retry_after = 120.0
-                FakeHistoryPoller.server_directed = True
-            return response
-    school = MidScanLimited()
-    school.activities = list(activities)
-    FakePoller.next_rows = list(activities)
-    now = [moment('2026-10-18 12:00:00').timestamp()]
-    def clock(): return now[0]
-    def stop(seconds):
-        now[0] += max(seconds, 0.0)
-        raise KeyboardInterrupt
-    FakePoller.on_timeout = stop
-    try:
-        assert execute(school, tmp_path, clock=clock, sleep=stop, background_poller=True,
-                       settings=Settings(state_dir=tmp_path, prewarm=False,
-                                         captcha_prefetch=False)) == 130
-    finally:
-        FakePoller.on_timeout = None
-    history_queries = [url for _, url, _ in school.requests
-                       if url.endswith('queryMyActivityList.do')]
-    assert history_queries == []
-    saved = json.loads((tmp_path / 'task.json').read_text())
-    assert saved.get('retry_server') is True
-    assert saved['retry_at'] >= moment('2026-10-18 12:00:00').timestamp() + 120
-    assert 'event=server_backoff' in (tmp_path / 'events.log').read_text()
 
 
 def test_activity_list_without_an_id_does_not_advance_pending_checks(tmp_path):
@@ -3780,55 +3574,11 @@ def test_invalid_background_history_falls_back_to_sync_after_the_guard(tmp_path,
     assert not any(line['event'] == 'history_background_used' for line in lines)
     history_queries = [url for _, url, _ in school.requests
                        if url.endswith('queryMyActivityList.do')]
-    assert history_queries
+    assert history_queries == []
     assert 'event=invalid_activity_data' not in (tmp_path / 'events.log').read_text()
     saved = json.loads((tmp_path / 'task.json').read_text())
     assert saved['health'].get('failure_count', 0) == 0
 
-def test_background_readers_use_the_opening_query_budget_and_share_the_gate(
-        tmp_path, monkeypatch):
-    import seu_reserve.app as app_module
-    seed_opening_selection(tmp_path, start='2026-10-18T12:00:10+08:00')
-    seen = {}
-    class RecordingPoller(FakePoller):
-        def __init__(self, query, *, interval, clock, **kwargs):
-            super().__init__(query, interval=interval, clock=clock, **kwargs)
-            seen['list_timeout'] = getattr(query.__self__, 'timeout', None)
-            seen['list_gate'] = kwargs.get('gate')
-    class RecordingHistory(FakeHistoryPoller):
-        def __init__(self, query, *, interval, clock, **kwargs):
-            super().__init__(query, interval=interval, clock=clock, **kwargs)
-            seen['history_timeout'] = getattr(query.__self__, 'timeout', None)
-            seen['history_gate'] = kwargs.get('gate')
-    monkeypatch.setattr(app_module, 'ActivityPoller', RecordingPoller)
-    monkeypatch.setattr(app_module, 'new_history_poller', RecordingHistory)
-    activities = [native_activity(opens='2026-10-18 12:00:10')]
-    FakePoller.instances.clear()
-    FakePoller.rows_override = None
-    FakePoller.at_offset = 0.0
-    FakePoller.next_error = None
-    FakePoller.next_wake_once = False
-    FakeHistoryPoller.rows = []
-    FakeHistoryPoller.error = None
-    FakeHistoryPoller.server_directed = False
-    FakeHistoryPoller.retry_after = 0.0
-    school = School()
-    school.activities = list(activities)
-    FakePoller.next_rows = list(activities)
-    now = [moment('2026-10-18 12:00:00').timestamp()]
-    def clock(): return now[0]
-    def stop(_seconds): raise KeyboardInterrupt
-    FakePoller.on_timeout = stop
-    try:
-        assert execute(school, tmp_path, clock=clock, sleep=stop, background_poller=True,
-                       settings=Settings(state_dir=tmp_path, prewarm=False,
-                                         captcha_prefetch=False)) == 130
-    finally:
-        FakePoller.on_timeout = None
-    assert seen.get('list_timeout') == app_module.OPENING_BACKGROUND_TIMEOUT
-    assert seen.get('history_timeout') == app_module.OPENING_BACKGROUND_TIMEOUT
-    assert seen.get('list_gate') is not None
-    assert seen.get('list_gate') is seen.get('history_gate')
 
 
 def test_invalid_salon_history_falls_back_to_sync_after_the_guard(tmp_path, monkeypatch):
@@ -3873,7 +3623,7 @@ def test_invalid_salon_history_falls_back_to_sync_after_the_guard(tmp_path, monk
     assert not any(line['event'] == 'history_background_used' for line in lines)
     history_queries = [url for _, url, _ in school.requests
                        if url.endswith('queryMyActivityList.do')]
-    assert history_queries
+    assert history_queries == []
     events = (tmp_path / 'events.log').read_text()
     assert 'event=invalid_activity_data' not in events
     saved = json.loads((tmp_path / 'task.json').read_text())
@@ -3894,7 +3644,7 @@ def test_stale_background_history_is_retried_across_rounds_without_blocking(tmp_
             return Snapshot(rows=list(FakeHistoryPoller.rows), at=self.clock() - age)
 
         def request_refresh(self):
-            pass
+            return super().request_refresh()
 
         def wait_update(self, timeout, since=None):
             StaleThenFreshHistory.waits.append(timeout)
@@ -4034,7 +3784,7 @@ def test_stale_history_is_retried_without_blocking_before_candidate_selection(
             return Snapshot(rows=[], at=self.clock() - age)
 
         def request_refresh(self):
-            pass
+            return super().request_refresh()
 
         def wait_update(self, timeout, since=None):
             StaleHistory.waits.append(timeout)
@@ -4507,7 +4257,7 @@ def test_withdrawn_record_does_not_block_a_conflicting_candidate(tmp_path):
     assert school.submitted == ['new']
 
 
-def test_missing_started_history_reader_still_counts_toward_the_fallback(tmp_path, monkeypatch):
+def test_dead_history_reader_never_falls_back_to_a_main_thread_query(tmp_path, monkeypatch):
     import seu_reserve.app as app_module
     seed_opening_selection(tmp_path, start='2026-10-18T12:00:10+08:00')
 
@@ -4561,9 +4311,11 @@ def test_missing_started_history_reader_still_counts_toward_the_fallback(tmp_pat
     finally:
         FakePoller.on_timeout = None
     events = [line['event'] for line in diagnostics_rows(tmp_path)]
-    # A history reader that disappeared after having started must not bypass the guard.
-    assert 'opening_history_missing' in events
-    assert 'opening_history_sync_fallback' in events
+    # A history reader that disappeared after having started is diagnosed as missing, but the
+    # unified architecture never pays for a synchronous main-thread history query.
+    assert 'reader_snapshot_missing' in events
+    queries = [url for _, url, _ in school.requests if url.endswith('queryMyActivityList.do')]
+    assert queries == []
 
 
 def test_hold_deadline_uses_host_clock_and_school_offset():

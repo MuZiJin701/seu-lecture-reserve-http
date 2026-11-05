@@ -15,12 +15,12 @@ from seu_reserve.state import Task
 
 
 @pytest.mark.parametrize(('offset','expected'),[
-    (-31,(10,10,25,30)),(-30,(2,2,5,10)),(-5,(2,2,5,10)),
-    (8.99,(2,2,5,10)),(9,(2,2,5,10)),(300,(10,10,25,30)),
+    (-31,(10,10)),(-30,(2,2)),(-5,(2,2)),
+    (8.99,(2,2)),(9,(2,2)),(300,(10,10)),
 ])
 def test_shared_read_policy_at_phase_boundaries(offset,expected):
     policy=app.read_policy([(1000,1300)],1000+offset)
-    assert (policy.timeout,policy.list_max_age,policy.history_interval,policy.history_max_age)==expected
+    assert (policy.timeout,policy.list_max_age)==expected
 
 
 def install_reader_sessions(monkeypatch, school, calls):
@@ -79,7 +79,7 @@ def test_normal_readers_book_and_mail_does_not_block_scanning(tmp_path, monkeypa
     assert school.submitted == ['one']
     assert send_threads == ['mail-sender']
     assert {name for _,name,_,_ in calls} == {'activities-reader','history-reader'}
-    assert all(budget == 10 for *_,budget in calls)
+    assert all(budget == (8 if name == 'history-reader' else 10) for _,name,_,budget in calls)
     state = json.loads((tmp_path/'task.json').read_text())
     assert state['status'] != 'pending'
     assert set(writers) == {'task-owner'}
@@ -119,6 +119,7 @@ def test_production_wake_path_submits_before_the_pause_interval(tmp_path, monkey
 def test_phase_switch_keeps_both_reader_threads_and_changes_budgets(tmp_path, monkeypatch):
     school = School()
     base=time.time()
+    school.server_now = datetime.fromtimestamp(base - 30, SHANGHAI).strftime('%Y-%m-%d %H:%M:%S')
     opening=datetime.fromtimestamp(base+120,SHANGHAI).strftime('%Y-%m-%d %H:%M:%S')
     school.activities=[native_activity(opens=opening,closes='2030-01-01 09:00:00')]
     calls=[]
@@ -144,7 +145,8 @@ def test_phase_switch_keeps_both_reader_threads_and_changes_budgets(tmp_path, mo
     assert not thread.is_alive()
     for name in ('activities-reader','history-reader'):
         assert len({ident for _,role,ident,_ in calls if role==name})==1
-    assert {budget for *_,budget in calls}=={2,10}
+    assert {budget for _,name,_,budget in calls if name == 'activities-reader'} == {2, 10}
+    assert {budget for _,name,_,budget in calls if name == 'history-reader'} == {8}
     assert not school.submitted
 
 
@@ -245,13 +247,19 @@ def test_opening_alert_queues_immediately_after_its_failure_threshold(tmp_path,m
     assert 'notification_deferred' not in (tmp_path/'events.log').read_text()
 
 
-def test_prewarm_requests_the_history_owner_once_without_main_history_io(tmp_path,monkeypatch):
+@pytest.mark.parametrize('enabled', [True, False])
+def test_fast_opening_notifies_history_once(tmp_path,monkeypatch,enabled):
     start=moment('2026-10-18 12:00:00').timestamp()
-    now=[start+7]
+    now=[start+4]
     seed_opening_selection(tmp_path,start='2026-10-18T12:00:10+08:00')
-    row=native_activity(opens='2026-10-18 12:00:10');row.update(YYRS=1,HDZRS=1)
+    row=native_activity(opens='2026-10-18 12:00:10');row.update(YYRS=1, HDZRS=1, _SERVER_NOW='2026-10-18 12:00:00')
     monkeypatch.setattr(app,'ActivityPoller',FakePoller)
-    monkeypatch.setattr(app,'new_history_poller',FakeHistoryPoller)
+    notifications = []
+    class History(FakeHistoryPoller):
+        def request_refresh(self):
+            notifications.append(now[0])
+            return super().request_refresh()
+    monkeypatch.setattr(app,'new_history_poller',History)
     for key,value in dict(instances=[],next_rows=[row],rows_override=None,at_offset=0,
                            next_error=None,next_wake_once=False).items():
         monkeypatch.setattr(FakePoller,key,value)
@@ -265,8 +273,8 @@ def test_prewarm_requests_the_history_owner_once_without_main_history_io(tmp_pat
     monkeypatch.setattr(FakePoller,'on_timeout',wait)
     school=School();school.activities=[row]
     assert execute(school,tmp_path,clock=lambda:now[0],sleep=wait,background_poller=True,
-        settings=app.Settings(state_dir=tmp_path,prewarm=True,captcha_prefetch=False))==130
-    assert sum(r['event']=='prewarm_history_requested' for r in diagnostics_rows(tmp_path))==1
+        settings=app.Settings(state_dir=tmp_path,prewarm=enabled,captcha_prefetch=False))==130
+    assert notifications == (pytest.approx([start+5], abs=.1) if enabled else [])
     assert not any(url.endswith('queryMyActivityList.do') for _,url,_ in school.requests)
 
 

@@ -57,7 +57,7 @@ def test_status_displays_health_and_selection_snapshot_fields(tmp_path, capsys):
 
 def test_query_failure_mail_failure_and_recovery_are_visible_without_repeats(tmp_path):
     school = School()
-    school.query_statuses = [500] * 300
+    school.query_statuses = [503] * 300
     states, messages = [], []
     now = 1000.0
     def notify(event):
@@ -182,7 +182,8 @@ def test_successful_pending_query_breaks_consecutive_failure_count(tmp_path):
         if len(waits) == 3:
             raise KeyboardInterrupt
     assert execute(school, tmp_path, notify=events.append, sleep=wait) == 130
-    assert waits == [1, 2, 2]
+    assert all(4 <= seconds <= 6 for seconds in waits[:2])
+    assert waits[2] == 2
     assert events == []
     assert 'event=reservation_unconfirmed' in (tmp_path / 'events.log').read_text()
     assert snapshot(tmp_path)['failure_count'] == 0

@@ -16,21 +16,43 @@ def test_status_and_help_do_not_require_credentials_or_network(tmp_path):
     assert cli(tmp_path, '--help').returncode == 0
     status = cli(tmp_path, '--status')
     assert status.returncode == 0
-    assert status.stdout.splitlines() == ['status=not_started', 'process_running=false', 'phase=unknown']
+    assert status.stdout.splitlines() == ['status=not_started', 'process_running=false',
+        'reserved_total=unknown', 'reference_goal_complete=unknown',
+        'progress_updated_at=unknown', 'phase=unknown']
     assert not (tmp_path / 'state').exists()
+
+
+@pytest.mark.parametrize('progress, total, complete, updated_at', [
+    ({'total': 8, 'complete': True, 'at': 1000}, '8', 'true', '1970-01-01T08:16:40+08:00'),
+    ({'total': 0, 'complete': False, 'at': 1000}, '0', 'false', '1970-01-01T08:16:40+08:00'),
+    ({'total': 9, 'complete': False, 'at': 1000}, '9', 'false', '1970-01-01T08:16:40+08:00'),
+    (None, 'unknown', 'unknown', 'unknown'),
+    ({'completed': {}, 'planned': {}, 'at': 1000}, 'unknown', 'unknown', 'unknown'),
+    ({'total': True, 'complete': True, 'at': 1000}, 'unknown', 'unknown', 'unknown'),
+    ({'total': -1, 'complete': False, 'at': 1000}, 'unknown', 'unknown', 'unknown'),
+    ({'total': 8, 'complete': 'false', 'at': 1000}, 'unknown', 'unknown', 'unknown'),
+    ({'total': 8, 'complete': True, 'at': float('nan')}, 'unknown', 'unknown', 'unknown'),
+    ({'total': 8, 'complete': True, 'at': 253402214401}, 'unknown', 'unknown', 'unknown'),
+])
+def test_status_shows_saved_reference_progress_without_writing_or_querying(
+        tmp_path, progress, total, complete, updated_at):
+    state = tmp_path / 'state'
+    state.mkdir()
+    path = state / 'task.json'
+    original = json.dumps({'status': 'pending', 'activity': 'synthetic-activity',
+                          'health': {'progress': progress}})
+    path.write_text(original)
+    result = cli(tmp_path, '--status')
+    assert result.returncode == 0, result.stderr
+    assert 'status=pending' in result.stdout.splitlines()
+    assert f'reserved_total={total}' in result.stdout.splitlines()
+    assert f'reference_goal_complete={complete}' in result.stdout.splitlines()
+    assert f'progress_updated_at={updated_at}' in result.stdout.splitlines()
+    assert path.read_text() == original
 
 
 def test_cli_starts_without_system_timezone_data(tmp_path):
     result = cli(tmp_path, '--help', environment={'PYTHONTZPATH': ''})
-    assert result.returncode == 0, result.stderr
-    assert '--check' in result.stdout
-
-
-def test_cli_help_does_not_import_unix_only_locking(tmp_path):
-    result = subprocess.run([sys.executable, '-c',
-        "import runpy, sys; sys.modules['fcntl'] = None; "
-        "sys.argv = ['seu-reserve', '--help']; runpy.run_module('seu_reserve.cli', run_name='__main__')"],
-        cwd=tmp_path, env={}, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert '--check' in result.stdout
 
@@ -48,16 +70,6 @@ def test_invalid_configuration_is_rejected_without_echoing_its_value(tmp_path):
     result = cli(tmp_path, '--config', str(config))
     assert result.returncode == 1
     assert 'SECRET' not in result.stdout + result.stderr
-
-
-def test_completed_task_restart_requires_credentials_to_recheck_school(tmp_path):
-    state = tmp_path / 'state'
-    state.mkdir()
-    (state / 'task.json').write_text(json.dumps({'version': 2, 'account': '0' * 64,
-        'status': 'done', 'activity': 'one', 'cooldowns': {}}))
-    result = cli(tmp_path)
-    assert result.returncode == 1
-    assert 'credentials_require_terminal' in result.stdout
 
 
 def test_legacy_single_success_requires_credentials_to_recheck_goal(tmp_path):
@@ -131,15 +143,6 @@ def test_invalid_dotenv_never_echoes_values_or_starts_authentication(tmp_path, t
     assert 'SIMULATED_SECRET' not in result.stdout + result.stderr
 
 
-@pytest.mark.parametrize('args, expected', [
-    ((), 1), (('--check',), 1), (('--new-task',), 1), (('--status',), 0), (('--help',), 0),
-])
-def test_startup_credit_appears_once_except_status_and_help(tmp_path, args, expected):
-    result = cli(tmp_path, *args)
-    assert result.stdout.count('by MuZiJin701') == expected
-    assert result.stdout.count('https://github.com/MuZiJin701/seu-lecture-reserve-http') == expected
-
-
 def test_example_is_valid_dotenv_with_the_confirmed_default_categories(tmp_path):
     from seu_reserve.cli import configuration_from
     from seu_reserve.model import COFFEE_CATEGORY, GOAL_CATEGORIES
@@ -170,16 +173,11 @@ def test_opening_speed_switches_default_on_and_can_be_disabled(tmp_path):
     defaults, _ = configuration_from(empty, {})
     assert defaults.prewarm is True
     assert defaults.captcha_prefetch is True
-    assert defaults.poller_align is False
-    assert defaults.history_background is True
     config = tmp_path / '.env'
-    config.write_text('SEU_PREWARM=false\nSEU_CAPTCHA_PREFETCH=false\n'
-                      'SEU_POLLER_ALIGN=true\nSEU_HISTORY_BACKGROUND=false\n')
+    config.write_text('SEU_PREWARM=false\nSEU_CAPTCHA_PREFETCH=false\n')
     settings, _ = configuration_from(config, {})
     assert settings.prewarm is False
     assert settings.captcha_prefetch is False
-    assert settings.poller_align is True
-    assert settings.history_background is False
     assert configuration_from(config, {'SEU_PREWARM': 'true'})[0].prewarm is True
 
 
@@ -507,26 +505,6 @@ def test_ocr_unavailable_removes_a_checkpoint_created_for_a_new_account(tmp_path
     assert not (directory / 'task.json').exists()
 
 
-def test_ocr_unavailable_leaves_an_existing_directory_without_a_task(tmp_path, monkeypatch, capsys):
-    from seu_reserve import cli
-    from seu_reserve.accounts import AccountInput, Accounts
-    config = tmp_path / '.env'
-    config.write_text('SEU_DATA_DIR=data\n', encoding='utf-8')
-    accounts = Accounts(tmp_path / 'data')
-    account = accounts.create(AccountInput(username='10001', name='已有目录', password='synthetic'))
-    directory = accounts.state_dir(account['id'])
-    directory.mkdir()
-    (directory / 'events.log').write_text('', encoding='utf-8')
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr('os.environ', {})
-    monkeypatch.setattr(cli, 'load_recognizer', no_recognizer)
-    assert cli.main(['--config', str(config), '--account', '10001']) == 1
-    assert 'event=ocr_unavailable' in capsys.readouterr().out
-    assert directory.exists()
-    assert not (directory / 'task.json').exists()
-    assert (directory / 'events.log').exists()
-
-
 def test_ocr_unavailable_keeps_a_preexisting_checkpoint(tmp_path, monkeypatch, capsys):
     from seu_reserve import cli
     from seu_reserve.accounts import AccountInput, Accounts
@@ -634,8 +612,7 @@ def test_account_mode_forces_the_managed_settings_before_the_engine_starts(tmp_p
     accounts = Accounts(tmp_path / 'data')
     account = accounts.create(AccountInput(username='10001', name='托管设置', password='synthetic'))
     legacy = {**account['options'], 'titles': ['旧筛选'], 'trust_device': False, 'prewarm': False,
-              'captcha_prefetch': False, 'poller_align': False, 'history_background': False,
-              'mail_success': False, 'online': False, 'offline': True}
+              'captcha_prefetch': False, 'mail_success': False, 'online': False, 'offline': True}
     with accounts.connect() as db:
         db.execute('UPDATE accounts SET options=? WHERE id=?', (json.dumps(legacy), account['id']))
     captured = {}
@@ -652,8 +629,7 @@ def test_account_mode_forces_the_managed_settings_before_the_engine_starts(tmp_p
     settings = captured['settings']
     assert settings.titles == ()
     assert all(getattr(settings, key) is True for key in
-               ('trust_device', 'prewarm', 'captcha_prefetch', 'poller_align',
-                'history_background', 'mail_success'))
+               ('trust_device', 'prewarm', 'captcha_prefetch', 'mail_success'))
     assert settings.categories == DEFAULT_CATEGORIES
     assert settings.online is False and settings.offline is True
     captured['options']['checkpoint'].close()

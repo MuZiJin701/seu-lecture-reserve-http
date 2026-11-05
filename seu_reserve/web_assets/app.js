@@ -12,15 +12,15 @@ $('confirm-accept').addEventListener('click',()=>$('confirm-dialog').close('yes'
 $('confirm-cancel').addEventListener('click',()=>$('confirm-dialog').close('no'));
 $('confirm-dialog').addEventListener('cancel',()=>{$('confirm-dialog').returnValue='no';});
 $('confirm-dialog').addEventListener('close',()=>{const resolve=confirmResolve;confirmResolve=null;resolve?.($('confirm-dialog').returnValue==='yes');});
-const phases = {starting:'正在启动',authentication:'正在登录学校',my_activities:'核对已有预约',activities:'查询讲座',captcha:'识别预约验证码',submitting:'提交预约中',confirming:'核对提交结果',waiting:'等待下次查询',waiting_for_attendance:'等待参加',manual_required:'等待人工认证',backoff:'稍后重试',done:'选听目标已完成',stopped:'已停止',failed:'运行异常'};
-const reasons = {candidate:'可预约',reservation_not_started:'尚未开放',reservation_ended:'预约已结束',capacity_full:'名额已满',not_reservable:'当前不可预约',already_reserved:'已有预约',category_not_allowed:'未启用此类别',category_not_needed:'暂不需要此类别',title_not_selected:'标题不在指定列表',online_disabled:'未启用线上',offline_disabled:'未启用线下',campus_not_selected:'校区不在选择范围',time_conflict:'时间冲突',cooldown:'验证码冷却中',invalid_activity_time:'活动时间无法读取',notice_test_only:'测试或购票公告',retry_limit:'已达安全重试次数'};
+const phases = {starting:'正在启动',authentication:'正在登录学校',my_activities:'核对已有预约',activities:'查询讲座',captcha:'识别预约验证码',submitting:'提交预约中',confirming:'核对提交结果',waiting:'等待下次查询',manual_required:'等待人工认证',backoff:'稍后重试',done:'参考目标已达成（继续运行）',stopped:'已停止',failed:'运行异常'};
+const reasons = {candidate:'可预约',reservation_not_started:'尚未开放',reservation_ended:'预约已结束',capacity_full:'名额已满',not_reservable:'当前不可预约',already_reserved:'已有预约',category_not_allowed:'未启用此类别',title_not_selected:'标题不在指定列表',online_disabled:'未启用线上',offline_disabled:'未启用线下',campus_not_selected:'校区不在选择范围',time_conflict:'时间冲突',cooldown:'验证码冷却中',invalid_activity_time:'活动时间无法读取',notice_test_only:'测试或购票公告',retry_limit:'已达安全重试次数'};
 const errors = {login_rejected:'管理员账号或密码错误。',login_rate_limited:'登录尝试过于频繁，请稍后再试。',authentication_required:'登录已失效，请重新登录。',csrf_rejected:'登录状态已变化，请刷新页面后重试。',account_exists:'这个账号已添加。',account_not_found:'账号已被删除，请选择其他账号。',account_already_running:'该账号已在运行。',account_stopping:'账号正在停止，请稍后再试。',account_identity_immutable:'一卡通号不可修改。',account_deleting:'账号正在清理，请重试删除。',reservation_protected:'仍有待确认预约或时间占位，请先启动账号完成核对。',configuration_conflict:'配置已被其他管理员修改，请重新加载后保存；你的输入仍保留。',mail_configuration_invalid:'公共发信配置无效，请检查服务器配置，或清空此账号收信邮箱。',mail_disabled:'填写收信邮箱后才能发送测试邮件。',challenge_expired:'认证提示已更新，请使用当前提示。',invalid_answer:'请输入六位数字验证码。',invalid_request:'填写内容有误，请检查必填项、邮箱和类别。',password_required:'新增账号需要学校密码。',stop_timeout:'账号尚未停止，请稍后查看。',configuration_or_state_invalid:'配置或本地状态异常，请检查服务器。',restart_exhausted:'账号连续异常退出，请检查后手动启动。',authentication_rejected:'学校拒绝了账号或密码，请核对配置。',service_stopping:'服务正在停止，请稍后重试。',state_in_use:'账号正由 CLI 运行，请先在原终端停止它。'};
 function node(tag, className, text){const el=document.createElement(tag);if(className)el.className=className;if(text!==undefined)el.textContent=text;return el;}
 function timestamp(value){return value?new Date(value*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}):'暂无';}
 function category(value){return (value||'类别未知').replace('人文与科学素养系列讲座_','').replace('人文与科学素养系列讲座-','');}
 function total(values){return values?Object.values(values).reduce((a,b)=>a+b,0):null;}
 function current(){return creating?null:records.find(account=>account.id===selected);}
-function phase(account){return account.external_running?'CLI 正在运行':account.stopping?'正在停止':account.deleting?'待完成删除':account.error==='restarting'?'稍后自动重启':account.running?(phases[account.health?.phase]||'运行中'):account.status==='done'?'目标已完成':account.error?'需要关注':'已停止';}
+function phase(account){return account.external_running?'CLI 正在运行':account.stopping?'正在停止':account.deleting?'待完成删除':account.error==='restarting'?'稍后自动重启':account.running?(phases[account.health?.phase]||'运行中'):account.status==='done'?'参考目标已达成':account.error?'需要关注':'已停止';}
 function toast(text){$('toast').textContent=text;$('toast').hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').hidden=true,5500);}
 function showLogin(message=''){
   if($('confirm-dialog').open)$('confirm-dialog').close('no');
@@ -68,7 +68,7 @@ function render(){
   records.forEach(account=>{
     const card=node('button','glass account-card'+(!creating&&account.id===selected?' selected':''));card.type='button';card.dataset.account=account.id;card.setAttribute('aria-pressed',String(!creating&&account.id===selected));
     const top=node('div','card-top');top.append(node('span','account-avatar',account.name.slice(0,1)),node('span','badge '+(account.challenge||account.error?'attention':account.running?'running':''),phase(account)));
-    const bottom=node('div','card-bottom'),count=node('span');count.append(node('strong','',total(account.health?.progress?.completed)??'—'),document.createTextNode('/ 8 已选听'));bottom.append(count,node('span','card-arrow','↗'));
+    const bottom=node('div','card-bottom'),count=node('span');count.append(node('strong','',total(account.health?.progress?.reserved)??'—'),document.createTextNode('/ 8 已预约'));bottom.append(count,node('span','card-arrow','↗'));
     card.append(top,node('p','card-name',account.name),node('p','identity','账号 · 尾号 '+account.username.slice(-4)),bottom);card.addEventListener('click',()=>selectAccount(account.id));$('account-grid').append(card);
   });
   const add=node('button','glass account-card add-card'+(creating?' selected':''));add.type='button';add.dataset.account='new';add.setAttribute('aria-label','新增账号');add.append(node('span','add-symbol','＋'),node('strong','','新增账号'),node('small','','配置后由你启动预约'));add.addEventListener('click',()=>selectAccount(null));$('account-grid').append(add);
@@ -84,9 +84,9 @@ function renderDetail(){
   const disabled=saving||!!account&&(account.external_running||account.stopping||account.deleting);
   for(const el of $('account-form').elements)el.disabled=disabled;
   $('draft-state').textContent=dirty?'有未保存的修改':account?'保存后安全生效':'保存后手动启动';
-  $('completed-count').textContent=total(progress?.completed)??'—';$('goal-progress').value=total(progress?.completed)??0;
-  $('planned-count').textContent='待参加：'+(total(progress?.planned)??'未知');
-  $('goal-progress').setAttribute('aria-valuetext',progress?`已选听 ${total(progress.completed)} 场，目标 8 场`:'进度未知');
+  $('completed-count').textContent=total(progress?.reserved)??'—';$('goal-progress').value=total(progress?.reserved)??0;
+  $('planned-count').textContent='参考目标：'+(progress?(progress.complete?'已达成（继续预约）':'未达成'):'未知');
+  $('goal-progress').setAttribute('aria-valuetext',progress?`已预约 ${total(progress.reserved)} 场，参考目标 8 场`:'进度未知');
   $('category-progress').replaceChildren();metadata.categories.slice(0,3).forEach(value=>{$('category-progress').append(node('span','category-tag'+(progress&&!progress.missing.includes(value)?' covered':''),category(value)+(progress&&!progress.missing.includes(value)?' · 已覆盖':' · 待补齐')));});
   $('last-query').textContent=timestamp(health.last_query_at);$('next-check').textContent=timestamp(health.next_check_at);$('candidate-count').textContent=health.candidate_count??'未知';
   $('mail-state').textContent=!account?.mail_enabled?'未启用':({accepted:'SMTP 已接受',failed:'最近发送失败',sending:'正在发送',ready:'已配置',disabled:'未启用'}[health.mail_status]??'尚未发送');
@@ -99,7 +99,7 @@ function renderDetail(){
   const challenge=account?.challenge,key=(account?.id??'')+':'+(challenge?.id??'');$('challenge-panel').hidden=!challenge;
   if(shownChallenge!==key){$('sms-code').value='';shownChallenge=key;}
   if(challenge){const sms=challenge.kind==='sms';$('challenge-label').textContent=challenge.label;$('send-sms').hidden=!sms;$('sms-label').hidden=!sms;$('sms-code').required=sms;$('answer-button').textContent=sms?'验证并继续':'已处理，重新检查';}
-  $('event-list').replaceChildren();(account?.events??[]).slice().reverse().forEach(event=>{const li=node('li');li.append(node('time','',timestamp(event.at)),node('span','',({task_started:'预约任务已启动',authentication_succeeded:'学校认证成功',authentication_required:'需要人工认证',reservation_succeeded:'预约已确认成功',reservation_unconfirmed:'预约结果待确认',reservation_unconfirmed_released:'已建立时间保护，继续扫描',goal_completed:'选听目标已完成',task_failed:'任务异常退出',query_failure:'查询持续失败',query_recovered:'查询已恢复',notification_finished:'告警邮件发送结束'}[event.event]??event.event)));$('event-list').append(li);});$('events-empty').hidden=!!account?.events?.length;
+  $('event-list').replaceChildren();(account?.events??[]).slice().reverse().forEach(event=>{const li=node('li');li.append(node('time','',timestamp(event.at)),node('span','',({task_started:'预约任务已启动',authentication_succeeded:'学校认证成功',authentication_required:'需要人工认证',reservation_succeeded:'预约已确认成功',reservation_unconfirmed:'预约结果待确认',reservation_unconfirmed_released:'已建立时间保护，继续扫描',goal_completed:'参考目标已达成（继续预约）',task_failed:'任务异常退出',query_failure:'查询持续失败',query_recovered:'查询已恢复',notification_finished:'告警邮件发送结束'}[event.event]??event.event)));$('event-list').append(li);});$('events-empty').hidden=!!account?.events?.length;
   $('selection-list').replaceChildren();(account?.selection??[]).forEach(item=>{const li=node('li');li.append(node('strong','',item.title||'未提供标题'),node('span','',reasons[item.reason]??item.reason));$('selection-list').append(li);});$('selection-empty').hidden=!!account?.selection?.length;
   renderReservations(account);
 }

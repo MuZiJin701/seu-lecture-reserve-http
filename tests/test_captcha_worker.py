@@ -1,8 +1,10 @@
 import json
 import threading
+import time
 from urllib.parse import urlsplit
 
 import pytest
+import requests
 
 import seu_reserve.app as app
 from seu_reserve.client import AuthenticationExpired, Client
@@ -11,11 +13,15 @@ from test_scheduler_and_preparation import has_event, until
 from test_unified_workers import install_reader_sessions
 
 
-@pytest.mark.parametrize('change', ['none', 'full', 'history', 'auth', 'rate_limit', 'stop'])
+@pytest.mark.parametrize('change', [
+    'none', 'full', 'history', 'history_format', 'list_timeout', 'list_expired',
+    'auth', 'rate_limit', 'stop'])
 def test_fresh_captcha_keeps_owner_responsive_and_revalidates_before_submit(tmp_path, monkeypatch, change):
     entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
     closing, expired, rate_limited = threading.Event(), threading.Event(), threading.Event()
     expire_next, limit_next = threading.Event(), threading.Event()
+    list_timeout, ocr_done = threading.Event(), threading.Event()
+    clock_shift = [0.0]
     busy = [False]
     image_threads, submit_codes, auth_threads, writers, ocr_threads = [], [], [], [], []
     class DelayedSchool(School):
@@ -38,6 +44,8 @@ def test_fresh_captcha_keeps_owner_responsive_and_revalidates_before_submit(tmp_
             if endpoint == 'queryActivityList.do' and expire_next.is_set() and not expired.is_set():
                 expired.set()
                 raise AuthenticationExpired('business_authentication_expired')
+            if endpoint == 'queryActivityList.do' and list_timeout.is_set():
+                raise requests.ReadTimeout('constructed list timeout')
             response = super().request(method, url, **kwargs)
             if endpoint == 'queryMyActivityList.do' and limit_next.is_set() and not rate_limited.is_set():
                 rate_limited.set()
@@ -71,11 +79,13 @@ def test_fresh_captcha_keeps_owner_responsive_and_revalidates_before_submit(tmp_
     monkeypatch.setattr(app, 'CaptchaWorker', ObservedWorker)
     def recognize(_):
         ocr_threads.append(threading.get_ident())
+        ocr_done.set()
         return '1111' if len(ocr_threads) == 1 else '2222'
     runner = threading.Thread(name='task-owner', target=lambda: results.append(app.run(
         app.Settings(state_dir=tmp_path, prewarm=False, captcha_prefetch=False), session=school,
         environ={'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
-        recognize=recognize, stop=stopped.is_set)))
+        recognize=recognize, clock=lambda: time.time() + clock_shift[0], monotonic=time.monotonic,
+        stop=stopped.is_set)))
     runner.start()
     try:
         assert entered.wait(3)
@@ -90,6 +100,17 @@ def test_fresh_captcha_keeps_owner_responsive_and_revalidates_before_submit(tmp_
             school.mine = [{**lecture('other'), 'HD_WID': 'other', 'YYZT': '已预约'}]
             before = len(calls)
             until(lambda: len(calls) > before + 2)
+        elif change == 'history_format':
+            valid = {**lecture('other'), 'HD_WID': 'other', 'YYZT': '已预约'}
+            school.mine = [valid, {**valid, 'YYZT': '已取消'}]
+            before = len(calls)
+            until(lambda: len(calls) > before + 3, seconds=1)
+        elif change in ('list_timeout', 'list_expired'):
+            list_calls = sum(call[0] == 'queryActivityList.do' for call in calls)
+            list_timeout.set()
+            until(lambda: sum(call[0] == 'queryActivityList.do' for call in calls) >= list_calls + 2)
+            if change == 'list_expired':
+                clock_shift[0] = 11.0
         elif change == 'auth':
             expire_next.set()
             assert expired.wait(1)
@@ -109,7 +130,12 @@ def test_fresh_captcha_keeps_owner_responsive_and_revalidates_before_submit(tmp_
             assert closing.wait(1)
             assert runner.is_alive() and not school.submitted
         release.set()
-        if change in ('none', 'auth'):
+        if change == 'list_expired':
+            assert ocr_done.wait(1)
+            until(lambda: has_event(tmp_path, 'reader_snapshot_missing'))
+            assert not school.submitted
+            list_timeout.clear()
+        if change in ('none', 'auth', 'list_timeout', 'list_expired', 'history_format'):
             until(lambda: bool(school.submitted))
         elif change in ('full', 'history'):
             until(lambda: has_event(tmp_path, 'captcha_candidate_changed'))
@@ -126,7 +152,7 @@ def test_fresh_captcha_keeps_owner_responsive_and_revalidates_before_submit(tmp_
     if change == 'auth':
         assert submit_codes == ['2222'] and auth_threads == ['task-owner', 'task-owner']
         assert [row['generation'] for row in jobs] == [1, 2]
-    elif change == 'none':
+    elif change in ('none', 'list_timeout', 'list_expired', 'history_format'):
         assert submit_codes == ['1111'] and len(image_threads) == 1
     else:
         assert not submit_codes and len(image_threads) == 1
@@ -165,7 +191,8 @@ def test_rejected_fresh_codes_reuse_one_worker_and_keep_four_attempt_limit(tmp_p
     assert school.submitted == ['one'] * 4 + ['two']
     assert len(images) == 5 and len(set(images)) == 1 and ocr == images
     rows = diagnostics_rows(tmp_path)
-    assert sum(row['event'] == 'captcha_cooldown' for row in rows) == 1
+    assert not any(row['event'] == 'captcha_cooldown' for row in rows)
+    assert not json.loads((tmp_path / 'task.json').read_text())['cooldowns']
     assert [row['job'] for row in rows if row['event'] == 'captcha_job_started'] == [1, 2, 3, 4, 5]
 
 

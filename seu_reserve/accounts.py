@@ -28,15 +28,13 @@ class AccountOptions(BaseModel):
     trust_device: bool = True
     prewarm: bool = True
     captcha_prefetch: bool = True
-    poller_align: bool = True
-    history_background: bool = True
     mail_success: bool = True
 
     @model_validator(mode='after')
     def managed_policy(self) -> 'AccountOptions':
         self.titles = []
         self.trust_device = self.prewarm = self.captcha_prefetch = True
-        self.poller_align = self.history_background = self.mail_success = True
+        self.mail_success = True
         return self
 
     @field_validator('titles', 'categories', 'campuses')

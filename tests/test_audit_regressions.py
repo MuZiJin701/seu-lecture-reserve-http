@@ -130,18 +130,3 @@ def test_unusable_retry_after_cannot_persist_an_unloadable_task(tmp_path, header
     # An unusable Retry-After falls back to the bounded short schedule, never a 20 s wait.
     assert saved['retry_at'] == 1001
     assert saved['health']['last_error'] == 'server_backoff'
-
-
-@pytest.mark.parametrize('field', ['updated_at', 'last_mail_at'])
-def test_oversized_snapshot_time_is_unknown_without_crashing(tmp_path, capsys, field):
-    from seu_reserve.cli import show_status
-    assert execute(School(), tmp_path) == 130
-    path = tmp_path / 'task.json'
-    saved = json.loads(path.read_text())
-    saved['health'][field] = 10 ** 400
-    path.write_text(json.dumps(saved))
-    before = path.read_bytes()
-    capsys.readouterr()
-    show_status(tmp_path)
-    assert 'phase=unknown' in capsys.readouterr().out
-    assert path.read_bytes() == before

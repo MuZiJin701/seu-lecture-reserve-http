@@ -41,6 +41,16 @@ def show_status(directory: Path) -> None:
     running = task_running(directory)
     print('process_running=' + str(running).lower())
     snapshot = saved.get('health')
+    progress = snapshot.get('progress', {}) if isinstance(snapshot, dict) else {}
+    progress_valid = (isinstance(progress, dict)
+                      and type(progress.get('total')) is int and progress['total'] >= 0
+                      and type(progress.get('complete')) is bool
+                      and type(progress.get('at')) in (int, float)
+                      and 0 <= progress['at'] <= 253402214400)
+    print('reserved_total=' + (str(progress['total']) if progress_valid else 'unknown'))
+    print('reference_goal_complete=' + (str(progress['complete']).lower() if progress_valid else 'unknown'))
+    print('progress_updated_at=' + (datetime.fromtimestamp(progress['at'], SHANGHAI).isoformat(timespec='seconds')
+                                    if progress_valid else 'unknown'))
     # 'preflight' stays accepted for state files written before the pre-check was removed.
     phases = {'starting', 'authentication', 'my_activities', 'activities', 'preflight', 'captcha',
               'submitting', 'confirming', 'waiting', 'waiting_for_attendance', 'manual_required',
@@ -112,8 +122,7 @@ def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[S
                'SEU_REQUIRED_CATEGORIES', 'SEU_PREFERRED_CAMPUS', 'SEU_ENABLE_ONLINE',
                'SEU_ENABLE_OFFLINE', 'SEU_STATE_DIR', 'SEU_MAIL_SUCCESS', 'SMTP_HOST', 'SMTP_PORT',
                'SMTP_USERNAME', 'SMTP_PASSWORD', 'MAIL_FROM', 'MAIL_TO', 'SEU_VPN_IP',
-               'SEU_CAPTCHA_PREFETCH', 'SEU_PREWARM', 'SEU_POLLER_ALIGN',
-               'SEU_HISTORY_BACKGROUND', 'SEU_TRUST_DEVICE', 'SEU_DATA_DIR',
+               'SEU_CAPTCHA_PREFETCH', 'SEU_PREWARM', 'SEU_TRUST_DEVICE', 'SEU_DATA_DIR',
                'SEU_WEB_HOST', 'SEU_WEB_PORT', 'SEU_WEB_ADMINS'}
     if set(values) - allowed:
         raise ValueError('unknown_configuration_key')
@@ -138,8 +147,6 @@ def configuration_from(path: Path | None, process: Mapping[str, str]) -> tuple[S
     for key, name in (('online', 'SEU_ENABLE_ONLINE'), ('offline', 'SEU_ENABLE_OFFLINE'),
                       ('mail_success', 'SEU_MAIL_SUCCESS'),
                       ('captcha_prefetch', 'SEU_CAPTCHA_PREFETCH'), ('prewarm', 'SEU_PREWARM'),
-                      ('poller_align', 'SEU_POLLER_ALIGN'),
-                      ('history_background', 'SEU_HISTORY_BACKGROUND'),
                       ('trust_device', 'SEU_TRUST_DEVICE')):
         raw = environ.get(name, str(getattr(defaults, key))).strip().lower()
         if raw not in ('true', 'false'):
@@ -167,7 +174,7 @@ def load_recognizer() -> Any:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description='SEU lecture goal: 8 attended, including law, art and mental health')
+    parser = argparse.ArgumentParser(description='Reserve SEU lectures; reference goal: 8 valid reservations, including law, art and mental health. Keep running until stopped.')
     parser.add_argument('--config', type=Path, help='dotenv file (default: .env in the current directory)')
     parser.add_argument('--account', help='managed school account (card number or internal ID)')
     mode = parser.add_mutually_exclusive_group()

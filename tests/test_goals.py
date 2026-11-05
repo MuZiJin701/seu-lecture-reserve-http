@@ -1,113 +1,210 @@
 import hashlib
 import json
-from collections import Counter
 
 import pytest
 
-from seu_reserve.model import (COFFEE_CATEGORY, GOAL_CATEGORIES, SERIES_CATEGORIES, Progress,
+import seu_reserve.app as app_module
+from seu_reserve.app import Settings
+from seu_reserve.model import (COFFEE_CATEGORY, GOAL_CATEGORIES, SERIES_CATEGORIES,
                                category_name, moment, progress, test_notice as is_test_notice)
-from test_app import School, execute, lecture
+from seu_reserve.poller import Snapshot
+from test_app import FakePoller, School, execute, interrupted, lecture
 
 
 PSYCHOLOGY, LAW, ART, OTHER = SERIES_CATEGORIES
 
 
 def attended(count=8):
+    """Valid reservations spread across the four formal goal categories.
+
+    The historical name is kept because other test modules import it; attendance is irrelevant
+    to the current reference target, so ``SFDK`` is only present as an ignored school field.
+    """
     return [lecture(f'history-{i}', YYZT='已预约', SFDK='1',
                     HDLX_DISPLAY=SERIES_CATEGORIES[i % 4],
                     KSSJ=f'2020-01-{i + 1:02} 10:00:00', JSSJ=f'2020-01-{i + 1:02} 11:00:00')
             for i in range(count)]
 
 
-def test_only_eight_attended_with_all_required_categories_complete_goal(tmp_path):
-    school = School()
-    school.mine = attended()
-    events = []
-    assert execute(school, tmp_path, notify=events.append) == 0
-    assert events == []
-    saved = json.loads((tmp_path / 'task.json').read_text())
-    assert saved['version'] == 2 and saved['status'] == 'done'
-    assert not saved['activity']
-    assert 'event=goal_completed' in (tmp_path / 'events.log').read_text()
-    requests_before_restart = len(school.requests)
-    assert execute(school, tmp_path, notify=events.append) == 0
-    assert len(school.requests) > requests_before_restart
-    assert execute(school, tmp_path, new_task=True, notify=events.append) == 0
-    assert events == []
-    assert not school.submitted
+def saved_task(directory):
+    return json.loads((directory / 'task.json').read_text())
 
 
-def test_success_continues_and_missing_categories_precede_filler(tmp_path):
-    school = School()
-    school.mine = attended(5)
-    # Both required categories are already covered: make art missing.
-    school.mine[2]['HDLX_DISPLAY'] = PSYCHOLOGY
-    school.activities = [lecture('filler', HDLX_DISPLAY=OTHER),
-                         lecture('art', HDLX_DISPLAY=ART, KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00'),
-                         lecture('last', HDLX_DISPLAY=OTHER, KSSJ='2030-01-03 10:00:00', JSSJ='2030-01-03 11:00:00'),
-                         lecture('extra', HDLX_DISPLAY=OTHER, KSSJ='2030-01-04 10:00:00', JSSJ='2030-01-04 11:00:00')]
-    assert execute(school, tmp_path) == 130
-    assert school.submitted == ['art', 'filler', 'last']
-    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
+def test_eight_valid_reservations_cover_the_reference_target():
+    current = progress(attended(8), 0)
+    assert current.total == 8
+    assert current.complete
+    assert not current.missing
+    assert current.reserved == {PSYCHOLOGY: 2, LAW: 2, ART: 2, OTHER: 2}
+
+    short = progress(attended(7), 0)
+    assert short.total == 7
+    assert not short.complete
+    # The three required categories are covered; only the total count is short.
+    assert not short.missing
 
 
-def test_filler_leaves_room_for_missing_required_categories(tmp_path):
-    school = School()
-    school.mine = attended(6)
-    for row in school.mine:
+def test_reference_target_requires_eight_reservations_and_each_required_category():
+    all_psychology = attended(8)
+    for row in all_psychology:
         row['HDLX_DISPLAY'] = PSYCHOLOGY
-    school.activities = [lecture('unneeded', HDLX_DISPLAY=OTHER)]
-    assert execute(school, tmp_path) == 130
-    assert not school.submitted
+    current = progress(all_psychology, 0)
+    assert current.total == 8
+    assert not current.complete
+    assert current.missing == frozenset({LAW, ART})
 
-
-@pytest.mark.parametrize('change', ['removed', 'cancelled', 'breached'])
-def test_coverage_waits_cancellation_or_breach_is_replaced_and_attendance_finishes(tmp_path, change):
-    school = School()
-    school.mine = attended(5) + [lecture(f'planned-{i}', YYZT='已预约', HDLX_DISPLAY=OTHER,
-        KSSJ=f'2030-01-0{i + 1} 10:00:00', JSSJ=f'2030-01-0{i + 1} 11:00:00') for i in range(3)]
-    school.activities = [lecture('replacement', HDLX_DISPLAY=OTHER,
-                                KSSJ='2030-01-04 10:00:00', JSSJ='2030-01-04 11:00:00')]
-    waits, now = [], [1792296000.0]
-    def wait(seconds):
-        waits.append(seconds)
-        now[0] += 30
-        if len(waits) == 1:
-            assert not school.submitted
-            if change == 'removed':
-                school.mine.pop()
-            elif change == 'cancelled':
-                school.mine[-1]['YYZT'] = '已取消'
-            else:
-                school.mine[-1]['SFWY'] = '1'
-        elif len(waits) == 2:
-            assert school.submitted == ['replacement']
-            for row in school.mine:
-                row['SFDK'] = '1'
-        else:
-            pytest.fail('goal should finish after school confirms attendance')
-    assert execute(school, tmp_path, sleep=wait, clock=lambda: now[0]) == 0
-    assert len(waits) == 2 and all(4 <= wait <= 6 for wait in waits)
-
-
-def test_eight_attended_without_art_still_books_art(tmp_path):
-    school = School()
-    school.mine = attended()
-    for row in school.mine:
+    without_art = attended(8)
+    for row in without_art:
         if row['HDLX_DISPLAY'] == ART:
             row['HDLX_DISPLAY'] = OTHER
-    school.activities = [lecture('extra-other', HDLX_DISPLAY=OTHER), lecture('needed-art', HDLX_DISPLAY=ART)]
+    current = progress(without_art, 0)
+    assert current.total == 8
+    assert not current.complete
+    assert current.missing == frozenset({ART})
+
+
+@pytest.mark.parametrize('changes', [
+    {'SFDK': '1'}, {'SFDK': '0'}, {'SFDK': None}, {'SFDK': ''}, {'SFDK': 'unknown'},
+    {'SFDK': None, 'SFWY': None},
+])
+def test_attendance_fields_no_longer_affect_the_reference_target(changes):
+    rows = attended(8)
+    for row in rows:
+        row.update(changes)
+    current = progress(rows, 0)
+    assert current.total == 8 and current.complete
+
+
+def test_breached_reservation_is_not_counted():
+    breach = lecture('breach', YYZT='已预约', SFDK='1', SFWY='1')
+    current = progress(attended(7) + [breach], 0)
+    assert current.total == 7
+    assert not current.complete
+
+
+def test_withdrawn_reservation_is_not_counted():
+    withdrawn = lecture('withdrawn', YYZT='已预约', FBZT='-1')
+    current = progress(attended(7) + [withdrawn], 0)
+    assert current.total == 7
+    assert not current.complete
+
+
+@pytest.mark.parametrize('category', [COFFEE_CATEGORY, '“SEU咖啡间"系列沙龙活动'])
+@pytest.mark.parametrize('checked', ['0', '1', None])
+def test_salon_reservations_are_not_counted(category, checked):
+    assert category_name(category) == COFFEE_CATEGORY
+    assert COFFEE_CATEGORY not in GOAL_CATEGORIES
+    row = lecture('salon-history', YYZT='已预约', SFDK=checked, HDLX_DISPLAY=category)
+    assert progress(attended(7) + [row], 0) == progress(attended(7), 0)
+    complete = progress(attended(8) + [row], 0)
+    assert complete.total == 8 and complete.complete
+
+
+@pytest.mark.parametrize('category', ['通知公告', '', None, 42, '未知类别'])
+def test_unreadable_or_non_goal_categories_are_ignored(category):
+    row = lecture('other', YYZT='已预约', HDLX_DISPLAY=category)
+    assert progress([row], 0).total == 0
+
+
+def test_identical_duplicate_activity_is_counted_once():
+    rows = [{'WID': f'booking-{i}', 'HD_WID': f'activity-{i}', 'FBZT': '1',
+             'SFDK': '1', 'SFWY': '0', 'JZXL_DISPLAY': SERIES_CATEGORIES[i % 4],
+             'JZSJ': f'2020-01-{i + 1:02} 10:00:00', 'HDJSSJ': f'2020-01-{i + 1:02} 11:00:00'}
+            for i in range(8)]
+    assert progress(rows + [dict(rows[0])], 0) == progress(rows, 0)
+    assert progress(rows, 0).total == 8 and progress(rows, 0).complete
+
+
+@pytest.mark.parametrize('changes', [
+    {'SFDK': '0'}, {'SFWY': '1'}, {'HDLX_DISPLAY': LAW}, {'HDMC': 'another title'},
+])
+def test_conflicting_duplicate_activity_is_rejected(changes):
+    row = attended(1)[0]
+    with pytest.raises(ValueError, match='attendance_record_conflict'):
+        progress([row, {**row, **changes}], 0)
+
+
+def test_unknown_publication_status_is_rejected():
+    with pytest.raises(ValueError, match='publication_status_unknown'):
+        progress([lecture('bad', YYZT='已预约', FBZT='unknown')], 0)
+
+
+def test_unknown_reservation_status_is_rejected():
+    with pytest.raises(ValueError, match='reservation_status_unknown'):
+        progress([lecture('bad', YYZT='unknown')], 0)
+
+
+def test_reaching_the_reference_target_keeps_running_and_booking(tmp_path):
+    school = School()
+    school.mine = attended()
+    school.activities = [lecture('extra', HDLX_DISPLAY=OTHER)]
+    events = []
+    # The scan only ends through the injected interruption: a reached reference target must not
+    # stop, complete or park the task.
+    assert execute(school, tmp_path, notify=events.append) == 130
+    assert school.submitted == ['extra']
+    assert events == []
+    saved = saved_task(tmp_path)
+    assert saved['version'] == 2 and saved['status'] == 'scanning'
+    snapshot = saved['health']['progress']
+    assert set(snapshot) == {'reserved', 'total', 'missing', 'complete', 'at'}
+    assert snapshot['reserved'] == {PSYCHOLOGY: 2, LAW: 2, ART: 2, OTHER: 3}
+    assert snapshot['total'] == 9 and snapshot['complete'] is True
+    assert snapshot['missing'] == []
+    assert snapshot['at'] == moment('2026-10-18 12:00:00').timestamp()
+    assert saved['health']['phase'] not in ('done', 'waiting_for_attendance')
+    log = (tmp_path / 'events.log').read_text()
+    assert log.count('event=goal_completed') == 1
+    assert 'done' not in saved['status']
+
+    # A restart rechecks the school record and keeps scanning; it must not treat the target as a
+    # terminal status.
+    assert execute(school, tmp_path, notify=events.append) == 130
+    assert school.submitted == ['extra']
+    assert saved_task(tmp_path)['status'] == 'scanning'
+
+
+def test_unreadable_category_reservation_is_excluded_but_not_blocking(tmp_path):
+    # The unknown-category record cannot count toward the reference target, but its readable
+    # interval must still protect the conflict check; a non-overlapping candidate is booked.
+    uncertain = lecture('uncertain', YYZT='已预约', HDLX_DISPLAY='未知类别')
+    assert progress([uncertain], 0).total == 0
+    school = School()
+    school.mine = [uncertain]
+    school.activities = [lecture('next-law', HDLX_DISPLAY=LAW,
+                                 KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00')]
     assert execute(school, tmp_path) == 130
-    assert school.submitted == ['needed-art']
+    assert school.submitted == ['next-law']
+
+
+@pytest.mark.parametrize('changes', [
+    {'FBZT': 'unknown'}, {'KSSJ': 'invalid'}, {'YYZT': 'unknown'},
+])
+def test_structural_history_errors_still_block_new_submissions(tmp_path, changes):
+    row = lecture('uncertain', YYZT='已预约')
+    row.update(changes)
+    school = School()
+    school.mine = [row]
+    school.activities = [lecture('next-law', HDLX_DISPLAY=LAW,
+                                 KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00')]
+    assert execute(school, tmp_path) == 130
+    assert not school.submitted
+
+
+def test_conflicting_duplicate_history_blocks_new_submissions(tmp_path):
+    row = lecture('duplicate', YYZT='已预约')
+    school = School()
+    school.mine = [row, {**row, 'SFWY': '1'}]
+    school.activities = [lecture('next-law', HDLX_DISPLAY=LAW,
+                                 KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00')]
+    assert execute(school, tmp_path) == 130
+    assert not school.submitted
+    assert 'event=attendance_record_conflict' in (tmp_path / 'events.log').read_text()
 
 
 @pytest.mark.parametrize('category', [COFFEE_CATEGORY, '“SEU咖啡间"系列沙龙活动'])
 @pytest.mark.parametrize('enabled', [True, False])
-def test_salon_booking_follows_configuration_without_goal_credit(tmp_path, category, enabled):
-    from seu_reserve.app import Settings
-    assert category_name(category) == COFFEE_CATEGORY
-    assert category_name(COFFEE_CATEGORY) == COFFEE_CATEGORY
-    assert COFFEE_CATEGORY not in GOAL_CATEGORIES
+def test_salon_booking_follows_configuration_without_counting(tmp_path, category, enabled):
     school = School()
     school.activities = [lecture(HDLX_DISPLAY=category)]
     settings = Settings(state_dir=tmp_path,
@@ -115,47 +212,7 @@ def test_salon_booking_follows_configuration_without_goal_credit(tmp_path, categ
     assert execute(school, tmp_path, settings=settings) == 130
     assert school.submitted == (['one'] if enabled else [])
     current = progress(school.mine, 0)
-    assert not current.completed and not current.planned
-
-
-def test_disabled_salon_does_not_require_candidate_fields(tmp_path):
-    from seu_reserve.app import Settings
-    school = School()
-    school.activities = [{'JZXL_DISPLAY': COFFEE_CATEGORY}]
-    assert execute(school, tmp_path,
-                   settings=Settings(state_dir=tmp_path, categories=GOAL_CATEGORIES)) == 130
-    assert not school.submitted
-    saved = json.loads((tmp_path / 'task.json').read_text())
-    assert saved['selection']['activities'][0]['reason'] == 'category_not_allowed'
-
-
-@pytest.mark.parametrize('category', [COFFEE_CATEGORY, '“SEU咖啡间"系列沙龙活动'])
-@pytest.mark.parametrize('checked', ['0', '1', None])
-def test_salon_does_not_count_as_completed_or_planned(category, checked):
-    row = lecture('coffee-history', YYZT='已预约', SFDK=checked, HDLX_DISPLAY=category)
-    current = progress(attended(7) + [row], 0)
-    assert current == progress(attended(7), 0)
-    assert not current.done and not current.planned
-    assert progress(attended(8) + [row], 0).done
-
-
-def test_salon_booking_still_leaves_room_for_required_categories():
-    covered = Counter({PSYCHOLOGY: 3, LAW: 2, ART: 1, OTHER: 1})
-    assert sum(covered.values()) == 7 and Progress(covered, Counter()).needs(COFFEE_CATEGORY)
-    missing_art = Counter({PSYCHOLOGY: 3, LAW: 2, OTHER: 2})
-    assert not Progress(missing_art, Counter()).needs(COFFEE_CATEGORY)
-    assert Progress(missing_art, Counter()).needs(ART)
-
-
-@pytest.mark.parametrize('completed', [False, True])
-def test_salon_does_not_extend_a_covered_or_completed_lecture_task(tmp_path, completed):
-    school = School()
-    school.mine = attended(8) if completed else attended(7) + [
-        lecture('planned-eighth', YYZT='已预约', HDLX_DISPLAY=OTHER)]
-    school.activities = [lecture('coffee', HDLX_DISPLAY=COFFEE_CATEGORY,
-                                 KSSJ='2030-01-01 12:00:00', JSSJ='2030-01-01 13:00:00')]
-    assert execute(school, tmp_path) == (0 if completed else 130)
-    assert not school.submitted
+    assert current.total == 0 and not current.complete
 
 
 def test_salon_reservation_still_blocks_conflicting_lectures(tmp_path):
@@ -168,31 +225,10 @@ def test_salon_reservation_still_blocks_conflicting_lectures(tmp_path):
     assert execute(school, tmp_path) == 130
     assert school.submitted == ['safe']
     assert school.mine[0] == salon
-    saved = json.loads((tmp_path / 'task.json').read_text())
+    saved = saved_task(tmp_path)
     assert saved['selection']['activities'][0]['reason'] == 'time_conflict'
-
-
-def test_completed_task_rechecks_progress_without_salon_credit(tmp_path):
-    school = School()
-    school.mine = attended()
-    assert execute(school, tmp_path) == 0
-    school.mine = attended(7) + [lecture('coffee-history', YYZT='已预约',
-        SFDK='1', HDLX_DISPLAY=COFFEE_CATEGORY,
-        KSSJ='2020-02-01 10:00:00', JSSJ='2020-02-01 11:00:00')]
-    school.activities = [lecture('replacement', HDLX_DISPLAY=OTHER)]
-    assert execute(school, tmp_path) == 130
-    assert school.submitted == ['replacement']
-    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
-
-
-def test_ended_salon_without_attendance_result_does_not_block_progress(tmp_path):
-    school = School()
-    school.mine = attended(7) + [lecture('coffee-history', YYZT='已预约',
-        SFDK=None, SFWY=None, HDLX_DISPLAY=COFFEE_CATEGORY,
-        KSSJ='2020-02-01 10:00:00', JSSJ='2020-02-01 11:00:00')]
-    school.activities = [lecture('replacement', HDLX_DISPLAY=OTHER)]
-    assert execute(school, tmp_path) == 130
-    assert school.submitted == ['replacement']
+    # The salon never counts, but the newly booked formal lecture does.
+    assert saved['health']['progress']['reserved'] == {PSYCHOLOGY: 1}
 
 
 def test_salon_with_unknown_conflict_time_still_blocks_new_submissions(tmp_path):
@@ -204,11 +240,11 @@ def test_salon_with_unknown_conflict_time_still_blocks_new_submissions(tmp_path)
     assert not school.submitted
 
 
-def test_confirmed_salon_hold_keeps_conflict_protection_without_goal_credit(tmp_path):
+def test_confirmed_salon_hold_keeps_conflict_protection_without_counting(tmp_path):
     school = School()
     assert execute(school, tmp_path) == 130
     path = tmp_path / 'task.json'
-    saved = json.loads(path.read_text())
+    saved = saved_task(tmp_path)
     now = moment('2026-10-18 12:00:00').timestamp()
     saved['holds'] = {'coffee-held': dict(
         start=moment('2030-01-01 10:00:00').timestamp(),
@@ -221,258 +257,48 @@ def test_confirmed_salon_hold_keeps_conflict_protection_without_goal_credit(tmp_
                                  KSSJ='2030-01-01 12:00:00', JSSJ='2030-01-01 13:00:00')]
     assert execute(school, tmp_path) == 130
     assert school.submitted == ['safe']
-    saved = json.loads(path.read_text())
+    saved = saved_task(tmp_path)
     assert saved['holds']['coffee-held']['confirmed'] is True
     assert saved['selection']['activities'][0]['reason'] == 'time_conflict'
 
 
 @pytest.mark.parametrize('title', ['系统测试讲座', '请勿预约', '购票公告'])
 def test_notice_titles_are_excluded_from_progress_and_selection(tmp_path, title):
-    row = lecture('notice', YYZT='已预约', SFDK='1', HDLX_DISPLAY=COFFEE_CATEGORY, HDMC=title)
+    row = lecture('notice', YYZT='已预约', HDLX_DISPLAY=COFFEE_CATEGORY, HDMC=title)
     assert is_test_notice(row)
-    assert not progress(attended(7) + [row], 0).done
+    assert progress(attended(7) + [row], 0).total == 7
     school = School()
     school.activities = [lecture('notice-activity', HDLX_DISPLAY=COFFEE_CATEGORY, HDMC=title)]
     assert execute(school, tmp_path) == 130
     assert not school.submitted
-    saved = json.loads((tmp_path / 'task.json').read_text())
+    saved = saved_task(tmp_path)
     assert saved['selection']['activities'][0]['reason'] == 'notice_test_only'
 
 
-def test_real_school_fields_are_counted_and_duplicates_are_not():
+def test_real_school_reservation_fields_are_counted_and_duplicates_are_not():
     rows = [{'WID': f'booking-{i}', 'HD_WID': f'activity-{i}', 'FBZT': '1',
              'SFDK': '1', 'SFWY': '0', 'JZXL_DISPLAY': SERIES_CATEGORIES[i % 4],
-             'JZSJ': f'2020-01-{i + 1:02} 10:00:00', 'HDJSSJ': f'2020-01-{i + 1:02} 11:00:00'} for i in range(8)]
-    assert progress(rows + [dict(rows[0])], 0).done
+             'JZSJ': f'2020-01-{i + 1:02} 10:00:00', 'HDJSSJ': f'2020-01-{i + 1:02} 11:00:00'}
+            for i in range(8)]
+    assert progress(rows + [dict(rows[0])], 0) == progress(rows, 0)
+    assert progress(rows, 0).total == 8 and progress(rows, 0).complete
     rows[-1]['SFWY'] = '1'
-    assert not progress(rows, 0).done
-    rows[-1].update(SFWY='0', FBZT='-1')
-    assert not progress(rows, 0).done
-
-
-@pytest.mark.parametrize('changes', [
-    {'HDLX_DISPLAY': ''}, {'HDLX_DISPLAY': '未知类别'},
-    {'KSSJ': 'invalid'}, {'FBZT': 'unknown'},
-])
-def test_structural_errors_still_block_new_submissions(tmp_path, changes):
-    school = School()
-    school.mine = [lecture('uncertain', YYZT='已预约', **changes)]
-    school.activities = [lecture()]
-    assert execute(school, tmp_path) == 130
-    assert not school.submitted
-
-
-@pytest.mark.parametrize('changes', [
-    {'SFDK': None}, {'SFDK': 'unknown'}, {'SFWY': 'unknown'},
-    {'SFDK': None, 'SFWY': None},
-])
-def test_unreadable_attendance_on_a_future_reservation_is_planned_without_blocking(tmp_path, changes):
-    row = lecture('future', YYZT='已预约', **changes)
-    current = progress([row], 0)
-    assert current.planned == {PSYCHOLOGY: 1}
-    assert not current.unresolved
-    school = School()
-    school.mine = [lecture('future', YYZT='已预约', **changes)]
-    school.activities = [lecture('next-law', HDLX_DISPLAY=LAW,
-                                 KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00')]
-    assert execute(school, tmp_path) == 130
-    assert school.submitted == ['next-law']
-
-
-def test_conflicting_duplicate_activity_is_rejected():
-    row = attended(1)[0]
-    with pytest.raises(ValueError, match='attendance_record_conflict'):
-        progress([row, {**row, 'SFDK': '0'}], 0)
-
-
-@pytest.mark.parametrize('checked', ['0', '1'])
-def test_chained_overlaps_keep_nonconflicting_lectures_in_either_input_order(checked):
-    rows = [lecture('a', SFDK=checked, KSSJ='2030-01-01 10:00:00', JSSJ='2030-01-01 11:00:00'),
-            lecture('b', SFDK=checked, KSSJ='2030-01-01 10:30:00', JSSJ='2030-01-01 11:30:00'),
-            lecture('c', SFDK=checked, KSSJ='2030-01-01 11:10:00', JSSJ='2030-01-01 12:00:00')]
-    for row in rows:
-        row['YYZT'] = '已预约'
-    original = [dict(row) for row in rows]
-    for ordered in (rows, list(reversed(rows))):
-        current = progress(ordered, 0)
-        assert current.completed == ({PSYCHOLOGY: 2} if checked == '1' else {})
-        assert current.planned == ({PSYCHOLOGY: 2} if checked == '0' else {})
-    assert rows == original
-
-
-def test_completed_overlap_precedes_unattended_required_category():
-    rows = [lecture('planned-law', YYZT='已预约', HDLX_DISPLAY=LAW),
-            lecture('attended-other', YYZT='已预约', SFDK='1', HDLX_DISPLAY=OTHER,
-                    JSSJ='2030-01-01 12:00:00')]
     current = progress(rows, 0)
-    assert current.completed == {OTHER: 1}
-    assert not current.planned
-
-
-def test_overlapping_choice_fills_missing_category_before_earlier_finish():
-    rows = attended(2) + [
-        lecture('psychology', YYZT='已预约', SFDK='1'),
-        lecture('art', YYZT='已预约', SFDK='1', HDLX_DISPLAY=ART, JSSJ='2030-01-01 12:00:00')]
-    assert progress(rows, 0).completed == {PSYCHOLOGY: 1, LAW: 1, ART: 1}
-
-
-def test_missing_categories_are_updated_after_each_choice():
-    rows = [lecture('first-psychology', YYZT='已预约'),
-            lecture('repeat-psychology', YYZT='已预约',
-                    KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00'),
-            lecture('law', YYZT='已预约', HDLX_DISPLAY=LAW,
-                    KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 12:00:00')]
-    assert progress(rows, 0).planned == {PSYCHOLOGY: 1, LAW: 1}
-
-
-@pytest.mark.parametrize('psychology_end', ['2030-01-01 12:00:00', '2030-01-01 11:00:00'])
-def test_overlap_ties_use_finish_then_activity_id_independent_of_input_order(psychology_end):
-    rows = [lecture('z', YYZT='已预约', JSSJ=psychology_end),
-            lecture('a', YYZT='已预约', HDLX_DISPLAY=LAW)]
-    for ordered in (rows, list(reversed(rows))):
-        assert progress(ordered, 0).planned == {LAW: 1}
-
-
-def test_touching_endpoints_count_only_one_lecture():
-    rows = [lecture('first', YYZT='已预约'),
-            lecture('touching', YYZT='已预约',
-                    KSSJ='2030-01-01 11:00:00', JSSJ='2030-01-01 12:00:00')]
-    assert progress(rows, 0).planned == {PSYCHOLOGY: 1}
-
-
-def test_unselected_ended_overlap_does_not_pause_confirmed_attendance():
-    rows = [lecture('pending', YYZT='已预约'), lecture('checked', YYZT='已预约', SFDK='1')]
-    current = progress(rows, float('inf'))
-    assert current.completed == {PSYCHOLOGY: 1}
-    assert not current.planned
-
-
-@pytest.mark.parametrize('changes', [{'HDLX_DISPLAY': '未知'}, {'KSSJ': 'invalid'}])
-def test_unknown_overlapping_record_still_requires_validation(changes):
-    rows = [lecture('checked', YYZT='已预约', SFDK='1'),
-            lecture('unknown', YYZT='已预约', **changes)]
-    with pytest.raises(ValueError):
-        progress(rows, 0)
-
-
-def test_unselected_reservation_still_blocks_new_conflicting_booking(tmp_path):
-    school = School()
-    school.mine = [lecture('selected', YYZT='已预约'),
-                   lecture('unselected', YYZT='已预约',
-                           KSSJ='2030-01-01 10:30:00', JSSJ='2030-01-01 11:30:00')]
-    original = [dict(row) for row in school.mine]
-    school.activities = [lecture('blocked', HDLX_DISPLAY=LAW,
-                                 KSSJ='2030-01-01 11:10:00', JSSJ='2030-01-01 12:00:00'),
-                         lecture('safe', HDLX_DISPLAY=ART,
-                                 KSSJ='2030-01-01 12:10:00', JSSJ='2030-01-01 13:00:00')]
-    assert execute(school, tmp_path) == 130
-    assert school.submitted == ['safe']
-    assert school.mine[:2] == original
-    assert not any('cancel' in url.lower() for _, url, _ in school.requests)
-
-
-def test_recheck_completed_task_does_not_count_eight_overlapping_attendances(tmp_path):
-    school = School()
-    school.mine = attended()
-    assert execute(school, tmp_path) == 0
-    for row in school.mine:
-        row.update(KSSJ='2020-01-01 10:00:00', JSSJ='2020-01-01 11:00:00')
-    events = []
-    assert execute(school, tmp_path, new_task=True, notify=events.append) == 130
-    assert not events
-    assert not school.submitted
-    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
+    assert current.total == 7 and not current.complete
+    rows[-1].update(SFWY='0', FBZT='-1')
+    current = progress(rows, 0)
+    assert current.total == 7 and not current.complete
 
 
 def test_read_only_check_rejects_structural_history_errors_without_creating_state(tmp_path):
     school = School()
-    school.mine = [lecture('unknown', YYZT='已预约', HDLX_DISPLAY='未知类别')]
+    school.mine = [lecture('uncertain', YYZT='已预约', FBZT='unknown')]
     directory = tmp_path / 'unused'
     assert execute(school, directory, check_only=True) == 1
     assert not directory.exists() and not school.submitted
 
 
-def test_read_only_check_accepts_unresolved_attendance_without_creating_state(tmp_path):
-    school = School()
-    school.mine = [lecture('past', YYZT='已预约', SFDK=None,
-                           KSSJ='2020-01-01 10:00:00', JSSJ='2020-01-01 11:00:00')]
-    directory = tmp_path / 'unused'
-    assert execute(school, directory, check_only=True) == 0
-    assert not directory.exists() and not school.submitted
-
-
-def test_future_reservation_with_missing_attendance_fields_counts_as_planned():
-    row = {'WID': 'booking', 'HD_WID': 'future-art', 'FBZT': '1', 'SFDK': '0',
-           'JZXL_DISPLAY': ART, 'JZSJ': '2026-10-27 18:30:00', 'HDJSSJ': '2026-10-27 20:30:00'}
-    current = progress([row], 1793000000)
-    assert current.planned == {ART: 1}
-    assert not current.completed
-
-
-def past_row(**changes):
-    return {'WID': 'booking', 'HD_WID': 'past-art', 'FBZT': '1', 'JZXL_DISPLAY': ART,
-            'JZSJ': '2020-01-01 10:00:00', 'HDJSSJ': '2020-01-01 11:00:00',
-            'SFDK': None, 'SFWY': None, **changes}
-
-
-@pytest.mark.parametrize('changes', [
-    {'SFDK': '0'}, {'SFDK': 'unknown'}, {'SFDK': None}, {'SFDK': ''},
-    {'SFDK': '0', 'SFWY': 'unknown'}, {'SFDK': '1', 'SFWY': 'unknown'},
-])
-def test_ended_reservation_with_unresolved_attendance_is_tracked_not_blocking(changes):
-    row = past_row(**changes)
-    current = progress([row, lecture('future-law', YYZT='已预约', HDLX_DISPLAY=LAW)], 1793000000)
-    assert current.unresolved == frozenset({'past-art'})
-    assert current.completed == {}
-    assert current.planned == {LAW: 1}
-
-
-def test_unresolved_attendance_is_counted_once_the_school_updates_it():
-    row = past_row(SFDK='0')
-    current = progress([row], 1793000000)
-    assert current.unresolved == frozenset({'past-art'}) and not current.completed
-    row['SFDK'] = '1'
-    current = progress([row], 1793000000)
-    assert current.completed == {ART: 1} and not current.unresolved
-
-
-def test_ended_reservation_with_unknown_attendance_never_blocks_new_booking(tmp_path):
-    school = School()
-    school.mine = [past_row(SFDK='0')]
-    school.activities = [lecture('next-law', HDLX_DISPLAY=LAW,
-                                 KSSJ='2030-01-02 10:00:00', JSSJ='2030-01-02 11:00:00')]
-    assert execute(school, tmp_path) == 130
-    assert school.submitted == ['next-law']
-
-
-def test_violated_ended_reservation_is_resolved_and_never_counted():
-    row = past_row(SFDK='1', SFWY='1')
-    current = progress([row], 1793000000)
-    assert current.completed == {} and not current.unresolved
-
-
-def test_unresolved_attendance_is_recorded_once_as_a_local_diagnostic(tmp_path):
-    school = School()
-    school.mine = [past_row(SFDK='0')]
-    school.activities = [lecture('next-law', HDLX_DISPLAY=LAW)]
-    assert execute(school, tmp_path) == 130
-    events = [json.loads(line) for line in
-              (tmp_path / 'diagnostics.jsonl').read_text(encoding='utf-8').splitlines()]
-    unresolved = [event for event in events if event['event'] == 'attendance_unresolved']
-    assert unresolved and unresolved[0]['count'] == 1
-
-
-def test_future_reservation_missing_breach_field_does_not_block_next_submission(tmp_path):
-    school = School()
-    school.mine = [{'WID': 'booking', 'HD_WID': 'future-art', 'FBZT': '1', 'SFDK': '0',
-                    'JZXL_DISPLAY': ART, 'JZSJ': '2030-01-01 10:00:00', 'HDJSSJ': '2030-01-01 11:00:00'}]
-    school.activities = [lecture('next-law', HDLX_DISPLAY=LAW,
-                                 KSSJ='2030-01-01 12:00:00', JSSJ='2030-01-01 13:00:00')]
-    assert execute(school, tmp_path) == 130
-    assert school.submitted == ['next-law']
-
-
-def test_legacy_one_success_reopens_and_clamps_long_wait(tmp_path):
+def test_legacy_one_success_reopens_without_old_generic_wait(tmp_path):
     saved = {'version': 1, 'account': hashlib.sha256(b'test-user').hexdigest(),
              'status': 'done', 'activity': 'old-success', 'cooldowns': {}, 'retry_at': 200}
     path = tmp_path / 'task.json'
@@ -486,11 +312,142 @@ def test_legacy_one_success_reopens_and_clamps_long_wait(tmp_path):
     migrated = json.loads(path.read_text())
     assert migrated['version'] == 2 and migrated['status'] == 'scanning'
     # A legacy generic wait has no server-directed marker, so it is clamped to the short schedule.
-    assert not migrated['activity'] and migrated['retry_at'] == 105
-    assert waits == [5] and not school.requests
+    assert not migrated['activity'] and migrated['retry_at'] == 0
+    assert len(waits) == 1 and 4 <= waits[0] <= 6 and school.authenticated
     saved.update(status='pending', activity='uncertain', retry_at=0)
     path.write_text(json.dumps(saved))
     school.mine = attended()
     assert execute(school, tmp_path) == 130
     assert json.loads(path.read_text())['activity'] == 'uncertain'
     assert not school.submitted
+
+
+class EventHistoryReader:
+    """Deterministic event-driven replacement for the background "my activities" reader.
+
+    The production reader answers explicit refresh events only (no periodic schedule); this
+    stand-in performs the query synchronously when the scan requests it and records how often a
+    refresh was actually asked for.  ``fail_next`` injects one transient request failure.
+    """
+
+    rows = []
+    queries = 0
+    fail_next = False
+    instances = []
+
+    def __init__(self, query, *, interval, clock, **_kwargs):
+        self.clock = clock
+        self.running = True
+        self.polls = 0
+        self.value = Snapshot(rows=list(type(self).rows), at=clock())
+        type(self).instances.append(self)
+
+    def start(self):
+        self.running = True
+        self.request_refresh()
+
+    def stop(self, *, join=True):
+        self.running = False
+
+    def request_refresh(self):
+        reader = type(self)
+        reader.queries += 1
+        self.polls += 1
+        if reader.fail_next:
+            reader.fail_next = False
+            self.value = Snapshot(rows=self.value.rows, at=self.clock(), error='Timeout',
+                                  reason='network_timeout', failed_at=self.clock(),
+                                  started=self.clock())
+        else:
+            self.value = Snapshot(rows=list(reader.rows), at=self.clock(), started=self.clock())
+        return self.polls
+
+    def snapshot(self):
+        return self.value
+
+    def snapshot_with_version(self):
+        return self.value, self.polls
+
+
+def event_driven_history(monkeypatch, school):
+    """Route the scan loop through the deterministic list/history readers."""
+    FakePoller.instances.clear()
+    FakePoller.next_rows = []
+    FakePoller.rows_override = None
+    FakePoller.next_error = None
+    FakePoller.at_offset = 0.0
+    FakePoller.on_timeout = None
+    EventHistoryReader.rows = school.mine
+    EventHistoryReader.queries = 0
+    EventHistoryReader.fail_next = False
+    EventHistoryReader.instances.clear()
+    monkeypatch.setattr(app_module, 'ActivityPoller', FakePoller)
+    monkeypatch.setattr(app_module, 'new_history_poller',
+                        lambda query, **kwargs: EventHistoryReader(query, **kwargs))
+
+
+def background_options(directory):
+    return dict(background_poller=True, clock=lambda: 1000.0, sleep=interrupted,
+                settings=Settings(state_dir=directory, prewarm=False, captcha_prefetch=False))
+
+
+def test_history_snapshot_is_reused_without_a_ttl(tmp_path, monkeypatch):
+    school = School()
+    school.mine = attended(2)
+    event_driven_history(monkeypatch, school)
+    now = [1000.0]
+    waits = []
+    def wait(seconds):
+        waits.append(seconds)
+        now[0] += 100
+        if len(waits) == 3:
+            raise KeyboardInterrupt
+    FakePoller.on_timeout = wait
+    options = background_options(tmp_path)
+    options['clock'] = lambda: now[0]
+    assert execute(school, tmp_path, **options) == 130
+    assert len(waits) == 3
+    # Three scans over 300 virtual seconds and exactly one baseline history query: the snapshot
+    # never expires and no periodic refresh exists.
+    assert EventHistoryReader.queries == 1
+    snapshot = saved_task(tmp_path)['health']['progress']
+    assert snapshot['total'] == 2 and snapshot['complete'] is False
+    assert snapshot['at'] == 1000.0
+
+
+def test_appearing_candidate_submits_without_a_history_refresh(tmp_path, monkeypatch):
+    class WatchingSchool(School):
+        queries_after_baseline = None
+        queries_at_submit = None
+
+        def request(self, method, url, **kwargs):
+            if url.endswith('addReservation.do'):
+                WatchingSchool.queries_at_submit = EventHistoryReader.queries
+            return super().request(method, url, **kwargs)
+
+    school = WatchingSchool()
+    school.mine = attended()
+    event_driven_history(monkeypatch, school)
+    now = [1000.0]
+    waits = []
+    def wait(seconds):
+        waits.append(seconds)
+        if len(waits) == 1:
+            candidate = lecture('extra', HDLX_DISPLAY=OTHER)
+            school.activities = [candidate]
+            FakePoller.rows_override = [candidate]
+            now[0] += 10
+            WatchingSchool.queries_after_baseline = EventHistoryReader.queries
+            return
+        raise KeyboardInterrupt
+    FakePoller.on_timeout = wait
+    options = background_options(tmp_path)
+    options['clock'] = lambda: now[0]
+    assert execute(school, tmp_path, **options) == 130
+    assert WatchingSchool.queries_after_baseline == 1
+    assert school.submitted == ['extra']
+    # A candidate must use the baseline without issuing or waiting for a history query.
+    assert WatchingSchool.queries_at_submit == 1
+    assert saved_task(tmp_path)['status'] == 'scanning'
+    assert saved_task(tmp_path)['health']['progress']['total'] == 9
+    assert (tmp_path / 'events.log').read_text().count('event=goal_completed') == 1

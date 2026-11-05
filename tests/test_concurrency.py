@@ -24,7 +24,6 @@ def test_background_poller_reads_list_during_opening(tmp_path, monkeypatch):
     monkeypatch.setattr(client_module.Client, 'clone_readonly', lambda self: Clone())
     school = ActivitySchool()
     school.activities = [activity()]
-    school.server_now = '2029-12-31 18:59:50'
 
     def wait(seconds):
         assert gate.wait(2.0)

@@ -61,10 +61,12 @@ def test_booking_and_goal_completion_are_recorded_but_not_mailed(tmp_path, smtp)
     school = School()
     school.mine = attended(7)
     school.activities = [lecture(SFDK='1')]
-    assert mailed_run(school, tmp_path, sleep=interrupted, clock=lambda: 1000) == 0
+    # Reaching the reference target no longer stops the task; it keeps scanning.
+    assert mailed_run(school, tmp_path, sleep=interrupted, clock=lambda: 1000) == 130
     assert smtp.send_message.call_count == 0
     log = (tmp_path / 'events.log').read_text()
     assert 'event=reservation_succeeded' in log and 'event=goal_completed' in log
+    assert json.loads((tmp_path / 'task.json').read_text())['status'] == 'scanning'
 
 
 def test_no_daily_report_at_twenty_and_no_report_timestamp(tmp_path, smtp):
@@ -80,7 +82,7 @@ def test_no_daily_report_at_twenty_and_no_report_timestamp(tmp_path, smtp):
 def test_query_failure_mails_once_after_five_minutes_and_recovery_does_not(tmp_path, smtp):
     school = School()
     school.activities = [lecture(YYZT='未开放')]
-    school.query_statuses = [500] * 300
+    school.query_statuses = [503] * 300
     state, waits, wait = advancing(1000.0, 5)
     assert mailed_run(school, tmp_path, clock=lambda: state['now'], sleep=wait) == 130
     assert waits[:4] == [1, 2, 4, 5]
@@ -103,7 +105,7 @@ def test_query_failure_mails_once_after_five_minutes_and_recovery_does_not(tmp_p
 def test_new_outage_after_recovery_alerts_again_after_five_minutes(tmp_path, smtp):
     school = School()
     school.activities = [lecture(YYZT='未开放')]
-    school.query_statuses = [500] * 300
+    school.query_statuses = [503] * 300
     state, waits, wait = advancing(1000.0, 5)
     assert mailed_run(school, tmp_path, clock=lambda: state['now'], sleep=wait) == 130
     clear_retry(tmp_path)
@@ -112,7 +114,7 @@ def test_new_outage_after_recovery_alerts_again_after_five_minutes(tmp_path, smt
         raise KeyboardInterrupt
     assert mailed_run(school, tmp_path, clock=lambda: state['now'], sleep=stop) == 130
     assert smtp.send_message.call_count == 1
-    school.query_statuses = [500] * 300
+    school.query_statuses = [503] * 300
     state, waits, wait = advancing(state['now'], 5)
     assert mailed_run(school, tmp_path, clock=lambda: state['now'], sleep=wait) == 130
     assert max(waits) <= 5 and smtp.send_message.call_count == 2
@@ -121,12 +123,12 @@ def test_new_outage_after_recovery_alerts_again_after_five_minutes(tmp_path, smt
 def test_partial_recovery_does_not_clear_query_alert(tmp_path, smtp):
     school = School()
     school.activities = [lecture(YYZT='未开放')]
-    school.query_statuses = [500] * 300
+    school.query_statuses = [503] * 300
     state, waits, wait = advancing(1000.0, 5)
     assert mailed_run(school, tmp_path, clock=lambda: state['now'], sleep=wait) == 130
     assert smtp.send_message.call_count == 1
     clear_retry(tmp_path)
-    school.query_statuses = [500]
+    school.query_statuses = [503]
     def stop_after_one(seconds):
         raise KeyboardInterrupt
     assert mailed_run(school, tmp_path, clock=lambda: state['now'], sleep=stop_after_one) == 130
@@ -155,7 +157,7 @@ def test_authentication_alert_attempt_survives_restart_even_if_mail_failed(tmp_p
 def test_query_alert_attempt_survives_restart_even_if_mail_failed(tmp_path):
     school = School()
     school.activities = [lecture(YYZT='未开放')]
-    school.query_statuses = [500] * 300
+    school.query_statuses = [503] * 300
     events = []
     def notify(event):
         events.append(event)
@@ -255,12 +257,12 @@ def test_alert_mail_uses_current_confirmed_progress_without_details(tmp_path, sm
     school = School()
     school.mine = attended(3)
     school.mine[0]['HDMC'] = 'PRIVATE lecture title'
-    school.query_statuses = [500] * 300
+    school.query_statuses = [200] + [503] * 300
     state, waits, wait = advancing(1000.0, 5)
     assert mailed_run(school, tmp_path, clock=lambda: state['now'], sleep=wait) == 130
     assert smtp.send_message.call_count == 1
     body = smtp.send_message.call_args.args[0].get_content()
-    assert '已选听：3 / 8' in body and '待参加：0' in body
+    assert '已预约：3 / 8（参考目标）' in body and '参考达标：否' in body
     assert 'PRIVATE' not in body
     assert 'PRIVATE' not in (tmp_path / 'events.log').read_text()
 
@@ -281,12 +283,12 @@ def test_alert_unknown_progress_is_not_zero_and_pending_never_submits(tmp_path, 
     assert mailed_run(failed, tmp_path, clock=lambda: state['now'], sleep=wait) == 130
     assert smtp.send_message.call_count == 1
     body = smtp.send_message.call_args.args[0].get_content()
-    assert '已选听：未知' in body and '待参加：未知' in body
+    assert '已预约：未知' in body and '参考目标：未知' in body
     assert '预约结果待确认' in body
     assert not failed.submitted
 
 
-def test_disabled_mail_read_only_and_completed_tasks_do_not_mail(tmp_path, smtp):
+def test_disabled_mail_read_only_and_goal_completed_tasks_do_not_mail(tmp_path, smtp):
     now = lambda: moment('2026-10-18 21:00:00').timestamp()
     assert run(Settings(state_dir=tmp_path / 'disabled'), background_poller=False, session=School(),
                environ={'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
@@ -296,10 +298,12 @@ def test_disabled_mail_read_only_and_completed_tasks_do_not_mail(tmp_path, smtp)
     assert not (tmp_path / 'check').exists()
     school = School()
     school.mine = attended()
+    # Goal completion is informational: the task keeps running instead of stopping as done.
     for _ in range(2):
-        assert mailed_run(school, tmp_path / 'completed') == 0
+        assert mailed_run(school, tmp_path / 'completed') == 130
     assert smtp.send_message.call_count == 0
     saved = json.loads((tmp_path / 'completed' / 'task.json').read_text())
+    assert saved['status'] == 'scanning'
     assert 'last_report_at' not in saved and saved['health']['last_mail_event'] == 'none'
 
 

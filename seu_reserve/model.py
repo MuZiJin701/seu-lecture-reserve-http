@@ -15,14 +15,6 @@ COFFEE_CATEGORY = '“SEU咖啡间”系列沙龙活动'
 GOAL_CATEGORIES = SERIES_CATEGORIES
 
 
-class AttendanceCategoryUnknown(ValueError):
-    """A reservation row has no usable category; the stable message keeps existing callers."""
-
-    def __init__(self, wid: str = ''):
-        super().__init__('attendance_category_unknown')
-        self.wid = wid
-
-
 def category_name(value: Any) -> Any:
     # The school response uses both ASCII and full-width closing quotes for the salon series.
     return COFFEE_CATEGORY if value == '“SEU咖啡间"系列沙龙活动' else value
@@ -35,33 +27,37 @@ def test_notice(row: dict[str, Any]) -> bool:
 
 @dataclass(frozen=True)
 class Progress:
-    completed: Counter[str]
-    planned: Counter[str]
-    # Activity IDs of ended reservations whose attendance result is not readable yet. They are
-    # counted neither as completed nor as planned and never stop the search for other lectures:
-    # the school may publish the result up to about a day later, so waiting for it would block
-    # every other reservation. A later scan counts the lecture as soon as the school updates it.
-    unresolved: frozenset[str] = frozenset()
+    """Reference progress over already-reserved lectures.
+
+    A lecture counts once it is a valid reservation, belongs to a formal goal category
+    (salon excluded) and is not marked as a rule violation by the school. Attendance fields
+    are deliberately ignored: the reference may be reached before any lecture takes place.
+    """
+
+    reserved: Counter[str]
+    missing: frozenset[str]
 
     @property
-    def done(self) -> bool:
-        return sum(self.completed.values()) >= 8 and all(self.completed[c] for c in REQUIRED_CATEGORIES)
+    def total(self) -> int:
+        return sum(self.reserved.values())
 
     @property
-    def missing(self) -> set[str]:
-        return {c for c in REQUIRED_CATEGORIES if not self.completed[c] + self.planned[c]}
+    def complete(self) -> bool:
+        """Reference target: eight goal lectures with the three required categories.
 
-    def needs(self, category: str) -> bool:
-        category = category_name(category)
-        return ((category in GOAL_CATEGORIES or category == COFFEE_CATEGORY) and (category in self.missing
-                or sum(self.completed.values()) + sum(self.planned.values()) + len(self.missing) < 8))
+        This is informational only; reaching it never stops new reservations.
+        """
+        return self.total >= 8 and all(self.reserved[category] for category in REQUIRED_CATEGORIES)
 
 
 def progress(rows: list[dict[str, Any]], now: float) -> Progress:
-    completed: Counter[str] = Counter()
-    planned: Counter[str] = Counter()
-    records: list[tuple[str, str, datetime, datetime, str]] = []
-    unresolved: set[str] = set()
+    """Count valid reservations per goal category. ``now`` is kept for a stable signature.
+
+    Structural contradictions still raise, because callers rely on that to stop submitting
+    from contradictory school records. A reservation whose category is unknown is not counted;
+    it never blocks the scan (the reference is advisory and must not stop other reservations).
+    """
+    counted: Counter[str] = Counter()
     seen: dict[str, dict[str, Any]] = {}
     for row in rows:
         wid = activity_id(row)
@@ -72,49 +68,22 @@ def progress(rows: list[dict[str, Any]], now: float) -> Progress:
         seen[wid] = row
         if 'FBZT' in row and row['FBZT'] not in ('1', '-1'):
             raise ValueError('publication_status_unknown')
-        if not reserved(row) or row.get('FBZT') == '-1':
+        if not confirmed_reservation(row):
             continue
         if test_notice(row):
             continue
-        category = category_name(row.get('JZXL_DISPLAY', row.get('HDLX_DISPLAY')))
-        if not isinstance(category, str) or not category:
-            raise AttendanceCategoryUnknown(wid)
-        if category == COFFEE_CATEGORY:
-            continue
-        if category not in GOAL_CATEGORIES:
-            raise AttendanceCategoryUnknown(wid)
-        start, end = interval(row)
-        checked, breached = row.get('SFDK'), row.get('SFWY')
         # The school omits SFWY when the reservation did not break the rules.
+        breached = row.get('SFWY')
         if breached is None or breached == '':
             breached = '0'
         if breached == '1':
-            # A violated reservation never counts, whatever its attendance field says.
             continue
-        if end.timestamp() <= now:
-            if checked == '1' and breached == '0':
-                records.append(('1', category, start, end, wid))
-            else:
-                # Ended without a readable attendance result. It may still appear up to a day
-                # later, but it must never block other reservations, so it is only tracked as
-                # unresolved and counted again on a later scan once the school updates it.
-                unresolved.add(wid)
+        category = category_name(row.get('JZXL_DISPLAY', row.get('HDLX_DISPLAY')))
+        if not isinstance(category, str) or category not in GOAL_CATEGORIES:
             continue
-        # A reservation that has not ended has no attendance result yet: it is planned. An
-        # unreadable value here is not a reason to block, because the result does not exist yet.
-        records.append(('1' if checked == '1' else '0', category, start, end, wid))
-    result = Progress(completed, planned, frozenset(unresolved))
-    # shortcut: greedy priorities do not maximize all schedule combinations; revisit if optimal planning is needed.
-    while records:
-        missing = result.missing
-        checked, category, start, end, _ = min(records, key=lambda record: (
-            record[0] != '1', record[1] not in missing, record[3], record[4]))
-        if checked == '1':
-            completed[category] += 1
-        else:
-            planned[category] += 1
-        records = [record for record in records if record[2] > end or record[3] < start]
-    return result
+        counted[category] += 1
+    missing = frozenset(category for category in REQUIRED_CATEGORIES if not counted[category])
+    return Progress(counted, missing)
 
 
 def conflicting_records(rows: list[dict[str, Any]]) -> bool:
@@ -264,20 +233,15 @@ class Lecture:
                 raise ValueError('lecture_schema_unknown') from None
             if closes <= opens or row.get('YY_WID') is not None and not isinstance(row['YY_WID'], str):
                 raise ValueError('lecture_schema_unknown')
-            # The school UI decides availability from the server clock and the joined head counts.
+            # Compare the published window with the host clock and use the joined head counts.
             if row['FBZT'] != '1':
                 availability = 'not_reservable'
             elif row.get('YY_WID'):
                 availability = 'already_reserved'
             else:
-                server_now = row.get('_SERVER_NOW')
-                try:
-                    current = moment(server_now).timestamp() if server_now else now
-                except ValueError:
-                    raise ValueError('lecture_schema_unknown') from None
-                if current < opens.timestamp():
+                if now < opens.timestamp():
                     availability = 'reservation_not_started'
-                elif current > closes.timestamp():
+                elif now > closes.timestamp():
                     availability = 'reservation_ended'
                 elif taken is not None and capacity is not None and taken >= capacity:
                     availability = 'capacity_full'

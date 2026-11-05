@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from .client import RemoteError
+from .client import AuthenticationExpired, AuthenticationRejected, RemoteError
 
 
 @dataclass(frozen=True)
@@ -99,22 +99,27 @@ class ActivityPoller:
                  clock: Callable[[], float] = time.monotonic,
                  gate: WaitGate | None = None,
                  on_exit: Callable[[], None] | None = None,
-                 on_align: Callable[[float, float, float], None] | None = None,
                  on_update: Callable[[], None] | None = None,
                  retry_delay: Callable[[int, Snapshot | None], float] | None = None,
+                 retry_interval: Callable[[], float] | None = None,
+                 max_consecutive_failures: int | None = None,
                  name: str = 'activity-poller'):
         self._query = query
         self._interval = interval
         self._clock = clock
         self._gate = gate
         self._on_exit = on_exit
-        self._on_align = on_align
         self._on_update = on_update
         self._retry_delay = retry_delay
+        self._retry_interval = retry_interval
+        # Event-driven owners stop retrying an outage after this many attempts; the next
+        # explicit refresh request (or a phase change) wakes them for another try.
+        self._max_failures = max_consecutive_failures
         self._name = name
         self._exit_called = False
         self._lock = threading.Lock()
         self._snapshot: Snapshot | None = None
+        self._last_success: tuple[Snapshot, int] | None = None
         self._stop = threading.Event()
         # Wakes the interval wait early for an on-demand refresh (and for stop). A refresh
         # requested while a query is already in flight is satisfied by that query: the target
@@ -122,9 +127,6 @@ class ActivityPoller:
         self._wake = threading.Event()
         self._policy_changed = threading.Event()
         self._refresh_target = 0
-        # One-shot start-of-poll target, consumed by the next wait computation. Targets
-        # already in the past are dropped so alignment can never rewind or busy-wait.
-        self._align: float | None = None
         self._polls = 0
         self._in_flight_since: float | None = None
         self._thread: threading.Thread | None = None
@@ -143,6 +145,15 @@ class ActivityPoller:
         with self._lock:
             return self._snapshot, self._polls
 
+    def snapshot_for_scan(self) -> tuple[Snapshot | None, int]:
+        """Keep the original successful snapshot and version across ordinary failures."""
+        with self._lock:
+            latest = self._snapshot
+            if (self._last_success is not None and latest is not None and latest.error is not None
+                    and not latest.server_directed):
+                return self._last_success
+            return latest, self._polls
+
     @property
     def running(self) -> bool:
         thread = self._thread
@@ -158,17 +169,6 @@ class ActivityPoller:
         """Completed query attempts, successful and failed."""
         with self._lock:
             return self._polls
-
-    def align_at(self, when: float | None) -> None:
-        """One-shot: retarget the next wait computation so the following poll starts at
-        ``when`` (same clock basis).
-
-        ``None`` drops a pending target. The target is honored only when it is still in
-        the future and at most two intervals away, so the regular cadence is never pushed
-        out by more than an extra period and an already-missed target is ignored.
-        """
-        with self._lock:
-            self._align = when
 
     def request_refresh(self) -> int:
         """Ask the running poller to run a query now; return the version that satisfies it.
@@ -191,6 +191,42 @@ class ActivityPoller:
         """Re-evaluate a changed phase without requesting an extra poll."""
         self._policy_changed.set()
         self._wake.set()
+
+    def _refresh_pending(self) -> bool:
+        """Whether a refresh request is not yet satisfied by a completed poll."""
+        with self._lock:
+            return self._refresh_target > self._polls
+
+    def _consume_satisfied_refresh(self) -> bool:
+        """Acknowledge a refresh request already satisfied by the poll that just completed.
+
+        The wake event alone cannot tell a stale request from a new one: a request made while a
+        query was in flight is satisfied when that query finishes, so its wake must be consumed
+        here. Otherwise the next bounded-failure wait would return immediately and start another
+        round of requests for an event that was already handled.
+        """
+        with self._lock:
+            if self._refresh_target > 0 and self._polls >= self._refresh_target:
+                self._refresh_target = 0
+                if not self._stop.is_set():
+                    self._wake.clear()
+                return True
+            return False
+
+    def _wait_for_new_event(self, *, allow_policy: bool) -> None:
+        """Wait for a genuinely new refresh request (or stop) and consume its wake.
+
+        A policy change is not a query request: event-driven owners must apply the new budget at
+        the start of the next real request instead of querying just because the phase changed.
+        """
+        while not self._stop.is_set():
+            if self._refresh_pending():
+                return
+            if allow_policy and self._policy_changed.is_set():
+                self._policy_changed.clear()
+                return
+            self._wake.wait(0.2)
+            self._wake.clear()
 
     def _call_exit(self) -> None:
         if self._exit_called:
@@ -225,6 +261,8 @@ class ActivityPoller:
                                   since=failed_at)
             with self._lock:
                 previous = self._snapshot
+                if isinstance(exc, (AuthenticationExpired, AuthenticationRejected)):
+                    self._last_success = None
                 self._snapshot = Snapshot(
                     rows=previous.rows if previous is not None else [],
                     at=previous.at if previous is not None else started,
@@ -247,6 +285,7 @@ class ActivityPoller:
             self._snapshot = Snapshot(rows=rows, at=finished, started=started,
                                       seconds=max(0.0, finished - started))
             self._polls += 1
+            self._last_success = self._snapshot, self._polls
             self._in_flight_since = None
         self._publish()
         return True
@@ -279,7 +318,6 @@ class ActivityPoller:
 
     def _run(self) -> None:
         try:
-            aligned_target: float | None = None
             failures = 0
             while not self._stop.is_set():
                 # Check the shared deadline immediately before each request. The gate is updated
@@ -291,52 +329,55 @@ class ActivityPoller:
                     self._wake.wait(self._gate.remaining())
                     self._wake.clear()
                     continue
-                if aligned_target is not None:
-                    # Record alignment only here: the next query is actually about to start and
-                    # all stop/shared-wait checks above have passed. A stop that wakes the wait
-                    # must not produce a diagnostic for a request that never runs.
-                    actual = self._clock()
-                    callback = self._on_align
-                    if callback is not None:
-                        try:
-                            callback(aligned_target, actual, actual - aligned_target)
-                        except Exception:
-                            # A diagnostic callback must never take the poller down.
-                            pass
-                    aligned_target = None
                 started = self._clock()
                 interval = self._interval() if callable(self._interval) else self._interval
                 if not self.poll_once():
                     if self._retry_delay is None or self._stop.is_set():
                         return
-                    failures += 1
-                    self._stop.wait(self._retry_delay(failures, self.snapshot()))
+                    # A refresh that arrived during this failed query is satisfied by the attempt
+                    # that just completed; consume it before deciding whether to keep retrying.
+                    self._consume_satisfied_refresh()
+                    snapshot = self.snapshot()
+                    backoff = (snapshot is not None and (
+                        snapshot.server_directed or snapshot.reason == 'service_unavailable'))
+                    failures = failures + 1 if backoff else 0
+                    if self._max_failures is not None and failures >= self._max_failures:
+                        # Event-driven owner: one outage must not turn into a request storm.
+                        # Genuinely new refresh events still get one more bounded round; a stale
+                        # wake from the already-satisfied request must not.
+                        if self._refresh_pending():
+                            failures = 0
+                            continue
+                        self._wait_for_new_event(allow_policy=False)
+                        failures = 0
+                        continue
+                    # Ordinary errors follow the same cadence as successful requests.
+                    if backoff:
+                        delay = self._retry_delay(failures, snapshot)
+                    else:
+                        target = interval if interval is not None else (
+                            self._retry_interval() if self._retry_interval is not None else 0.0)
+                        delay = max(0.0, target - (self._clock() - started))
+                    self._stop.wait(delay)
                     continue
                 failures = 0
-                with self._lock:
-                    if (self._refresh_target > 0
-                            and self._polls >= self._refresh_target):
-                        # The query we just completed satisfies the pending refresh request.
-                        self._refresh_target = 0
-                        if not self._stop.is_set():
-                            self._wake.clear()
+                self._consume_satisfied_refresh()
                 # A stop may have arrived while the query was in flight and the refresh clear
                 # above could otherwise discard its wake: never enter the interval after a stop.
                 if self._stop.is_set():
                     return
                 if interval is None:
-                    self._wake.wait()
-                    self._wake.clear()
+                    # Event-driven owner: only another explicit refresh event may query. Policy
+                    # changes are applied by the next real request, never by an extra query.
+                    self._policy_changed.clear()
+                    if self._refresh_pending():
+                        # A refresh event was requested after the query started/finished; it is
+                        # still pending, so run the query it asked for.
+                        self._wake.clear()
+                        continue
+                    self._wait_for_new_event(allow_policy=False)
                     continue
                 wait = interval - (self._clock() - started)
-                target = self._take_align()
-                if target is not None:
-                    now = self._clock()
-                    if now < target and target - now <= 2 * interval:
-                        # Exactly when the next poll must start; the target is consumed either
-                        # way, so a missed opening cannot shift later polls.
-                        wait = target - now
-                        aligned_target = target
                 while wait > 0 and not self._stop.is_set():
                     if not self._wake.wait(wait):
                         break
@@ -351,13 +392,5 @@ class ActivityPoller:
                     if interval is None:
                         break
                     wait = interval - (self._clock() - started)
-                    if aligned_target is not None:
-                        wait = aligned_target - self._clock()
         finally:
             self._call_exit()
-
-    def _take_align(self) -> float | None:
-        """Consume the pending alignment target (one-shot) under the state lock."""
-        with self._lock:
-            target, self._align = self._align, None
-            return target

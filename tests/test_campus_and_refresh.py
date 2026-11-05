@@ -185,13 +185,13 @@ def test_sms_send_failure_does_not_swallow_input(answers):
     client = Client(school, {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
                     prompt, events.append)
     client.authenticate()
-    assert school.send_attempts == 1
+    assert school.send_attempts == answers.count('send')
     assert any('短信发送失败' in label for label in labels)
     assert 'sms_send_failed' in events
     # Every displayed prompt consumed exactly one user input; no discarded answer.
     assert not pending and len(labels) == len(answers)
     if 'send' in answers[1:]:
-        assert any('等待约' in label for label in labels)
+        assert not any('等待约' in label for label in labels)
 
 
 def test_new_background_history_replaces_a_still_cached_history(tmp_path, monkeypatch):
@@ -230,7 +230,7 @@ def test_new_background_history_replaces_a_still_cached_history(tmp_path, monkey
                    settings=Settings(state_dir=tmp_path, prewarm=False,
                                      captcha_prefetch=False)) == 130
     assert not school.submitted
-    assert intervals and all(interval() == 5 for interval in intervals)
+    assert intervals and all(interval is None for interval in intervals)
     assert FakePoller.instances and all(.05 <= poller.interval() <= .10 for poller in FakePoller.instances)
     assert not any(url.endswith('queryMyActivityList.do') for _, url, _ in school.requests)
     saved = json.loads((tmp_path / 'task.json').read_text())
@@ -277,7 +277,9 @@ class CampusSmsRetryAcrossFallback(CampusSchool):
             self.send_attempts += 1
             response = requests.Response()
             response.url = url
-            response.status_code = 200
+            response.status_code = 429 if self.send_attempts == 1 else 200
+            if self.send_attempts == 1:
+                response.headers['Retry-After'] = '60'
             response._content = json.dumps({'code': 500 if self.send_attempts == 1 else 200}).encode()
             return response
         if path.endswith('loginRedirect') and self.campus_redirects == 0:
@@ -337,7 +339,7 @@ class CampusSmsSendRaises(CampusSchool):
         return super().request(method, url, **kwargs)
 
 
-def test_sms_send_remote_error_cools_down_without_crashing(monkeypatch):
+def test_sms_send_remote_error_has_no_cooldown(monkeypatch):
     school = CampusSmsSendRaises()
     now = [500.0]
     monkeypatch.setattr(client_module.time, 'monotonic', lambda: now[0])
@@ -354,7 +356,7 @@ def test_sms_send_remote_error_cools_down_without_crashing(monkeypatch):
     client = Client(school, {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'},
                     prompt, events.append)
     client.authenticate()
-    assert client.sms_retry_at == 560.0
+    assert client.sms_retry_at == 0.0
     assert school.send_attempts == 1
     assert events.count('sms_send_failed') == 1
     assert any('短信发送失败' in label for label in labels)

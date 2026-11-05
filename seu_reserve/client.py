@@ -44,8 +44,6 @@ HOSTS = {'auth.seu.edu.cn', 'vpn.seu.edu.cn', 'ehall.seu.edu.cn'}
 # Read bodies in large chunks and bound each blocking read by the remaining request budget:
 # one-byte iteration made every response byte pass through Python code and timing checks.
 RESPONSE_CHUNK_SIZE = 65536
-# The school rejects too-frequent SMS sends; after a failure, block local resends for this long.
-SMS_RESEND_DELAY = 60.0
 
 
 class _DeadlineSocket:
@@ -163,7 +161,7 @@ def _resolve_within(host: str, port: int, deadline: float) -> tuple[Any, ...]:
         generation = _DNS_GENERATION.get(key, 0)
     remaining = deadline - now
     if remaining <= 0:
-        raise socket.gaierror(socket.EAI_AGAIN, 'dns resolution budget exhausted')
+        raise socket.timeout('dns resolution budget exhausted')
     if not _DNS_RESOLVER_SLOTS.acquire(blocking=False):
         raise socket.gaierror(socket.EAI_AGAIN, 'dns resolver slot limit reached')
     resolved: list[Any] = []
@@ -195,7 +193,7 @@ def _resolve_within(host: str, port: int, deadline: float) -> tuple[Any, ...]:
         _DNS_RESOLVER_SLOTS.release()
         raise
     if not done.wait(max(0.0, remaining)):
-        raise socket.gaierror(socket.EAI_AGAIN, 'dns resolution timed out')
+        raise socket.timeout('dns resolution timed out')
     if failures:
         exc = failures[0]
         if isinstance(exc, socket.gaierror):
@@ -332,6 +330,21 @@ class _DeadlineHTTPSConnection(_BoundedDNSConnection, Urllib3HTTPSConnection):
         fallback = (time.monotonic() + float(timeout)) if timeout is not None else None
         self._response_deadline = _current_request_deadline() or fallback
         Urllib3HTTPSConnection.request(self, *args, **kwargs)
+
+    def _new_conn(self) -> Any:
+        sock = super()._new_conn()
+        deadline = _current_request_deadline()
+        if deadline is None:
+            return sock
+        # The TCP connection may already have consumed most of the request budget; bound the
+        # TLS handshake that follows with what is left so opening the connection cannot run
+        # past the deadline that connect() reports for the whole attempt.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            sock.close()
+            raise socket.timeout('response deadline exceeded')
+        sock.settimeout(max(remaining, 0.001))
+        return sock
 
     def connect(self) -> None:
         deadline = _current_request_deadline()
@@ -540,6 +553,13 @@ class AuthenticationExpired(RemoteError):
 
 class AuthenticationRejected(RemoteError):
     pass
+
+
+def server_backoff_error(exc: BaseException) -> bool:
+    """Only an explicit HTTP failure or Retry-After may introduce a request backoff."""
+    return (getattr(exc, 'retry_after', 0) > 0
+            or getattr(exc, 'http_status', None) in (429, 502, 503, 504)
+            or isinstance(exc, RemoteError) and str(exc) in ('server_backoff', 'service_unavailable'))
 
 
 class Client:
@@ -783,16 +803,15 @@ class Client:
                                                 stream=True, **kwargs)
             finally:
                 REQUEST_DEADLINE.value = previous_deadline
-            if response.status_code in (429, 502, 503, 504):
+            retry_after = retry_after_seconds(response)
+            if response.status_code in (429, 502, 503, 504) or retry_after > 0:
                 # Decide from the status line and headers first: a slow or malformed error body
                 # must not turn an explicit rate-limit/overload answer into a generic network
                 # timeout that loses the wait the school asked for.
                 status = response.status_code
-                retry_after = retry_after_seconds(response)
                 self._discard(response)
-                if status == 429:
-                    raise RemoteError('server_backoff', retry_after, http_status=429)
-                raise RemoteError('service_unavailable', retry_after, http_status=status)
+                reason = 'service_unavailable' if status in (502, 503, 504) else 'server_backoff'
+                raise RemoteError(reason, retry_after, http_status=status)
             if response.status_code != 200:
                 # Only 200 bodies are consumed later (JSON payload or captcha image); redirect
                 # and error bodies are never needed.
@@ -1042,17 +1061,14 @@ class Client:
                     try:
                         sent = self.cas('sendStage2Code', {'userId': username})
                     except RemoteError as exc:
-                        # A network, TLS or 429 failure while sending the SMS is not fatal: report
-                        # it, cool down for at least the local interval (or the school's
-                        # Retry-After) and keep the prompt loop so the next input is not lost.
                         self.notify('sms_send_failed')
-                        self.sms_retry_at = time.monotonic() + max(SMS_RESEND_DELAY, exc.retry_after)
-                        sms_hint = '短信发送失败，可能请求过于频繁；请稍后重试，或直接输入六位验证码。'
+                        if server_backoff_error(exc):
+                            self.sms_retry_at = time.monotonic() + max(1.0, exc.retry_after)
+                        sms_hint = '短信发送失败，结果未确认；可再次输入 send，或输入已收到的六位验证码。'
                         continue
                     if not has_code(sent, 200):
                         self.notify('sms_send_failed')
-                        self.sms_retry_at = time.monotonic() + SMS_RESEND_DELAY
-                        sms_hint = '短信发送失败，可能请求过于频繁；请稍后重试，或直接输入六位验证码。'
+                        sms_hint = '短信发送失败，结果未确认；可再次输入 send，或输入已收到的六位验证码。'
                 elif re.fullmatch(r'\d{6}', answer):
                     code = answer
                     break
@@ -1200,10 +1216,9 @@ class Client:
             for item in hdrs:
                 if isinstance(item, dict) and isinstance(item.get('HD_WID'), str):
                     counts[item['HD_WID']] = item.get('YYRS')
-        server_now = datas.get('xtdqsj')
         merged: list[dict[str, Any]] = []
         for row in rows:
-            activity = dict(row, _SERVER_NOW=server_now)
+            activity = dict(row)
             for key in ('HD_WID', 'WID'):
                 identifier = activity.get(key)
                 if isinstance(identifier, str) and identifier in counts:

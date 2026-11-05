@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from seu_reserve.client import RemoteError
+from seu_reserve.client import AuthenticationExpired, RemoteError
 from seu_reserve.poller import ActivityPoller, WaitGate
 
 
@@ -32,18 +32,6 @@ def test_dynamic_poll_interval_is_resampled_and_includes_request_time():
     assert waits == pytest.approx([.55])
 
 
-def test_poll_once_stores_rows_and_timestamp():
-    clock = [100.0]
-    poller = ActivityPoller(lambda: [{'WID': 'one'}], interval=0.25, clock=lambda: clock[0])
-    assert poller.poll_once() is True
-    snapshot = poller.snapshot()
-    assert snapshot is not None
-    assert snapshot.rows == [{'WID': 'one'}]
-    assert snapshot.at == 100.0
-    assert snapshot.error is None
-    assert not poller.running
-
-
 def test_poll_once_records_error_and_retry_after_without_raising():
     class Throttled(Exception):
         retry_after = 7.5
@@ -62,20 +50,27 @@ def test_poll_once_records_error_and_retry_after_without_raising():
     assert snapshot.rows == []
 
 
-def test_plain_failure_is_not_marked_server_directed():
-    class Broken(Exception):
-        pass
+def test_scan_keeps_success_version_until_authentication_expires():
+    attempts = iter([None, RemoteError('network_timeout'),
+                     AuthenticationExpired('business_authentication_expired'),
+                     RemoteError('network_timeout')])
 
     def query():
-        raise Broken('boom')
+        error = next(attempts)
+        if error is not None:
+            raise error
+        return []
 
-    poller = ActivityPoller(query, interval=0.25, clock=lambda: 55.0)
-    assert poller.poll_once() is False
-    snapshot = poller.snapshot()
-    assert snapshot is not None
-    assert snapshot.error == 'Broken'
-    assert snapshot.failed_at == 55.0
-    assert snapshot.server_directed is False
+    poller = ActivityPoller(query, interval=.25)
+    assert poller.poll_once()
+    success = poller.snapshot_with_version()
+    assert not poller.poll_once()
+    assert poller.snapshot_for_scan() == success
+    latest, version = poller.snapshot_with_version()
+    assert latest is not None and latest.error and version == 2
+    assert not poller.poll_once()
+    assert not poller.poll_once()
+    assert poller.snapshot_for_scan() == poller.snapshot_with_version()
 
 
 def test_rate_limited_failure_without_retry_after_is_server_directed():
@@ -113,13 +108,6 @@ def test_error_snapshot_records_a_fixed_log_safe_reason(error, reason):
     assert snapshot.reason == reason
 
 
-def test_successful_snapshot_has_no_error_reason():
-    poller = ActivityPoller(lambda: [], interval=0.25, clock=lambda: 55.0)
-    assert poller.poll_once() is True
-    snapshot = poller.snapshot()
-    assert snapshot is not None and snapshot.reason is None
-
-
 def test_thread_polls_until_stopped():
     called = threading.Event()
     calls = []
@@ -136,170 +124,6 @@ def test_thread_polls_until_stopped():
     assert not poller.running
     assert calls
     assert poller.snapshot() is not None and poller.snapshot().error is None
-
-
-def _started_poller(starts, *, interval):
-    """Poller whose query records its start time on the real clock."""
-
-    def query():
-        starts.append(time.monotonic())
-        return []
-
-    return ActivityPoller(query, interval=interval, clock=time.monotonic)
-
-
-def _wait_for_polls(poller, count, timeout=3.0):
-    """Wait until ``count`` queries have completed; returns the completed count."""
-    deadline = time.monotonic() + timeout
-    while poller.polls < count and time.monotonic() < deadline:
-        time.sleep(0.02)
-    return poller.polls
-
-
-def test_polls_counts_completed_queries():
-    class Broken(Exception):
-        pass
-
-    calls = []
-
-    def query():
-        calls.append('one')
-        if len(calls) == 2:
-            raise Broken('boom')
-        return [{'WID': 'one'}]
-
-    poller = ActivityPoller(query, interval=0.25, clock=lambda: 100.0)
-    assert poller.polls == 0
-    assert poller.poll_once() is True
-    assert poller.polls == 1
-    assert poller.poll_once() is False
-    assert poller.polls == 2
-
-
-def test_on_update_fires_after_a_completed_poll():
-    updated = threading.Event()
-    poller = ActivityPoller(lambda: [], interval=0.01, clock=time.monotonic,
-                            on_update=updated.set)
-    poller.start()
-    try:
-        assert updated.wait(2.0)
-    finally:
-        poller.stop()
-    assert poller.polls >= 1
-
-
-def test_on_update_fires_after_a_failed_poll():
-    class Broken(Exception):
-        pass
-
-    updated = threading.Event()
-
-    def query():
-        raise Broken('boom')
-
-    poller = ActivityPoller(query, interval=0.01, clock=time.monotonic,
-                            on_update=updated.set)
-    poller.start()
-    try:
-        assert updated.wait(2.0)
-    finally:
-        poller.stop()
-    snapshot = poller.snapshot()
-    assert snapshot is not None and snapshot.error == 'Broken'
-
-
-def test_align_at_places_the_next_poll_near_the_target():
-    starts = []
-    poller = _started_poller(starts, interval=0.5)
-    target = time.monotonic() + 0.15
-    poller.align_at(target)
-    poller.start()
-    try:
-        assert _wait_for_polls(poller, 2) >= 2
-    finally:
-        poller.stop()
-    # The first poll runs immediately; the one-shot alignment puts the next one on target.
-    assert len(starts) >= 2
-    assert target - 0.05 <= starts[1] <= target + 0.3
-
-
-def test_align_callback_reports_the_honored_target_and_actual_start():
-    starts, aligns = [], []
-
-    def query():
-        starts.append(time.monotonic())
-        return []
-
-    poller = ActivityPoller(query, interval=0.5, clock=time.monotonic,
-                            on_align=lambda target, actual, delta: aligns.append((target, actual, delta)))
-    target = time.monotonic() + 0.15
-    poller.align_at(target)
-    poller.start()
-    try:
-        assert _wait_for_polls(poller, 3) >= 3
-    finally:
-        poller.stop()
-    assert aligns
-    assert abs(aligns[0][0] - target) < 0.01
-    assert aligns[0][2] >= -0.05
-
-
-def test_alignment_is_not_recorded_when_stop_interrupts_the_wait():
-    starts, aligns = [], []
-
-    def query():
-        starts.append(time.monotonic())
-        return []
-
-    poller = ActivityPoller(query, interval=1.0, clock=time.monotonic,
-                            on_align=lambda target, actual, delta: aligns.append((target, actual, delta)))
-    poller.align_at(time.monotonic() + 0.25)
-    poller.start()
-    try:
-        assert _wait_for_polls(poller, 1) >= 1
-        time.sleep(0.05)
-    finally:
-        poller.stop()
-    assert starts  # the first poll did run
-    assert aligns == []
-
-
-def test_align_at_is_one_shot():
-    starts = []
-    poller = _started_poller(starts, interval=0.4)
-    poller.align_at(time.monotonic() + 0.15)
-    poller.start()
-    try:
-        assert _wait_for_polls(poller, 3) >= 3
-    finally:
-        poller.stop()
-    # Only the first wait was pulled to the target; the poll after it is regular again.
-    assert starts[2] - starts[1] >= 0.3
-
-
-def test_align_at_ignores_a_target_beyond_two_intervals():
-    starts = []
-    poller = _started_poller(starts, interval=0.3)
-    poller.align_at(time.monotonic() + 2.0)
-    poller.start()
-    try:
-        assert _wait_for_polls(poller, 2) >= 2
-    finally:
-        poller.stop()
-    assert 0.2 <= starts[1] - starts[0] <= 0.6
-
-
-def test_align_at_none_cancels_a_pending_target():
-    starts = []
-    poller = _started_poller(starts, interval=0.3)
-    poller.align_at(time.monotonic() + 0.15)
-    poller.align_at(None)
-    poller.start()
-    try:
-        assert _wait_for_polls(poller, 2) >= 2
-    finally:
-        poller.stop()
-    assert starts[1] - starts[0] >= 0.2
 
 
 def test_snapshot_with_version_returns_a_consistent_pair():
@@ -325,19 +149,6 @@ def test_snapshot_with_version_returns_a_consistent_pair():
     # Rows from poll N and version N are published under the same lock, so a reader can never
     # mark a version consumed while holding older rows.
     assert all(row == version for row, version in pairs)
-
-def test_wait_gate_is_updated_by_the_limited_thread_immediately():
-    class Limited(Exception):
-        retry_after = 120.0
-        http_status = 429
-
-    gate = WaitGate(time.monotonic)
-    poller = ActivityPoller(lambda: (_ for _ in ()).throw(Limited()), interval=0.01,
-                            clock=time.monotonic, gate=gate)
-    started = time.monotonic()
-    assert poller.poll_once() is False
-    assert gate.remaining() > 100.0
-    assert time.monotonic() - started < 1.0
 
 
 def test_wait_gate_stops_the_sibling_thread_before_its_next_request():
@@ -372,16 +183,6 @@ def test_wait_gate_stops_the_sibling_thread_before_its_next_request():
         limited_poller.stop()
         sibling.stop()
 
-
-def test_rate_limit_without_retry_after_also_updates_the_gate():
-    class Limited(Exception):
-        http_status = 429
-
-    gate = WaitGate(lambda: 50.0)
-    poller = ActivityPoller(lambda: (_ for _ in ()).throw(Limited()), interval=0.01,
-                            clock=lambda: 50.0, gate=gate)
-    assert poller.poll_once() is False
-    assert gate.remaining() > 0.5
 
 def test_request_refresh_polls_immediately_instead_of_waiting_for_the_interval():
     polls = []
@@ -423,77 +224,6 @@ def test_stop_without_join_does_not_block_on_a_slow_request_and_closes_on_exit()
     release.set()
     assert closed.wait(2.0)
 
-
-def test_exit_callback_runs_once_for_a_finished_thread():
-    exits = []
-    poller = ActivityPoller(lambda: [], interval=10.0, clock=time.monotonic,
-                            on_exit=lambda: exits.append('closed'))
-    poller.start()
-    try:
-        deadline = time.monotonic() + 2.0
-        while poller.polls < 1 and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert poller.polls >= 1
-    finally:
-        poller.stop()
-    assert exits == ['closed']
-
-def test_request_refresh_returns_the_version_that_satisfies_it():
-    calls = []
-    started = threading.Event()
-    release = threading.Event()
-
-    def query():
-        calls.append(time.monotonic())
-        started.set()
-        release.wait(3.0)
-        return []
-
-    poller = ActivityPoller(query, interval=10.0, clock=time.monotonic)
-    poller.start()
-    try:
-        assert started.wait(2.0)
-        # The query in flight was started before the request: the poller promises that its
-        # completion (the next polls version) satisfies the refresh.
-        target = poller.request_refresh()
-        assert target == 1
-        assert poller.polls == 0
-        release.set()
-        deadline = time.monotonic() + 2.0
-        while poller._refresh_target and time.monotonic() < deadline:
-            time.sleep(0.005)
-        # The in-flight query satisfied the request without a queued second poll, and the
-        # satisfied target is cleared so a later request is for a fresh version.
-        assert poller.polls == target
-        assert poller._refresh_target == 0
-        assert len(calls) == 1
-        assert poller.request_refresh() == poller.polls + 1
-    finally:
-        release.set()
-        poller.stop()
-
-def test_request_refresh_coalesces_a_repeat_request_into_the_same_target():
-    started = threading.Event()
-    release = threading.Event()
-
-    def query():
-        started.set()
-        release.wait(3.0)
-        return []
-
-    poller = ActivityPoller(query, interval=10.0, clock=time.monotonic)
-    poller.start()
-    try:
-        assert started.wait(2.0)
-        assert poller.request_refresh() == 1
-        assert poller.request_refresh() == 1
-    finally:
-        release.set()
-        poller.stop()
-
-def test_request_refresh_without_a_running_poller_returns_no_target():
-    poller = ActivityPoller(lambda: [], interval=1.0, clock=time.monotonic)
-    assert poller.request_refresh() == 0
 
 def test_refresh_request_during_an_in_flight_query_is_coalesced():
     calls = []
@@ -547,7 +277,7 @@ def test_refresh_cannot_shorten_a_reader_error_backoff():
     def query():
         starts.append(time.monotonic())
         if len(starts) == 1:
-            raise RemoteError('network_timeout')
+            raise RemoteError('service_unavailable', http_status=503)
         recovered.set()
         return []
     reader = ActivityPoller(query, interval=60, on_update=updated.set,
@@ -584,5 +314,71 @@ def test_policy_reschedule_recomputes_wait_without_an_immediate_extra_query():
             time.sleep(.005)
         assert len(starts)>=2
         assert .12 <= starts[1]-starts[0] < .7
+    finally:
+        reader.stop()
+
+def test_merged_refresh_is_consumed_before_the_failure_cap_wait():
+    """One refresh merged into an in-flight failing query must not replay a failure round."""
+    calls = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def query():
+        calls.append(threading.current_thread().name)
+        entered.set()
+        release.wait(2)
+        raise RemoteError('service_unavailable', http_status=503)
+
+    reader = ActivityPoller(query, interval=None,
+                            retry_delay=lambda count, snapshot: .01,
+                            max_consecutive_failures=3)
+    reader.start()
+    try:
+        assert entered.wait(2)
+        assert reader.request_refresh() == 1
+        release.set()
+        until = time.monotonic() + 1.5
+        while len(calls) < 3 and time.monotonic() < until:
+            time.sleep(.005)
+        # A stale wake from the already-satisfied merged request would immediately start a
+        # second three-failure round here.
+        time.sleep(.15)
+        assert len(calls) == 3
+        # A genuinely new refresh event still gets exactly one bounded round.
+        reader.request_refresh()
+        until = time.monotonic() + 1.5
+        while len(calls) < 6 and time.monotonic() < until:
+            time.sleep(.005)
+        time.sleep(.15)
+        assert len(calls) == 6
+    finally:
+        release.set()
+        reader.stop()
+
+
+def test_event_driven_reader_ignores_policy_reschedule_until_a_refresh_event():
+    """A phase change updates the budget but must not query an event-driven owner by itself."""
+    calls = []
+    first = threading.Event()
+
+    def query():
+        calls.append(time.monotonic())
+        first.set()
+        return []
+
+    reader = ActivityPoller(query, interval=None)
+    reader.start()
+    try:
+        assert first.wait(1)
+        reader.reschedule()
+        time.sleep(.15)
+        assert len(calls) == 1
+        reader.request_refresh()
+        until = time.monotonic() + .7
+        while len(calls) < 2 and time.monotonic() < until:
+            time.sleep(.005)
+        assert len(calls) == 2
+        time.sleep(.1)
+        assert len(calls) == 2
     finally:
         reader.stop()

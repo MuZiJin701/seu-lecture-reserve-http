@@ -1,482 +1,181 @@
-# 使用与验收
+# 使用指南：配置、命令行与排错
 
-线程职责、各时期参数和预约时序图见[线程协作与查询策略](thread-query-strategy.md)。
+[README](../README.md) · [Web 操作与部署](web.md) · [业务规则](requirements.md) · [查询策略](thread-query-strategy.md)
 
-首次使用按 [README](../README.md) 的安装、配置、检查和启动步骤操作。本文集中说明配置、诊断与恢复；业务规则以[需求](requirements.md)为准，统计证据见[接口调查](completion-records.md)，术语见 [GLOSSARY](../GLOSSARY.md)。
+使用网页管理多个账号，先看 [README 的启动步骤](../README.md#安装与启动)。本文供需要改配置、使用 CLI、设置邮箱或处理报错时查阅。
 
-Web 管理台的管理员登录、部署、账号操作与收信配置见 [Web 指南](web.md)。已纳管账号统一开启设备信任、预热、验证码预取、后台历史刷新、开抢对齐和成功通知，不再按标题过滤；邮箱留空不发邮件。本页可选开关和标题配置描述旧单账号 CLI，`--account` 使用纳管账号的统一规则。本文的 `main.py` 命令与 `.env` 学校选项用于旧单账号 CLI；已纳管账号使用 `--account 一卡通号` 读取统一配置和状态。预约规则逐账号适用。
+## 入口与恢复
 
-已纳管账号的配置写入与 CLI 正常运行共用 `task.lock`：CLI 已持锁时，网页保存返回 `state_in_use`，配置不变；网页先保存完成、CLI 随后取得锁时，保存成功，CLI 重读最新筛选、学校密码和邮件配置后运行，管理台跳过被 CLI 阻塞的重启。运行中账号的正常保存仍安全停止并重启该账号，沿用原任务及待确认保护。操作和离线证据见 [Web 指南](web.md#cli-与锁)与[审查修复验收](acceptance/2026-10-31-review-fixes.md#4-复核补丁写入配置持锁与-cli-重读)。
+### 网页账号也能用 CLI
+
+在项目目录运行，把“你的一卡通号”换成网页中已添加的账号：
+
+```bash
+uv run --locked main.py --account 你的一卡通号 --status
+uv run --locked main.py --account 你的一卡通号 --check
+uv run --locked main.py --account 你的一卡通号
+```
+
+三条命令分别是查看本地状态、检查真实学校链路、开始／继续预约。CLI 和网页共用该账号的配置与状态；同一账号运行 CLI 前，先在网页停止。账号参数也接受内部 ID。
+
+不带 `--account` 时，使用 `.env` 中的单账号配置。已经添加到网页的账号应使用 `--account`，不要另建一套相同账号的任务。
+
+### 常用选项
+
+| 选项 | 用途与影响 |
+| --- | --- |
+| 无模式选项 | 开始或恢复预约；在该终端按 Ctrl+C 停止 |
+| `--status` | 查看本地状态，不请求学校 |
+| `--check` | 真实登录、查询筛选结果并取验证码；不提交或取消预约，不发邮件，不创建任务。开启设备信任时仍会更新信任文件 |
+| `--test-mail` | 发一封真实测试邮件，不登录学校 |
+| `--resolve-pending` | 在交互终端中请求学校核对，并按你的确认处理待确认状态；不提交预约 |
+| `--new-task` | 兼容旧的“已完成”状态；当前达标后仍继续运行，通常不需要使用 |
+| `--config /绝对路径/.env` | 指定配置文件，可与上述模式及 `--account` 组合 |
+
+`--status`、`--check` 等模式选项互斥。用 `--help` 查看完整参数；一般失败返回 1，Ctrl+C／SIGTERM 停止返回 130。
+
+### 短信认证和待确认
+
+CLI 提示需要短信时，输入 `send` 发送，再输入六位验证码；发送失败可按提示重发；仅服务器明确限流、要求等待或返回 502–504 时才限制重发。网页操作见[账号操作](web.md#账号操作)。设备信任不保证免短信，开抢前应提前完成认证，并保留最终用于预约的进程。
+
+提交结果不明时，先让程序自动核对。需要人工处理时：先停止该账号的所有运行实例，再执行：
+
+```bash
+uv run --locked main.py --account 你的一卡通号 --resolve-pending
+```
+
+若学校记录已有原活动，按结果确认；仍查不到时，只有输入 `confirm` 才会清除对应待确认和占位，其他输入取消。**先到学校核实，再决定是否解除；不要删 `task.json` 强行重试。** 自动恢复规则见[状态与恢复](requirements.md#状态与恢复)。
 
 ## 配置
 
-复制 [.env.example](../.env.example) 为 `.env` 后填写。默认只读当前工作目录的 `.env`，不向上查找；其他位置用 `--config /项目目录/.env` 指定，文件不存在即报错。状态目录相对于所选配置文件，进程环境变量优先。
+复制 [.env.example](../.env.example) 为 `.env` 后修改。默认读取当前目录的 `.env`，进程环境变量优先；配置文件所在目录决定相对数据路径。修改后重启对应进程才生效。`.env` 由程序读取，不要用 `source .env` 执行它。
 
-| 配置项 | 含义 |
+列表写成 JSON，并用单引号包住，例如 `'["九龙湖校区"]'`。布尔值只接受 `true`／`false`。密码含空格、`#`、`=`、`$` 时加引号；`${...}` 不会展开。
+
+### 管理台与公共配置
+
+| 配置项 | 说明 |
 | --- | --- |
-| `SEU_CARD_NUMBER` / `SEU_PASSWORD` | 学校一卡通号与密码 |
-| `SEU_PREFERRED_LECTURES` | 完整标题 JSON 数组；`[]` 不限标题，仍受其他条件约束 |
-| `SEU_REQUIRED_CATEGORIES` | 可预约类别及顺序，默认心理、法律、艺术、其他与沙龙五类，不能为空；沙龙可预约，但不计入正式讲座目标；移除沙龙项可关闭其预约 |
-| `SEU_PREFERRED_CAMPUS` | 允许的线下校区数组；内置默认为空列表，未配置时不约线下；样例列出学校全部校区 |
-| `SEU_ENABLE_ONLINE` / `SEU_ENABLE_OFFLINE` | 允许线上／线下，仅接受 `true` 或 `false` |
+| `SEU_WEB_ADMINS` | 管理员账号和密码的 JSON 对象，也支持已有密码哈希。`{}` 表示没有管理员，程序会拒绝启动 |
+| `SEU_WEB_HOST` / `SEU_WEB_PORT` | 监听地址和端口，默认 `0.0.0.0:8080`；仅用于可信局域网或 VPN |
+| `SEU_DATA_DIR` | Web 和 `--account` 共用的数据目录；未设置时依次使用 `SEU_STATE_DIR`、`state` |
+| `SEU_VPN_IP` | 首次认证失败时可用的备用网关 IP；留空关闭。仍校验证书，不重放预约提交；地址是否可用需按实际网络判断 |
+
+网页账号的学校密码、类别、校区和收信邮箱在网页中设置，不使用下面的单账号筛选配置。网页账号统一不限标题，并开启设备信任、我的活动预热、验证码预取和成功通知；不填收信邮箱则不发邮件。
+
+### 单账号 CLI 配置
+
+以下仅用于不带 `--account` 的运行方式：
+
+| 配置项 | 说明 |
+| --- | --- |
+| `SEU_CARD_NUMBER` / `SEU_PASSWORD` | 学校账号和密码。兼容旧键 `SEU_USERNAME`；同一来源同时设置时优先用一卡通号 |
 | `SEU_STATE_DIR` | 状态目录，默认 `state` |
-| `SEU_DATA_DIR` | Web 与 `--account` CLI 的数据根目录；缺省沿用 `SEU_STATE_DIR`，再缺省为 `state`。包含 `accounts.sqlite3` 与按账号状态 |
-| `SEU_TRUST_DEVICE` | 可选“记住此设备”（程序缺省 `false`；`.env.example` 样例为 `true`）：登录时发送学校同款信任字段（`rememberTrustDevice` 与本地稳定 `fingerPrint`），登录成功后将域名以 `seu.edu.cn` 结尾的 CAS Cookie 原子保存到状态目录 `trust-cookies.json`（固定字段及账号归属哈希、仅本地、等效登录凭据）；之后新进程登录先装入 Cookie；校园直连路径显式调用 `verifyTgt` 校验应用页，网关入口在进入应用阶段跳转 CAS 时也会调用 `verifyTgt`，其余网关请求靠 Cookie 生效；Cookie 有效时可免密码／短信（2026-10-30 本机同账号单样本已验证），失效、被拒或损坏时静默回退密码＋短信；不延长会话有效期（约 1 小时 54 分）；不要在共享或公用电脑开启。两类文件内容不打印、不进入日志／邮件／仓库；删除 Cookie 文件会结束静默登录，删除指纹按新设备重新生成 |
-| `SEU_VPN_IP` | 首次登录的备用网关 IP；空值关闭回退 |
-| `SEU_MAIL_SUCCESS` | 每次成功通知开关；程序缺省 `false`、样例 `true`，仅邮件已启用时生效 |
-| `SEU_PREWARM` | 默认 true；约前 2 秒通知历史只读线程刷新，不阻塞主线程，也不保证主会话连接预热；剩余不足 0.4 秒跳过 |
-| `SEU_CAPTCHA_PREFETCH` | 开抢前约 0.6 秒预取并识别验证码，候选出现后直接提交；超时上界 `min(0.6 秒, 距开抢剩余 −0.03 秒)`，剩余不足 0.45 秒时跳过、预热后重新计算剩余时间；默认 `true`，`false` 关闭 |
-| `SEU_POLLER_ALIGN` | 实验性开抢对齐：把某次后台轮询对齐到开抢时刻；程序缺省 `false`，`.env.example` 样例为 `true`。校时校准后目标取最早的估算时间（通常早于真实开抢），尚未校时的首次对齐仍可能偏差，开启前需真实开抢对比 |
-| `SEU_HISTORY_BACKGROUND` | 默认 true；定期历史刷新普通期 25 秒、开抢期 5 秒；false 只取消定期刷新，按需查询仍由历史线程完成，缓存分别 30／60 秒 |
+| `SEU_PREFERRED_LECTURES` | 完整讲座标题列表；`[]` 表示不限标题 |
+| `SEU_REQUIRED_CATEGORIES` | 允许类别，按列出的顺序优先，不能为空；名称见配置样例 |
+| `SEU_PREFERRED_CAMPUS` | 允许的线下校区。程序缺省为空，即不约线下；样例列出了全部校区，请按需要删选 |
+| `SEU_ENABLE_ONLINE` / `SEU_ENABLE_OFFLINE` | 是否允许线上／线下活动；线下还须满足校区限制 |
+| `SEU_TRUST_DEVICE` | 保存设备指纹和 Cookie，尝试免短信登录。程序缺省关闭，样例开启；勿在公用电脑启用 |
+| `SEU_CAPTCHA_PREFETCH` | 是否预取验证码，默认开启。程序按运行机器的时钟在学校公布的开放时间前 2.7 秒尝试预取 |
+| `SEU_PREWARM` | 是否在进入快抢期时通知我的活动线程预热一次，并用主会话做一次普通列表读取为验证码预取和提交预留连接；默认开启 |
+| `SEU_MAIL_SUCCESS` | 是否发送每次成功通知。程序缺省关闭，样例开启；关闭后仍可发送重要告警 |
 
-列表写成单引号包裹的 JSON，例如 `'["无锡校区"]'`。密码含空格、`#`、`=` 或 `$` 时用引号包裹；`${...}` 原样保留，不展开变量。不要把 `.env` 当 shell 脚本执行。修改后重启生效，样例更新不会覆盖已有配置。
-
-`SEU_PREWARM`、`SEU_CAPTCHA_PREFETCH`、`SEU_HISTORY_BACKGROUND`、`SEU_POLLER_ALIGN` 是开抢提速实验项，只接受 `true` 或 `false`，互不影响，也不改变提交串行顺序。程序缺省：预热与预取开启，关闭只回退对应准备；后台历史刷新由 `SEU_HISTORY_BACKGROUND` 单独控制且开启，关闭后取消定期历史刷新，按需查询仍由历史线程完成，普通／开抢缓存分别 30／60 秒；对齐由 `SEU_POLLER_ALIGN` 单独控制且缺省关闭。`.env.example` 样例把六项可选项（含 `SEU_TRUST_DEVICE`、`SEU_MAIL_SUCCESS`）全部设为 `true`。事件唤醒与健康快照合并没有单独开关，始终生效。预热与预取按学校开抢时间戳去重，同一场开抢各最多一次；本地开抢估算取“开抢时间戳 − 学校时钟偏移 − 余量”，余量取 `1.1 秒 + 该次列表快照年龄 + 该次列表请求耗时`，重算只允许向更早移动；余量超过 2 秒时跳过预热、预取与可选对齐并记录 `preparation_skipped`。风险、诊断字段与配置方法见[开抢提速实验项](#开抢提速实验项)。
-
-2026-10-28 起按用户确认的新口径排除“SEU咖啡间”沙龙计数：全部历史沙龙及已确认占位不计已选听、不占正式讲座的待参加缺口；7 场正式讲座加 1 场沙龙不算达标。沙龙仍默认启用预约；配置含沙龙时继续按原有筛选和目标缺口策略处理，配置不含时跳过。沙龙预约不减少正式讲座缺口，也不设独立次数目标；正式讲座的已选听加待参加覆盖目标后暂停全部新增，实际选听达标后结束。更新前停止旧实例，保留 `.env` 和状态，更新后按原方式启动；已完成任务也会重新核对并在不足时恢复补约。已有有效沙龙预约及时间占位继续拦截冲突，不自动取消。
-
-兼容账号变量 `SEU_USERNAME`；同一来源中 `SEU_CARD_NUMBER` 优先，任何进程环境账号都优先于文件。缺少凭据时前台可隐藏输入，非交互运行会报错。旧 TOML 入口和浏览器超时配置不适用，未知 `.env` 字段会报错；按本项目样例逐项填写，不要复用不适用的旧字段。
-
-`.env`、状态及含讲座详情的终端输出仅供本地使用，不要上传真实配置或个人记录。
+旧配置中的 `SEU_POLLER_ALIGN`、`SEU_HISTORY_BACKGROUND` 已删除；旧账号库含这些选项时也不能直接用于新版。升级前先备份 `.env` 和完整数据目录，再检查兼容性，**不要靠删除账号或任务绕过报错**。升级步骤见[本地数据与恢复](web.md#本地数据与恢复)。
 
 ## 邮件配置
 
-邮件可选，关闭后终端及 `events.log` 仍记录事件。仅配置收件人不足以发信；所有邮件字段为空或缺省时关闭，仅保留 `SMTP_PORT=465` 也关闭，部分配置不完整则停止启动。`--check` 与 `--resolve-pending` 不发送邮件，因此不因共用发信配置缺失或无效而失败；正常运行（含 `--new-task`）与 `--test-mail` 仍校验邮件配置。
-
-### 获取发信密码
-
-| 发件邮箱域名 | 自动使用的主机 | 密码类型 |
-| --- | --- | --- |
-| `qq.com` | `smtp.qq.com` | SMTP 授权码 |
-| `163.com` | `smtp.163.com` | SMTP 授权密码 |
-| `126.com` | `smtp.126.com` | SMTP 授权密码 |
-| `gmail.com` | `smtp.gmail.com` | 应用专用密码 |
-
-QQ：在电脑浏览器登录 [QQ 邮箱](https://mail.qq.com/)，进入“设置 → 账号与安全 → 安全设置”（旧版为“设置 → 帐户”），开启包含 SMTP 的服务，按提示验证并生成授权码。已有服务时保留原设置，从授权码管理生成新码；页面入口可能变化，见[操作说明](https://consumer.huawei.com/cn/support/content/zh-cn00696857/)。
-
-163／126：登录对应邮箱，进入“设置 → POP3/SMTP/IMAP”，开启 SMTP 并选择“新增授权密码”，按提示验证。生成的密码通常只显示一次，见[网易说明](https://help.mail.126.com/faqDetail.do?code=d7a5dc8471cd0c0e8b4b8f4f8e49998b374173cfe9171305fa1ce630d7f67ac286624f309a1a7089)。
-
-Gmail：在 [Google 账号](https://myaccount.google.com/security)开启两步验证，再到[应用专用密码](https://myaccount.google.com/apppasswords)为本工具创建密码，复制十六个字符并去掉分组空格。找不到入口时检查组织限制、验证方式及高级保护设置，见 [Google 说明](https://support.google.com/accounts/answer/185833?hl=zh-Hans)。
-
-### 填写并测试
-
-不要填写邮箱网页登录密码。只填以下两项即可默认发给自己：
+不需要邮件时，公共发信配置和网页账号收信邮箱都留空。需要时，在 `.env` 填写发信邮箱和 SMTP 授权码／应用专用密码：
 
 ```dotenv
-SMTP_USERNAME=your-address@qq.com
-SMTP_PASSWORD='your-authorization-code'
+SMTP_USERNAME=sender@qq.com
+SMTP_PASSWORD=换成授权码
+# 其他邮箱服务商可补充：
+# SMTP_HOST=smtp.example.com
+# SMTP_PORT=465
+# MAIL_FROM=sender@example.com
 ```
 
-主机按上表域名精确匹配，不区分大小写；别名、子域及其他邮箱不自动识别。切换邮箱时清空或更新旧的显式主机。高级配置如下，非空显式值优先：
+程序可按 QQ、163、126、Gmail 的邮箱域名选择主机，其他邮箱需指定 `SMTP_HOST`。邮箱需已开启 SMTP，使用服务商要求的授权码或应用专用密码。发信使用校验证书的隐式 TLS，默认端口 465。
 
-| 配置项 | 默认值及用途 |
-| --- | --- |
-| `SMTP_HOST` | 根据发件账号补全；其他邮箱手填 TLS 主机，不含 URL 或端口 |
-| `SMTP_PORT` | 隐式 TLS 端口，默认 `465` |
-| `MAIL_FROM` | 默认 `SMTP_USERNAME`；自定义须获服务商允许 |
-| `MAIL_TO` | 默认发件人，可指定另一个完整邮箱地址 |
-| `SMTP_USERNAME` / `SMTP_PASSWORD` | 成对提供；也兼容无需认证的 TLS 中继 |
+- 网页：在每个学校账号中填收信邮箱；留空不发信。填了收信邮箱但公共发信配置无效时，该账号不能启动。
+- 单账号 CLI：`MAIL_TO` 指定收件人，缺省为发信邮箱。邮件字段全空表示关闭，填了一部分但不完整会报错。
 
-当前使用校验证书的 `SMTP_SSL`，不支持明文、587 STARTTLS 或 OAuth。SMTP 不自动使用 HTTP 代理。关闭邮件需清空账号、密码、主机、发件人和收件人，端口留空或保持 `465`；同名进程环境变量也须清除。
-
-保存配置后运行：
+网页可点击“测试邮件”；单账号 CLI 可运行：
 
 ```bash
 uv run --locked main.py --test-mail
 ```
 
-此命令只发一封邮件，不要求学校凭据、不访问学校、不修改任务。`event=test_mail_accepted`、退出码 0 只代表 SMTP 接受，还需核对收件箱及垃圾邮件。`mail_disabled`、`mail_configuration_invalid` 或 `notification_failed` 返回 1，测试结果不写入任务通知状态。
-
-### 通知规则
-
-只提醒重大问题：需要人工认证、认证被拒绝（账号／密码／账号状态）、连续五分钟无法完成查询、连续五分钟无法完成验证码或提交请求、任务异常退出。预约成功邮件由 `SEU_MAIL_SUCCESS=true` 开启（样例默认开启），每次按活动 ID 确认的预约成功发一封，由后台线程发送、不阻塞扫描；关闭时只发重大告警，不发目标完成、待确认、恢复通知和日报。所有邮件达到原有触发条件即入队，不再因开抢延后；持续失败仍须满五分钟，不是首次失败就发信。同一未解决告警跨重启只尝试一次，失败不自动补发，恢复只记录不发送；退出时最多等待发送队列五秒，未完成邮件可能中止。具体时机见[邮件与告警](requirements.md#邮件与告警)。邮件只有中文说明、安全汇总与数据时间，没有讲座详情或凭据。认证被拒绝告警以 `task_failed` 作为持久化去重键；旧版本状态若残留 `authentication_rejected` 键，会在加载时一次性迁移，修正凭据后可正常重启。
-
-重大告警和成功通知共用一个邮件发送线程，主线程只决定类型、去重、生成正文并排队；发送结果返回主线程保存。每次 SMTP 网络操作超时二十秒，不是整封邮件总时限。最近邮件状态／耗时字段继续只反映重大告警，成功通知不改这些字段；两者均记录安全的发送结束事件。队列仅在内存中，退出最多等待五秒，仍未完成则记录 notification_pending_on_exit，可能中止且不自动补发；通知失败不改变预约结果。SMTP 接受与收件箱送达分别验收，既有用户确认不代表本轮新架构已完成真实送达验证。
+这是实际发送操作。显示服务器接受后，还要检查收件箱。发送哪些通知见[邮件与告警](requirements.md#邮件与告警)。
 
 ## 开抢与拥塞恢复
 
-CLI 与管理台账号共用主线程、两个查询所有者和可选邮件线程；首次需要预约验证码时启动一个工作线程，之后所有预取、现场取图及判错重取的图片获取/校验和 OCR 均复用它。主线程负责认证、快照校验、筛选、派发验证码任务、重试决策、串行提交与唯一任务写入。验证码线程独占借出的主会话，每次只执行一个任务，结果未消费前不接下一任务；期间主线程处理可靠历史快照、读者错误、阶段参数、停止、邮件及健康状态，但不使用或复制主会话。结果归还后用已有列表/历史快照重算候选与冲突，不增加复核查询。活动列表和历史列表各由独立只读线程及会话查询，邮件线程顺序发送。主线程不再同步查询列表或历史兜底。认证失效后丢弃旧认证代次的验证码，先归还会话再重新认证；任务编号递增，空闲不取图、不建立库存。直接查询离线适配器仍同步，`--check` 仅只读取图。取舍见 [ADR-0014](adr/0014-single-captcha-worker.md)，验证见[统一验证码线程验收](acceptance/2026-11-04-captcha-worker.md)。
+请在运行 CLI 或管理服务的机器上用 NTP 等方式同步系统时钟。查询阶段、我的活动预热和验证码预取以这台机器的时钟为准。例如学校公布 19:00 开放，预取目标为 18:59:57.300。提交前，程序用同一时钟判断是否处于预约时间窗，并核对学校的发布状态和名额。已有可靠结果时，提交可以与我的活动刷新并行。各时期的完整行为见[预约查询策略](thread-query-strategy.md)。
 
-时间按学校时钟判断，随机值均匀抽样，不提供配置或网页调频选项。更新代码并重启原 CLI 或管理服务后才生效。下表为默认开启定期历史刷新时的参数；T 为预约开放时刻：
+临时网络或响应错误、验证码问题及超时不增加冷却或退避。**提交超时仍要核对学校记录，不能直接重提。**
 
-| 阶段 | 列表目标开始间隔 | 列表快照有效期 | 历史目标开始间隔／快照有效期 | 两路读取预算 |
-| --- | --- | --- | --- | --- |
-| 普通期 | 随机 4–6 秒 | 10 秒 | 25 秒／30 秒 | 10 秒 |
-| T−30 秒至 T−5 秒 | 随机 0.5–1.5 秒 | 2 秒 | 5 秒／10 秒 | 2 秒 |
-| T−5 秒至 T＋9 秒 | 随机 0.05–0.10 秒 | 2 秒 | 5 秒／10 秒 | 2 秒 |
-| T＋9 秒至 T＋5 分钟 | 随机 0.5–1.5 秒 | 2 秒 | 5 秒／10 秒 | 2 秒 |
-| T＋5 分钟起 | 恢复普通期参数，读者继续运行 | 10 秒 | 25 秒／30 秒 | 10 秒 |
-
-列表、历史间隔均按请求开始到下一次开始计算，扣除请求耗时，超出目标则不额外等待；每个读者只允许一个在途请求，不补发错过的次数。列表逐次重新抽样，等待在已知阶段边界截短，可选对齐仍可调整一次等待；已开始请求保留其开始时预算。两个来源的请求量会叠加，多账号再各自叠加。随机化不保证避免自动化识别或提高命中率。
-
-有可靠快照时，主线程普通期每轮计划等随机 4–6 秒，开抢期按对应目标减去处理耗时；缺快照时等待新版本或最近阶段、准备、读者恢复截止时间，最多五秒重新检查。Condition 加递增版本记录列表、历史、邮件和验证码通知；先确认版本再消费结果，持条件锁核对版本后才等待，通知不能丢在消费与等待之间。真实等待使用单调时钟的绝对截止时间，健康刷新与五分钟告警可截短内部等待。停止优先检查，跨进程停止仍保留最多 0.2 秒检查粒度；服务端等待中可处理本地结果，但不会提前发学校请求。通知不改变查询周期、在途合并或错误退避，不作为额外查询指令。实际主线程间隔不固定，也不能当作学校请求频率。
-
-快照年龄从成功响应完成时间计算；查询成功时发布新的快照和版本。查询失败会发布带错误的状态，旧行只供诊断保留，不能当作成功快照使用。2026-11-04 用户确认将快抢期快照有效期从 0.75 秒放宽到 2 秒，与慢抢期一致；用于减少下一次查询尚在途时过早停止使用旧结果。请求预算和有效期仍独立计时：耗时 1.5 秒的成功响应刚发布时年龄接近零；在途请求不续期，新成功结果立即替换，明确失败即禁止使用旧行，不保证旧快照覆盖整次两秒请求。过期时等待新结果，不由主线程兜底查询。候选数据从请求开始计算的年龄另见 `rows_data_age`。验证见[开抢快照 2s 验收](acceptance/2026-11-04-opening-snapshot-2s.md)，全时期协作见[策略时序图](thread-query-strategy.md#全时期预约时序)。
-
-待确认期间，提交持久化之后产生的可靠列表或历史正向证据可提前唤醒并确认；一次有效缺席核对后的两秒截止时间不会被通知缩短。各次缺席检查仍要求两路请求均在本次起点后开始，不用重复快照累计次数。事件与诊断日志复用安全打开的句柄并逐行 flush，退出关闭；仍仅在启动前轮转，检查点不交给后台写入线程。
-
-普通期历史最多复用 30 秒；缓存筛选出可提交候选时，向历史线程请求新查询，拿到可靠结果后重新检查进度与冲突，失败不提交。定期刷新约 25 秒一次，新快照及时取代缓存；手动取消、考勤和新增预约仍可能延后约 30 秒加调度与请求耗时反映。开抢历史最多复用 10 秒；过期、错误或行格式非法时暂停新增，但列表读者继续运行。预热、切入开抢和缓存缺失时可主动刷新历史，一般准备触发至少间隔 2 秒；候选核对与提交后核对另按版本票据请求，均由同一历史读者完成。
-
-已知目标按活动 ID 跟踪，窗口不超过预约截止时间；多场窗口重叠取更快阶段。目标明确已预约、撤下、被筛选或冲突排除、类别已不需要时结束对应追踪；没有待抢目标且无待确认提交时提前恢复普通参数，两个读者继续运行。空列表、缺行或时间格式错误不证明完成；满额场次继续跟踪可能释放的名额。
-
-| 路径或错误 | 处理 |
-| --- | --- |
-| 验证码、提交 | 普通期预算 10 秒，开抢期 8 秒；验证码线程取图/OCR 后归还主会话，主线程串行提交；用已有快照复核，不额外查列表 |
-| 只读瞬时失败 | 同一读者、同一会话自行恢复，其他健康读者继续；开抢期可恢复网络／响应错误通常约 0.1 秒后再试，普通期按 1、2、4、5 秒短退避 |
-| 主线程可恢复错误 | 开抢期通常约 0.25 秒后再检查，普通期按 1、2、4、5 秒短退避；快照尚未准备好本身不记查询失败 |
-| 502／503／504 | 没有明确等待值时按 1、2、4、5 秒短退避，上限 5 秒，不改用长等待 |
-| 429／有效 Retry-After | 两路只读与主线程共用最长等待截止点；读者停留在原线程中等待，到期恢复；每次新请求前、取验证码前及取图后提交前检查，不用旧错误反复延长截止点 |
-| 认证失效 | 停止读者并重新认证；旧请求结束前不创建同端点替代读者 |
-
-服务端要求等待优先，已经在途的请求不被强行中断；无可用等待值的 429 使用短退避，非法或不可持久化的值不写成无限等待。重启恢复的旧本地等待最多 5 秒，有效服务端等待保持。失败不联动关闭健康读者，也不反复推迟历史重启冷却。主线程要求刷新不能缩短读者自己的错误退避。
-
-响应首部、TLS、响应体读取（含 gzip、chunked 内部读取）共用剩余请求预算，连接后再次校验。DNS 在有界后台线程解析，调用方只等剩余预算；成功结果缓存 60 秒，连接失败丢弃，最多 8 个解析任务。请求已超时后解析成功仍可填充缓存；超时按 EAI_AGAIN 处理。纯 CPU 解析及线程调度不能硬中断，预算不是绝对完成上限。连接超时可按未发送恢复；已发送但结果不明的提交先按活动 ID 核对，不能盲目重提。
-
-既有实测未证实学校主动限流，也未证明服务端不会识别自动化。此前把限流当作停顿原因的推测已撤回；历史只读采样及真实开抢证据见[只读记录](acceptance/2026-10-29-read-only-probe.md)、[19:00 实战排查](acceptance/2026-11-03-opening-recovery.md)。当前架构的检查与限制见[统一线程验收](acceptance/2026-11-03-unified-workers.md)，不能用旧版成功样本替代当前高峰验收。
-
-### 开抢提速实验项
-
-事件唤醒、健康快照合并和两个读者的职责边界始终生效；已纳管账号统一开启以下选项，旧单账号 CLI 保留布尔开关。
-
-- **后台定期历史刷新（SEU_HISTORY_BACKGROUND，默认 true）**：所有阶段运行同一历史线程，按上表定期查询。false 只关闭定期查询，启动、候选出现及待确认仍由该线程按需查询；普通期缓存 30 秒、开抢期兼容旧 60 秒缓存，绝不恢复主线程同步查询。
-- **开抢前预热（SEU_PREWARM，默认 true）**：约前 2 秒通知历史线程刷新，记录 prewarm_history_requested；若同一查询在途则合并，距估算开放不足 0.4 秒时跳过。同一场最多成功发出一次准备通知；不阻塞主线程、不保证开放前完成，不再用历史请求保持主会话的验证码／提交连接热度，也没有原主会话 1.5 秒预热预算。
-- **验证码预取（SEU_CAPTCHA_PREFETCH，默认 true）**：主线程约前 0.6 秒向同一验证码线程派发预取任务，取图预算 min(0.6 秒, 剩余−0.03 秒)，剩余不足 0.45 秒跳过，开抢后不预取。任务独占主会话，归还后主线程才可认证或提交，现场获取也派发给同一线程；不并行生成第二张验证码。超预算、超过 5 秒未用、会话失效或被服务端判错时丢弃或回退现场取图，不增加原有最多四次尝试。取图/OCR 完成后由主线程记录 captcha_prefetched，启动记录 captcha_prefetch_started；本地 OCR 不能强制中断，退出先等任务归还会话。主线程可在准备期间继续处理快照，但提交仍依赖有效验证码，不承诺缩短真实开抢提交耗时。
-- **开抢对齐（SEU_POLLER_ALIGN，程序默认 false、样例 true）**：向活动列表读者交付下一场尚未开放的估算时间，调整一次等待、最多延长到两倍间隔，不增加请求。存在排队、超时或校时误差时不保证命中。
-
-预热、预取按稳定学校开放时间戳去重；下一场尚未开放的场次不会被仍在窗口内的旧场次挡住。估算取“学校开放时间−学校时钟偏移−余量”，余量为 1.1 秒＋该次列表快照年龄＋该次请求耗时；重算只向更早移动。余量超过 2 秒时跳过预热、预取与对齐，记录 preparation_skipped；仍可现场取图提交。程序启动后加载 OCR，失败时在首次需要识别时再尝试。预取和现场任务共用取图/OCR 实现，截止从派发开始计算；结果年龄从图片收到时计算。现场结果超过预算或五秒不用，丢弃并按既有退避重试；该限制不代表学校承诺的验证码有效期。候选到提交仍只保留验证码阶段健康写入和待确认／submitting 合并原子保存两次落盘。
-
-修改旧 CLI 开关后须重启，进程环境优先，非法布尔值报错；各开关不改变串行提交、服务端等待或结果不明保护。关闭预热／预取只关闭对应准备。
-
-诊断只在状态目录 diagnostics.jsonl，完整内容不进入终端、邮件或网页：
-
-| 诊断 | 含义 |
-| --- | --- |
-| `prewarm_history_requested` | 已请求历史读者准备；不表示查询完成或主会话连接已预热 |
-| `reader_snapshot_missing` | 一次失联期首次记录，含 reader、reader_in_flight、reader_request_started_at；读者尚未完成首轮查询（冷启动）不记录；主线程等待可靠结果，不触发同步兜底 |
-| `reader_stalled` | 一次失联期内读者超过 60 秒仍无可靠快照时记录一次（每个读者每次失联期一行），含 reader、missing_seconds、in_flight_seconds；仅本地诊断，不改变等待与读者所有权 |
-| `history_background_used`／`history_background_invalid` | 可靠历史被采用及年龄／行格式不可用原因 |
-| `background_reader_stopped` | 意外停止读者的安全错误摘要，按 reader 每五秒节流；普通失败在原线程重试，不一定产生此行 |
-| `request_failed` | reader、白名单端点、reason、stage、exception_type、预算／耗时及 DNS/TCP/TLS/响应头/体分段；未知阶段为 null，不记录 URL、请求参数、Cookie、正文或异常原文；同一 reader／端点／reason／stage 组合每 5 秒最多一行，被折叠的重复次数写入 `suppressed` |
-| `reservation_checked` | 一次有效缺席核对，checks 及 check_started_at、activities_started_at、history_started_at；两路请求须不早于本次核对起点 |
-| `notification_finished`／`notification_failed`／`notification_pending_on_exit` | 安全事件：发送尝试结束、固定失败原因／退出五秒后仍未发完；SMTP 接受不等于送达 |
-| `captcha_prefetched` | 预取的取图／识别耗时、连接耗时及距开抢的提前量（相对偏早的本地开抢估算，通常早于真实开抢） |
-| `captcha_job_started` | 派发给验证码线程的任务；`source` 为 prefetch/fresh、`job` 为本进程递增任务编号、`generation` 为认证代次；不含图片或识别内容 |
-| `captcha_job_discarded` | 认证失效或原调用放弃后回收的任务结果/异常，不作为提交证据 |
-| `captcha_candidate_changed` | 取图后已有快照复核不通过；`reason` 为 snapshot_unavailable/candidate_unavailable，放弃本轮提交、不额外查询 |
-| `captcha_prefetch_invalid` / `failed` | 预取识别结果不可用／取图或识别失败；随后按现场取图处理 |
-| `captcha_prefetch_stale` / `rejected` | 预取结果超过 5 秒未用被丢弃／被服务端判为验证码错误并回退现场取图 |
-| `pending_snapshot_confirmed` | 待确认核对使用轮询快照中的正向证据确认（`reservation_confirmed.source=pending_snapshot`） |
-| `poller_aligned` | 后台轮询实际采纳了一次开抢对齐：`target`、`actual` 与 `delta_seconds`（实际开始相对目标）；未采纳时不记录 |
-| `attendance_category_unknown` | 本地补充说明：学校记录缺少可用类别时记录该行活动 ID（`wid`），公开错误码仍为 `attendance_category_unknown`；恢复后的旧错误由 `last_error_at` 与 `last_error_active` 区分 |
-| `preparation_skipped` | 时钟不确定性过大（`reason=clock_uncertainty`，含 `uncertainty` 秒数）而跳过预热、预取与可选对齐；按开抢场次去重，候选仍现场取图提交 |
-| `trust_cookies_loaded` / `trust_cookies_unavailable` | 登录前加载持久化学校 Cookie 的数量（`cookies`）／未加载（文件缺失、过期、损坏或账号不匹配）；不记录 Cookie 值或票据 |
-| `trust_cookies_saved` / `trust_cookies_save_failed` | 登录成功后保存的学校 Cookie 数量（`cookies`）／写入失败；不记录 Cookie 值 |
-| `trust_silent_login_succeeded` / `trust_silent_login_failed` | `verifyTgt` 静默登录成功／失败：`step` 为 `verify_tgt`、`redirect`、`entry` 或 `app_page`，`code` 仅在校方返回整数时记录，非整数返回记为 `-1`；失败后静默回退密码＋短信 |
-| `attendance_unresolved` | 已结束但学校尚未给出可读考勤结果的讲座数量（`count`）；这些记录不计入已选听或待参加，也不阻塞新预约，学校回填后自动计入。数量变化时才写一行，仅本地诊断 |
-| `submission_started` 的 `captcha_source`、`prefetch_age`、`connect_seconds`、`rows_age`、`rows_data_age`、`precommit_save_seconds`、`yyrs`、`hdzrs`、`remaining`、`remaining_after` | 验证码来自预取（`prefetch`）还是现场取图（`fresh`）、预取年龄、该次现场取图的 TCP/TLS 建连耗时（复用连接、使用预取或本地拒绝时为 `null`）、候选所用列表快照年龄、候选数据年龄（从列表请求开始计）、提交前落盘耗时；`yyrs`／`hdzrs` 为提交所用活动列表行的已约人数与总人数，`remaining` 为提交时剩余名额（`hdzrs − yyrs`），`remaining_after` 为按本次占用一个名额推算的提交后剩余；人数缺失或不可解析时均为 `null` |
-| `submission_reply.captcha_source` / `connect_seconds` | 该次提交回复对应的验证码来源，便于对照判错；`connect_seconds` 为提交请求的 TCP/TLS 建连耗时（复用连接时为 `null`） |
-| `scan_timing` 的 `rows_age`、`rows_fetch_seconds`、`rows_data_age`、`main_requests`、`poller_polls` | 本次扫描消费的列表快照年龄、列表请求耗时、从请求开始到主线程消费的数据年龄、主循环累计请求数、后台轮询累计完成次数 |
-
-## 入口与恢复
-
-| 命令 | 用途 |
-| --- | --- |
-| `uv run --locked main.py` | 启动或恢复真实预约；Ctrl+C 停止 |
-| `uv run --locked main.py --check` | 登录、校验数据、展示筛选原因并取得验证码图片，不预约或写任务 |
-| `uv run --locked main.py --status` | 离线查看状态与私有筛选快照，不要求登录 |
-| `uv run --locked main.py --test-mail` | 只发一封真实测试邮件 |
-| `uv run --locked main.py --new-task` | 兼容入口：重核已完成目标；普通启动也会重核 |
-| `uv run --locked main.py --resolve-pending` | 待确认提交的人工兜底入口：只读核对学校记录，显式确认后才清除待确认与占位，不提交预约请求（仍需登录并只读查询）；正常运行会在核对后自动保留/释放占位 |
-
-五个模式参数互斥，均可配合 `--config`；`--help` 查看帮助。原 `uv run --locked seu-reserve` 与 `uv run main.py` 仍可使用，`--locked` 会阻止锁文件被自动更新。业务错误通常返回 1，Ctrl+C 或 SIGTERM 返回 130。
-
-每次正常启动都核对学校目标，本地完成不代表学校当前仍达标。状态损坏、账号不符或恢复时间非法会停止并保留原文件，不要删除任务来绕过待确认、冷却或服务端等待要求。版本 1 单场状态自动迁移，旧程序不能读取新版状态，不要混用。
-
-待确认不需要人工解除：程序先只核对原活动；连续 3 次有效查询仍未出现时，为每笔未确认预约保留独立时间占位并恢复扫描，所有占位共同参与冲突检查，其他候选与之重叠时跳过，每个原活动在占位存续期间最多重试 2 次（占位在 600 秒或原活动开始前到期，到期后计数随占位释放、按新占位重新计算；学校记录延迟时可能重复提交同一活动）；“我的活动”出现原活动（`FBZT='-1'` 的记录不作成功证据，与进度统计口径一致）、活动列表显示已预约或回复明确已预约时立即确认，并把该时间加入本地冲突集合后重算候选；已确认但历史未追上的占位继续保留，并按活动 ID 计入本地计划进度，避免超过目标继续预约。占位期限以主机时钟保存；原活动开始时间先按学校时钟偏差换算到主机时钟；尚未校时时按本地 600 秒保留，不因主机快慢提前按活动开始时间释放。到期记录 `reservation_hold_expired`。核对时优先使用后台轮询的内存快照：仅当快照时间不早于提交持久化时间且显示该活动已预约时，作为明确成功证据立即确认（`source=pending_snapshot`，诊断 `pending_snapshot_confirmed`）；快照中未出现该活动不构成缺席证据。没有该正向证据时，待确认核对请求两个读者的新查询；两路请求开始时间均须不早于本次核对开始，再计作一次有效缺席核对。纯等待新快照不清零已有有效次数，真实查询失败或结构矛盾才清零；一次有效核对无结果后等 2 秒再开始下一次。待确认核对同时使用“我的活动”和活动列表，一个接口失败不会阻止另一个来源的成功证据；但 429 等带等待要求的响应必须先等待，不会先查另一来源或增加核对次数，等待中断的核对同样清零已保存的连续计数。两者都查不到仍不能当作失败。查询失败、记录矛盾或结构不可读时不自动解除，该次核对也不计入连续 3 次有效缺席次数（失败时清零已保存次数，恢复后重新累计），仍可停止后台服务、确认 `process_running=false` 后运行 `uv run --locked main.py --resolve-pending` 人工兜底：只读查询“我的活动”，原场已出现则按成功确认；未出现时输入 `confirm` 才清除待确认与对应占位（含旧格式占位），其他输入取消且状态不变。该命令不提交预约。
-
-升级时，旧版已确认占位缺少类别会优先用本轮已有响应补齐，不额外查询学校；仍缺类别时以 `attendance_category_unknown` 暂停新增并保留占位，等待学校记录同步。旧待确认记录缺少活动起止时间时保持待确认，可用上述人工兜底入口核对。人工解除只清理对应活动，其他预约的新旧格式占位继续保留。
-
-前台需要短信时，输入 `send` 主动发送，再输入六位验证码；错误或过期可主动重发，未知挑战等待处理。会话恢复成功前不开展业务。后台没有终端而需要人工输入时保留任务并退出，先确认后台停止，再前台运行。未启用设备信任时登录 Cookie 只在进程内存中；停止前台再启动后台不会继承已认证会话，可能再次要求短信。启用设备信任后只尝试复用同账号有效 Cookie，不保证免短信。预约前应在最终运行进程中提前完成认证并保持该进程，不要在开放瞬间切换。
-
-## 服务器后台运行
-
-Web 常驻管理服务采用 [Web 指南](web.md#systemd-常驻)的永久 unit。本节保留旧单账号 CLI 的 Ubuntu 24.04 系统级临时服务；安装和运行使用同一账号。默认日志为 `state/runner.log`，自定义状态目录时同步修改目录及日志路径。
-
-先执行 `uv run --locked main.py --status`，确认本机 `process_running=false`（同一状态目录只有一个写者），再启动：
-
-```bash
-mkdir -p state
-touch state/runner.log
-sudo systemd-run --unit=seu-lecture-reserve-http --collect --service-type=exec \
-  --uid="$(id -un)" --working-directory="$PWD" --expand-environment=no \
-  --property=Restart=no --property=TimeoutStopSec=60 \
-  --property="StandardOutput=append:$PWD/state/runner.log" \
-  --property=StandardError=inherit \
-  "$(command -v uv)" run --locked main.py
-```
-
-已纳管账号使用 `main.py --account 一卡通号` 和其按账号状态目录。账号身份锁已取消（见 [ADR-0009](adr/0009-concurrent-sessions-and-locks.md)），但每个状态目录仍只允许一个写者；不要启动两个写同一 `task.json` 的进程。需要网页管理时建议停止此旧服务，再启动 Web 管理服务。
-
-服务名固定为 `seu-lecture-reserve-http.service`，与浏览器版区分。它指定工作目录、当前账号和绝对 `uv` 路径。输出持续追加，未配置自动轮转，请留意磁盘空间（本地诊断 `diagnostics.jsonl` 另有 8 MiB 启动轮转，见[状态与日志](#状态与日志)）。
-
-### 查看与停止
-
-```bash
-sudo systemctl status seu-lecture-reserve-http.service --no-pager
-uv run --locked main.py --status
-tail -n 20 state/runner.log
-```
-
-启动命令成功只证明程序已启动，仍需检查最近成功查询。停止时执行：
-
-```bash
-sudo systemctl stop seu-lecture-reserve-http.service
-uv run --locked main.py --status
-```
-
-确认 `process_running=false` 后才可前台处理或再次启动。停止等待最多六十秒，超时后可能强制终止；保留状态，重启时先核对待确认提交。`--collect` 会回收已退出服务，`systemctl status` 可能显示未找到，需结合项目状态及日志判断；root 用户省略 `sudo`。
-
-`Restart=no` 表示退出后不自动重启；服务器重启后也不会自启。处理故障后重新执行本节启动命令，保留原状态和日志，停止不取消学校预约。此处只提供操作指南，不会替用户部署或启动真实预约。
-
-### 服务环境
-
-系统级服务不自动继承 SSH 的临时 `export`，程序仍直接加载项目 `.env`，保留服务进程环境优先的规则。不要用 systemd 的 `EnvironmentFile` 解析本项目 `.env`，两者语法并不相同。
-
-Requests 的环境代理仍可用，但代理变量不能写进本项目 `.env`，否则报未知配置项。需要沿用 SSH 中已设置的 `HTTPS_PROXY` 和 `NO_PROXY` 时：把本节启动命令中的 `sudo systemd-run` 改为 `sudo --preserve-env=HTTPS_PROXY,NO_PROXY systemd-run`，并在程序路径之前加上 `--setenv=HTTPS_PROXY --setenv=NO_PROXY`。只列出实际设置的变量；root 直接运行 `systemd-run` 并加同样的 `--setenv` 参数。其他代理变量可按名称显式传入，不自动转发整个环境。
-
-该方式只在命令中列变量名，不展开代理地址或密码；sudo 策略须允许保留指定变量。SMTP 不走这些 HTTP 代理。参考 [systemd-run](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html) 的独立服务环境和 `--setenv` 说明。
-
-### 从 nohup 迁移
-
-这里只迁移旧后台实例的部署方式，与账号导入无关，也不需要重建 `.env` 或状态目录。先进入原项目目录，读取旧 PID 并核对：
-
-```bash
-reserve_pid=$(cat state/runner.pid)
-ps -p "$reserve_pid" -o pid,ppid,args
-readlink "/proc/$reserve_pid/cwd"
-```
-
-确认命令确为本项目的 `uv run main.py`（可能含 `--locked`），工作目录也正确后再执行：
-
-```bash
-kill -TERM "$reserve_pid"
-uv run --locked main.py --status
-```
-
-PID 可能过期或被复用，不能只凭文件杀进程；没有 PID 文件也不代表没有实例，需自行核对原进程。`uv` 会[转发终止信号](https://docs.astral.sh/uv/concepts/projects/run/#signal-handling)给 Python 子进程，确认 `process_running=false` 后做只读检查，再按本节启动 systemd 服务。旧 PID 文件不再用于新服务管理，保留它不会影响任务恢复。
-
-## 状态与日志
-
-`--status` 首行 `status=...` 为本地任务状态：`not_started` 无任务、`scanning` 扫描、`pending` 提交待确认、`done` 上次核对已完成、`legacy_completed` 旧单场成功。它们不能单独证明进程健康或预约成功。
-
-| 字段 | 怎么看 |
-| --- | --- |
-| `process_running` | 是否占用本地任务锁，不读取旧 PID 判活；权限或路径错误会报错 |
-| `phase` / `last_phase` | 当前／退出前阶段；旧任务或坏快照为 `unknown`，停止时 `phase=stopped` |
-| `updated_at` / `snapshot_age_seconds` | 快照时间与距今秒数 |
-| `last_query_at` / `last_query_age_seconds` | 当前进程最近完整查询及校验成功时间；未知不代表零次 |
-| `next_check_at` | 正常等待或退避的下一次检查计划 |
-| `last_error` / `last_error_at` / `failure_count` / `last_error_active` | 最近错误及时间、连续失败数；恢复清零次数，旧错误保留；`last_error_active=false` 表示该错误是历史记录，不是当前故障。Web 管理台的错误提示与预约清单旧数据标记也使用该字段，旧状态文件回退到 `last_error_at > last_query_at` 判断 |
-| `activity_count` / `candidate_count` | 上次列表条数及候选数；未查询列表时为 `unknown`，不是剩余名额 |
-| `mail_status` / `last_mail_at` | 邮件配置与最近重大告警状态／时间；`accepted` 只是 SMTP 接受 |
-| `last_mail_status` / `last_mail_error` | 跨重启保留的最近重大告警结果和安全错误分类 |
-| `last_mail_event` / `last_mail_duration_seconds` | 重大告警事件及实际耗时；旧记录或未结束尝试显示未知耗时 |
-| `selection_updated_at` / `activity_details` | 最近私有筛选快照及时间，损坏详情显示 `unknown` |
-
-常见阶段为 `authentication`、`my_activities`、`activities`、`captcha`、`submitting`、`confirming`、`waiting`、`waiting_for_attendance`、`backoff`、`manual_required` 和 `failed`。
-
-结合进程、阶段、成功查询及 `next_check_at` 判断进展：零候选且成功时间在更新，可能是未开放或被筛选，不代表提交链路通过。退避可受学校要求延长，学校网络请求也需等待；邮件独立发送，不能只按固定时长无更新判断退出。状态写入使用临时文件原子替换；Windows 上备份、杀毒或同时读取状态的进程短暂占用 `task.json` 时会自动重试，持续失败时终端最多每分钟记录一次 `event=health_write_failed`。该次健康快照可能滞后，但任务、预约结果与其他保存不受影响，此后旧时间不可作为新证据。健康快照写入在等待边界按 phase 变化或约 1 秒节流刷新，退出前强制刷新；`authentication`、`captcha`、`submitting`、`confirming`、`manual_required`、`failed`、`done`、`waiting_for_attendance` 阶段进入前以及错误、邮件状态变化会立即写入 phase 与状态。因此普通等待下 `--status` 最多滞后约 1 秒，关键阶段进入时 phase 立即可见，但 `updated_at` 可能滞后到该请求结束；等待中看到的是本次扫描即将等待的状态，而待确认前持久化、确认、占位与 `retry_at` 等关键状态仍同步落盘，不受该延迟影响。
-
-普通期活动列表通常比历史刷新更频繁：`last_query_at` 或 `selection_updated_at` 推进，不表示“我的活动”刚刚查询过。历史数据时间以本地 `task.json` 的 `health.progress.at`、`reservations.at` 及网页预约清单同步时间为准；普通期手动取消、考勤和新增预约可能延后约 30 秒加一轮扫描及请求耗时反映。
-
-筛选摘要 `selection.activities` 还保存活动 ID `wid`，用于按场次恢复开抢追踪；旧无 ID 摘要按标题与预约起止时间逐条绑定，同名场次分别保留。`--check`、`--status` 和管理台筛选摘要仍只投影原展示字段，不额外输出 ID；诊断与本地任务文件继续按私有数据处理。
-
-`scan_timing.mode=opening` 同时涵盖开放前 5 秒至后 9 秒的快速阶段与窗口内其他较慢阶段；`wait_seconds` 是主循环本轮计划等待，不是后台列表的实际请求间隔。`main_requests` 累计主会话的各类请求尝试，`poller_polls` 仅为当前一代列表线程已完成的查询尝试、线程重建后清零；不能把扫描行数或最后一代线程计数当作整个窗口的请求量。
-
-正常轮询安静，启动和认证成功会记录事件；查看最近事件：
-
-```bash
-tail -n 20 state/events.log
-```
-
-日志每行带 Unix 时间戳，旧错误仍保留；未记录过事件时文件可能不存在。启动署名不代表登录成功。后台启动、`--check` 和 `--test-mail` 展示一次维护者及项目链接，`--status` 和 `--help` 保持简洁。
-
-私有诊断另写在 `state/diagnostics.jsonl`：扫描节奏、筛选变化、验证码、验证码预取、开抢前预热、后台历史刷新、提交与核对结果、快照确认；`submission_started` 含 `captcha_seconds`、`ocr_seconds`、`captcha_source`、`prefetch_age`、`connect_seconds`、`rows_age`、`rows_data_age`、`precommit_save_seconds`，并记录提交时列表行的 `yyrs`（已约人数）、`hdzrs`（总人数）、`remaining`（提交时剩余名额）与 `remaining_after`（按本次占用一个名额推算的提交后剩余），`submission_reply.captcha_source` 标明该次回复所用验证码来源，`scan_timing` 含 `rows_source`（`poller` 快照；`query` 仅离线直接查询适配器）、`rows_age`、`rows_fetch_seconds`、`rows_data_age`、`main_requests`、`poller_polls`，后台历史刷新命中和格式非法重试分别记录 `history_background_used`／`history_background_invalid`，时钟不确定性过大跳过准备记录 `preparation_skipped`；字段仅含活动 ID、标题、固定原因、学校预约时间、计数与耗时。诊断不进入终端、邮件或事件日志；后台只读线程失败被主循环回收时记录一次 `background_reader_stopped`（含义见诊断表）。正常启动时若 `diagnostics.jsonl` 超过 8 MiB，会先改名为 `diagnostics-<YYYYmmdd-HHMMSS>.jsonl`（重名加数字后缀）并保留全部旧文件，运行期间不轮转，`--check` 不轮转也不写诊断；按需在本地排查时读取，各开抢提速字段含义见[开抢提速实验项](#开抢提速实验项)。
-
-### 筛选原因
-
-`--check` 展示当前结果；`--status` 展示最近成功快照，可能因待确认、查询失败或考勤结果未决而陈旧。每场仅保留标题、首个原因及学校预约时间，时间以北京时间显示，未知为 `null`。不为诊断额外查询学校，逐场详情不进入邮件或事件日志。
-
-| 原因 | 含义 |
-| --- | --- |
-| `candidate` | 通过筛选与名额判定，提交后按活动 ID 确认 |
-| `category_not_allowed` / `category_not_needed` | 类别未启用／当前目标不需要 |
-| `reservation_not_started` / `reservation_ended` | 预约尚未开始／已经结束 |
-| `capacity_full` / `not_reservable` | 已约人数达到总人数或不可约；以学校接口响应为准 |
-| `already_reserved` | 列表或我的活动已有预约 |
-| `notice_test_only` | 系统测试、请勿预约或购票公告，不预约 |
-| `title_not_selected` | 完整标题不匹配 |
-| `online_disabled` / `offline_disabled` | 对应授课方式关闭 |
-| `campus_not_selected` | 线下校区未选择 |
-| `time_conflict` | 与有效预约重叠、首尾相接，或与待确认原活动的本地时间占位重叠 |
-| `cooldown` | 验证码失败的本地冷却；只读检查不采用此项 |
-| `invalid_activity_time` | 候选时间损坏，跳过该场 |
-| `retry_limit` | 待确认原活动已达到重试次数上限，或已确认但学校历史尚未同步的占位，暂不重试 |
-
-未启用类别提前排除，允许缺少其他字段；缺标题显示空字符串，损坏的预约时间显示 `null`。目标或类别未知的记录仍严格校验，矛盾候选及已有记录未知会阻止新增。
-
-已预约证据优先展示为 `already_reserved`；其余场次在完成必要字段校验后，先判断类别需求、标题、授课方式、校区、冲突及本地保护，再判断是否开放或满额。因此已被配置排除的未开放场次可能显示筛选原因，不会仅因存在开放时间就启动快速查询。`capacity_full` 仍可保留为待抢目标，不能把“满额”和“本账号不再需要”混为一类。
+实际开抢效果和未确认项见[当前验证状态](acceptance/2026-11-05-prep-history-goal.md)。更新代码后需重启 CLI 或管理服务，已有进程不会自动加载新策略。
 
 ## 排错
 
-先看事件码、发生时间及下一次检查计划，公开排错只提供脱敏信息。
-
-| 事件或错误 | 处理 |
+| 看到的现象或错误码 | 怎么处理 |
 | --- | --- |
-| `configuration_or_state_invalid` | 配置、状态文件或路径校验失败（如未知配置项、JSON 列表或开关非法、状态损坏）而退出；按 `.env` 样例修正配置并保留、修复状态文件，不删除任务绕过保护 |
-| `ocr_unavailable` | 启动时加载 OCR 模型失败，在认证前退出；检查 ddddocr／ONNX 依赖与模型文件，重新同步依赖后再启动 |
-| `credentials_require_terminal` / `authentication_rejected` | 补齐凭据或核对账号状态，避免反复登录 |
-| `authentication_required` / `interactive_terminal_required` | 确认后台退出后前台处理短信或其他挑战 |
-| `campus_login_fallback` | 校园直连缺少 CAS 服务信息，或登录后进入应用阶段的网络／HTTP／TLS 失败（含非应用页面）时，已回退一次原网关认证；凭据错误、人工挑战与 `login()` 内部失败不回退 |
-| `sms_send_failed` | 短信发送被学校拒绝、请求过于频繁，或发送请求本身遇到网络／429 错误；程序提示稍后重试，冷却取 max(60 秒, `Retry-After`) 并跨校园→网关二次登录保持，期间不再重复发送 |
-| `activity_schema_unknown` / `business_response_invalid` | 目标数据或活动列表响应格式变化，暂停提交并核实接口，不能当作零候选 |
-| `invalid_activity_data` / `attendance_category_unknown` / `attendance_record_conflict` | 已有记录结构不可靠，不删除状态或绕过校验并暂停新增；尚未结束的新预约缺少打卡/违约字段按未参加、未违约计入待参加 |
-| 已结束但考勤结果不可读（`SFDK` 为 `0/空/未知` 等） | 不计为已选听、也不计入待参加，但**不再暂停或阻塞**其他讲座预约；学校之后回填打卡结果时，下一次扫描自动计入。本地诊断 `attendance_unresolved` 记录当前未决数量，不进入终端、事件或邮件 |
-| `reservation_unconfirmed` / `reservation_unconfirmed_released` | 提交结果待核对／核对后保留原活动时间占位并恢复扫描；占位期间冲突候选跳过，解除与占位事件不发邮件 |
-| `reservation_hold_confirmed` / `reservation_hold_expired` | 占位期间出现明确成功证据并确认／占位到期释放；到期后可能重新允许冲突候选，证据在本地事件与诊断 |
-| `query_failure` / `query_recovered` | 持续故障／完整查询恢复；恢复不等于预约成功 |
-| `reservation_step_failure` / `reservation_step_recovered` | 验证码或提交请求连续五分钟失败／恢复；达到阈值即排队并去重，恢复不发信 |
-| `notification_finished` / `notification_pending_on_exit` | 邮件发送尝试结束／退出五秒后队列仍未清空；旧日志中的 notification_deferred、notification_skipped_recovered 已不再产生 |
-| `connect_timeout` | 连接阶段超时、请求未发出；程序恢复扫描并重试，不进入待确认 |
-| `server_backoff` / `service_unavailable` | 429 或带等待值的过载响应按 `Retry-After` 等待，无可用值时按 1、2、4、5 秒短退避；502/503/504 按短退避恢复，持续失败仍以 5 秒为上限，不改用长退避；均为防御性处理，见上文更正 |
-| `pending_confirmed` / `pending_released_by_operator` / `pending_resolution_cancelled` / `pending_not_found` / `pending_check_failed` / `pending_not_in_history` | `--resolve-pending` 的人工核对结果；任务不在待确认、记录矛盾或查询失败时保留原状态并返回核对失败；取消不改变任务 |
-| `reservation_succeeded` / `goal_completed` | 已按 ID 确认一场／实际选听目标达标 |
-| `task_failed` / `unexpected_failure` | 可捕获异常退出，检查本地错误和服务日志后恢复 |
-| `mail_configuration_invalid` / `notification_failed` | 核对邮件字段或下表错误分类，业务结果不受发信失败影响 |
+| 管理台打不开 | 本机用 `127.0.0.1`，服务器用实际 IP；检查服务、端口及管理员配置 |
+| 配置项不认识：`unknown_configuration_key` | 对照样例移除废弃键；不要执行 `.env` 文件 |
+| 账号已在运行：`state_in_use` | 回到原网页或终端停止该账号，勿删锁文件 |
+| 保存冲突：`configuration_conflict` | 有人先保存了配置，重新加载后再编辑 |
+| 学校拒绝登录：`authentication_rejected` | 核对学校密码和账号状态，再手动启动 |
+| 需要短信 | 在对应账号卡片或原 CLI 处理；其他账号继续运行 |
+| 查询／取图超时 | 保留原任务，查看私有诊断里的失败阶段和耗时，避免同时重复登录或额外查询 |
+| 开抢阶段或预取时刻明显偏早、偏晚 | 检查实际运行预约任务的机器是否已同步系统时钟，再核对学校公布的开放时间 |
+| 预约清单或进度较旧 | 我的活动列表只在事件发生时同步；学校网页手动变更后，可停止再启动账号 |
+| 没有邮件 | 检查该账号收信邮箱、公共 SMTP 配置和发送结果，再检查收件箱 |
+| 状态损坏或账号不符 | 先备份和核对原文件，保留待确认保护，勿直接删除重建 |
+| `last_error` 还有旧错误 | 同时看 `last_error_active`、最近成功查询时间和进程状态；保留的旧错误不等于当前仍有故障 |
 
-只读检查会输出 `stage` 和安全原因。网络原因包括 `tls_failure`、`proxy_failure`、`network_timeout`、`connect_timeout`、`connection_failure`、`network_failure`、`http_failure`、`server_backoff` 和 `service_unavailable`；HTTP 错误附状态码。`connect_timeout` 表示连接未建立、请求未发出，可安全重试；DNS 解析超时同样保证请求未发出，查询可重试，提交按 `connection_failure` 进入待确认核对；`network_timeout` 表示已发送但结果未知或读取超时，提交按待确认处理。`server_backoff` 表示 429 或服务端要求等待，按 `Retry-After` 等待（无可用值按短退避）；`service_unavailable` 表示 502/503/504 响应，按临时服务故障短退避恢复；二者均为防御性处理，不代表学校会限流。TLS 诊断只显示白名单域名、固定 `tls_reason` 及可确定时的 `proxy_used`，不打印异常原文或代理地址。证书失败不能通过关闭校验解决。
+校园直连失败时可按程序规则回退网关，无需修改系统 DNS、路由或 TUN。备用网关 IP 只用于首次认证的有限回退。
 
-邮件失败分类为 `dns_failed`、`tls_failed`、`timeout`、`authentication_failed`、`sender_refused`、`recipient_refused`、`message_rejected`、`connection_failed`、`smtp_failed`、`network_failed` 或 `unknown`。分别检查网络、授权码、服务器和发件／收件设置；不自动重发，SMTP 接受后仍需确认收件箱。
+## 状态与日志
 
-### 校园网直连登录
+单账号 CLI 的状态在 `SEU_STATE_DIR`；网页账号在 `<数据根>/accounts/<id>/`。用 `--status` 查看运行阶段、最近查询时间和本地预约状态；学校结果仍以学校记录为准。
 
-校园网访问讲座入口直接进入统一身份认证，且 CAS 服务目标为 `ehall.seu.edu.cn` 时，程序优先完成校内登录；入口要求 VPN 时仍使用原网关认证。统一身份认证自身要求短信时继续按提示处理；2026-10-29 本机实测该路径仍需短信，短时间重复登录会被学校拒绝发送短信。短信发送失败或发送请求本身遇到网络／429 错误时会提示稍后重试，冷却取 max(60 秒, `Retry-After`) 并跨校园→网关回退的二次登录保持，期间重复输入 `send` 不会再次请求学校；校园直连缺少 CAS 服务信息，或登录后进入应用阶段遇到网络／HTTP／TLS 失败（含非应用页面）时，会自动回退一次原网关认证，凭据错误与人工挑战不回退。
+| 文件 | 用途 |
+| --- | --- |
+| `task.json` | 保存任务、待确认、时间占位、筛选和最近展示结果 |
+| `task.lock` / `manager.lock` | 防止同一状态或管理服务被重复运行；文件存在不一定代表锁正在被占用 |
+| `events.log` / `runner.log` | 事件和进程输出，不应含凭据或个人活动详情 |
+| `diagnostics.jsonl` | 私有诊断，含请求阶段、耗时和预约排查信息，不公开或发送邮件 |
+| `device-fingerprint` / `trust-cookies.json` | 设备信任材料；Cookie 等效登录凭据 |
 
-程序不修改 Clash/TUN、系统 DNS 或路由。由用户自行关闭 Clash 或配置学校流量直连，再运行 `uv run --locked main.py --check` 验证实际网络路径；此命令不提交预约或发邮件。未开启 `SEU_TRUST_DEVICE` 时，检查进程与其他进程的登录会话互不传递；开启后可由本地 Cookie 文件尝试静默登录。由于每次登录可能需要短信且短时间重复登录会被拒绝，正式运行应提前在最终进程中完成认证并保持运行到开抢结束。
+诊断文件在启动时若超过 8 MiB，会改名保留；运行中不轮转，长期运行要关注磁盘空间。`--check` 不创建任务或诊断日志。
 
-可选：记住此设备（`SEU_TRUST_DEVICE`，程序缺省关闭；`.env.example` 样例开启）。学校在统一身份认证后要求短信二次验证；浏览器页面的等价选项是“记住此设备，下次免二次验证”。2026-10-30 首次实测显示：只在 CAS 登录请求中发送 `rememberTrustDevice: true` 与稳定 `fingerPrint` 并不能免短信，紧接着在新进程运行的 `--check` 仍要求短信——浏览器流程还依赖学校签发并在浏览器中持久保存的 CAS Cookie（`TGT`、`JSESSIONID`，用于 `verifyTgt`／`casLoginByCookie` 静默登录）。本机保存的 Cookie 中观察到学校签发的 `TRUST_DEVICE`（单样本有效期约 30 天）以及 `TGT`／`JSESSIONID`，有效期以学校实际为准。当前实现因此分两步：① 登录时发送上述信任字段，并把随机生成的 `stable_<32 位十六进制>` 指纹保存在状态目录 `device-fingerprint`；② 登录成功后在状态目录原子写入 `trust-cookies.json`（只保存域名以 `seu.edu.cn` 结尾的 Cookie 的 name／value／domain／path／secure／expires）。之后每次登录前先装入这些 Cookie，校园直连路径还会显式调用 `verifyTgt` 并校验最终是应用页，只有校验通过才完成静默登录，否则静默回退密码＋短信。2026-10-30 本机同账号单样本已验证：首次 `--check` 照常短信完成并生成该文件，约 60 秒后新进程第二次 `--check` 未要求短信并输出 `event=read_only_complete`；仅此一例，不代表其他机器、账号或时间可用。两类文件仅在本地使用，内容不打印、不写入事件日志或诊断、不进入邮件或仓库；诊断只记录加载／保存数量与静默登录成败（`trust_cookies_*`、`trust_silent_login_*`，见诊断表），不记录 Cookie 值或票据；删除指纹会按新设备重新生成，删除 Cookie 文件只会结束静默登录，下次正常登录可重新保存。Cookie 文件等效登录凭据：不要提交或分享，也不要在共享或公用电脑开启（否则该机可能仅凭该文件或账号密码绕过短信）。该选项不延长登录会话有效期（本机 2026-10-29 实测约 1 小时 54 分）；若学校仍要求短信，说明静默登录未被接受，保持默认关闭即可。`--check` 开启时同样会读取或写入这两个文件，但仍不创建任务、不写诊断、不预约。
+本机留存的实战证据按日期归入 `state/evidence/YYYY-MM-DD/`，不会被程序当作任务加载。清理临时脚本、源码副本和测试输出时，保留账号目录、数据库、检查点、锁与信任材料。
 
-### 网关回退
+需要分析一场开抢时，依次找：
 
-`.env.example` 提供 `SEU_VPN_IP=121.249.14.2`，程序内部没有默认 IP，空值或缺省关闭。该地址来自历史排查，可能失效，须按可信 DNS 核对更新；仅接受 IPv4／IPv6 字面地址，不接受域名、URL 或端口。
+| 你要确认什么 | 诊断记录 |
+| --- | --- |
+| 快抢期是否通知我的活动线程预热 | `prewarm_history_requested` 表示通知已发出，实际查询是否完成看我的活动线程记录 |
+| 提交会话是否预热 | `main_session_warmed` 表示快抢期开始的一次列表读取成功并留下可复用连接，`main_session_warm_failed` 记录失败原因；之后预取的 `captcha_prefetched.connect_seconds` 为 null 表示没有新建连接 |
+| 验证码是否准备好 | `captcha_prefetch_started` 是任务启动，`captcha_prefetched` 是取图识别后结果被采纳，`captcha_error` 是现场取图失败。列表或我的活动的失败看 `request_failed` 中的查询来源 |
+| 什么时候提交、学校怎样回复 | `submission_started`、`submission_reply`、`submission_error` |
+| 是否按活动 ID 确认成功 | `reservation_confirmed`、`reservation_checked` |
+| 请求失败在哪一步 | `request_failed` 的 `reader`、`endpoint`、`stage`、`duration_seconds` 及各阶段耗时 |
 
-始终先正常 DNS；仅首次登录访问 `vpn.seu.edu.cn` 遇解析失败、连接关闭／重置或可识别的 TLS 意外断开时，切换备用 IP 并重走认证一次。普通超时、连接拒绝、证书失败、凭据错误、代理或 HTTP 错误、其他域名故障不触发。切换后本进程继续使用备用 IP，下次启动重新尝试 DNS，首次登录完成后不再切换。
-
-回退只替换网关连接地址，URL、Host、TLS SNI、域名证书及 Cookie 仍使用原域名；不改变系统 DNS、TUN 或代理，不直接重放业务请求。它不能保证绕过所有代理干预，真实故障恢复仍待验收。
+诊断中的 `suppressed` 表示合并的重复次数；安全事件的行数不是学校请求次数。
 
 ## 当前业务数据契约与限制
 
-真实学校列表使用 `JZMC`、`JZXL_DISPLAY`、`JZDD`、`JZSJ`／`HDJSSJ`、`FBZT`、`YYKSSJ`／`YYJSSJ`。活动 ID 使用非空 `HD_WID` 或 `WID`，我的预约优先使用 `HD_WID`，不能拿预约记录自身 ID 替代。
-
-`FBZT='1'` 且处于预约起止时刻之间才进入可用性判断，时间边界包含；`FBZT='-1'` 或已有 `YY_WID` 时排除。已约人数（`hdrsList` 的 `YYRS`）和总人数（`HDZRS`）都可解析且前者不小于后者时判满；缺少人数不是已有名额的证明，最终以提交和核对为准。开放与结束按学校返回的服务器时间 `xtdqsj` 判定。线上线下只接受标题开头的 `【线上】`／`【线下】`，不猜测 `SFKSYY`。学校前端会合并人数和预约信息，本项目同样按 `HD_WID` 合并，并保留独立“我的活动”防重与冲突检查；资格和实时名额不依赖单独预检，以提交响应及最终确认裁定。
-
-兼容构造响应的 `HDMC`、`HDLX_DISPLAY`、布尔 `IS_ONLINE`、`YYZT`，时间兼容 `KSSJ`／`JSSJ`、`HDKSSJ`／`HDJSSJ`。时间格式为 `YYYY-MM-DD HH:MM:SS`、`YYYY-MM-DD HH:MM` 或 `YYYY/MM/DD/HH:MM:SS`，按 Asia/Shanghai 解释，主机应准确校时。
-
-有效预约 `YYZT` 可为 `已预约`、`预约成功`、`取消预约`；非有效为 `已取消`、`取消成功`、`未预约`。真实我的活动可用 `HD_WID` 与 `FBZT` 识别，已打卡仍有预约身份；统计打卡与违约规则见[接口调查](completion-records.md)。
-
-列表接受完整数组，拒绝分页对象或已提供总数不符的响应。空列表不能证明字段兼容，未开放列表不能证明开放后的预约成功；全历史完整性和新格式仍需单独验证。
-
-学校时间暂时缺失时沿用已知时钟偏差，不为校时增加提交前查询；重启后尚未校准时，已有冷却继续生效，取得有效学校时间后才判断是否到期。
+学校接口和字段说明集中在[接口与数据校验](thread-query-strategy.md#学校接口与数据校验)。预约成功样本见 [10 月 29 日](acceptance/2026-10-29-live-run.md)、[11 月 1 日](acceptance/2026-11-01-live-run.md)，设备信任样本见 [10 月 30 日](acceptance/2026-10-30-device-trust.md)。这些样本不能保证其他账号、网络或未来开抢也成功；当前限制见[验证状态](acceptance/2026-11-05-prep-history-goal.md)。
 
 ## 开发检查
+
+使用 Python 3.12、uv 和锁文件：
 
 ```bash
 uv sync --locked
 uv run --locked mypy seu_reserve
 uv run --locked pytest
-uv run --locked main.py --help
 ```
 
-Python 3.12、uv 和锁文件是开发入口；OCR 使用 ddddocr 自带模型，首次安装包含 ONNX 依赖。`tzdata` 为无系统 IANA 数据的平台提供北京时间，更新锁文件后先同步环境。
-
-离线测试用构造学校响应、临时配置／状态、替代时间／输入／邮件，不读取真实 `.env` 或访问学校。Windows 使用 `msvcrt` 文件锁，Linux 使用 `fcntl`，保留原子替换及持久化写入；Windows 不执行 Unix 目录 `fsync`。
-
-## 验收记录
-
-当前统一线程架构：完整离线 **771 通过、3 跳过**，mypy 12 个源文件通过；2026-11-04 项目检查按审查发现完成待确认证据时间基准、真实读者唤醒测试、在途读者交接测试、读者失联诊断、邮件入队时间冻结、重复失败诊断节流与冷启动诊断语义等小修，并以当前源码完成真实学校只读复测（真实认证、列表/历史、验证码、30 秒引擎与正常停止通过，未提交预约），见[统一线程验收](acceptance/2026-11-03-unified-workers.md)与[检查小修记录](acceptance/2026-11-04-audit-minor-fixes.md)。
-
-此前 2026-11-03 19:00 旧版实战后完成查询恢复修复：完整离线 **765 通过、3 跳过**，mypy 12 个源文件通过；服务器临时加载新模块的真实只读查询 **12/12 成功**，生产服务未替换或重启。新版本尚未验收真实开抢，见[本轮记录](acceptance/2026-11-03-opening-recovery.md)。
-
-截至 2026-10-30，最近一次完整离线测试记录为 **629 项通过、5 项平台限制跳过**（HTTP 简化前的版本），mypy 通过；HTTP 简化及后续审查修复后全量测试为 **645 通过、3 跳过**；管理员登录与单页改版（含直接配置管理员密码补充）本轮全量测试为 **667 通过、3 跳过**；改版实施后的只读审查修复新增 25 条回归，全量测试为 **692 通过、3 跳过**；设备信任逐次诊断补充 3 条回归后全量测试为 **695 通过、3 跳过**；已结束记录考勤未决不阻塞预约的重设计新增/改写 10 条回归后全量测试为 **705 通过、3 跳过**；2026-10-31 审查修复（运行中保存、请求体上限、并发登录限速）新增 3 条回归后全量测试为 **708 通过、3 跳过**；复核补丁（写入持锁、CLI 重读配置）新增 3 条回归后全量测试为 **711 通过、3 跳过**；锁、告警与待确认口径修复新增 8 条回归后全量测试为 **719 通过、3 跳过**；2026-11-01 服务器真实开抢未改代码，离线全量仍为 **719 通过、3 跳过**，单账号线上讲座预约成功；同日开抢期快速路径与诊断补充（含两轴审查后的第四轮复核修复）全量测试为 **730 通过、3 跳过**；2026-11-03 启动清理竞态修复与 DNS 有界解析后全量测试为 **737 通过、3 跳过**；同日对复核发现的待确认快速路径请求放大、预热查询预算被同步兜底上限压缩、DNS 解析槽位泄漏与后台线程日志并发写入问题完成修复，新增 3 条回归后全量测试为 **740 通过、3 跳过**，见[服务器实战记录](acceptance/2026-11-01-live-run.md)、[开抢快速路径验收](acceptance/2026-11-01-opening-fast-path.md)、[启动清理与 DNS 有界解析记录](acceptance/2026-11-03-startup-cleanup-and-bounded-dns.md)、[本轮复核修复记录](acceptance/2026-11-03-review-fixes.md)与[二次复核修复记录](acceptance/2026-11-03-recheck-fixes.md)；同日第二轮检查新增 5 条回归，全量测试为 **745 通过、3 跳过**，结果见验收表首行。下表按验证发生时间保留历史；旧行中的频率、测试数及“未推送、未部署”均描述当时状态，当前行为以本文正文为准，提交状态以 Git 为准。
-
-2026-10-29 的[只读对照测试](acceptance/2026-10-29-read-only-probe.md)共 592 次活动列表查询成功，未观察到 429/限流或明显变慢，并完成原网关路径的一次人工短信登录。同日 17:00 的校园直连复测完成新版校内 CAS 真实登录（仍需短信），并以 0.10 秒列表 + 5 秒历史双只读会话并发 30 秒（列表 276 次、历史 6 次全部成功，无 429）；两次登录间隔约 90 秒时短信发送被拒。同日 19:00 的线上目标讲座已按活动 ID 预约成功，详见[本机实战日志](acceptance/2026-10-29-live-run.md)；多次开抢的真实命中率统计、长期稳定性和运行中短信恢复仍待验收。
-
-| 项目 | 当前证据及边界 |
-| --- | --- |
-| 2026-11-04 项目检查小修 | 按项目检查完成 6 项小修：待确认正向证据改用提交检查点保存完成后的时间（`pending_saved_at`）；新增真实 `ActivityPoller` 完成/失败回调与生产唤醒路径回归；清理真空断言与死 fixture，新增在途读者不被替代回归；新增 `reader_stalled` 本地诊断（60 秒无可靠快照，每读者每次失联一行）并区分冷启动；邮件正文时间在入队时冻结；同键 `request_failed` 每 5 秒节流并记录 `suppressed`。离线 **771 通过、3 跳过**，mypy 12 个源文件通过；2026-11-04 三次真实学校只读复测通过（认证、列表/历史、验证码、30 秒引擎、2 秒读者采样、正常停止；约 52–54 次/次请求全部 200/302，原账号文件未变），未提交预约、未部署，见[检查小修记录](acceptance/2026-11-04-audit-minor-fixes.md) |
-| 2026-11-03 减少无效查询 | 最高频窗口改为前 5 秒至后 9 秒；按活动 ID 结束无价值追踪，普通历史最多缓存 30 秒、候选出现时重新核对。完整 754 通过、3 跳过，mypy 通过；真实只读两档 38/38、5/5 成功，隔离普通引擎约 25 秒历史查询 1 次；未部署、未验收真实开抢，见[本轮记录](acceptance/2026-11-03-query-reduction.md) |
-| 2026-11-03 首轮随机调度（历史参数） | 普通期每轮后等待 4–6 秒；开放前 30 秒至后 30 秒，列表目标开始间隔随机 0.05–0.10 秒；后 30 秒至 5 分钟随机 0.5–1.5 秒，之后恢复普通查询。后台列表逐次抽样并扣除请求耗时，较慢阶段快照上界 2 秒。完整离线 748 通过、3 跳过，mypy 通过；真实学校只读两档采样 36/36、7/7 成功，隔离普通引擎约 25 秒正常停止；未提交预约、未部署、未验证真实开抢命中率，见[本轮验收](acceptance/2026-11-03-random-polling.md) |
-| 2026-11-03 二次复核修复 | 第二轮检查修复：开抢快速路径待确认探测到 429 时先等待再查历史（离线构造 429 后历史请求 0 次、按 `Retry-After` 等待）；`reservation_unconfirmed` 改为按待确认段持久化去重（新段记录一次、重启同段不重复）；认证被拒兜底去重覆盖“重启且告警已持久化”场景；DNS 解析线程构造失败归还槽位；有界连接补 `http.client.connect` 审计事件；更正 2026-11-01 实战计数口径、`--check` 标题输出与 DNS 硬中断的文档矛盾。新增 5 条回归并加强动态共享等待与预热预算断言；全量 **745 通过、3 跳过**，mypy 12 个源文件通过；修复后真实学校服务器只读复测（`--check` 0.28 秒、活动列表 141/141、我的活动 3/3）通过，未提交或取消预约，详见[二次复核修复记录](acceptance/2026-11-03-recheck-fixes.md) |
-| 2026-11-03 复核修复（本轮） | 按项目检查发现完成 6 项修复：开抢快速路径待确认核对先探测活动列表再查历史，无新鲜快照时不再每 0.1 秒发一次历史请求（离线构造从约 8 次/4.2 秒降至 ≤3，并每段待确认只记录一次 `reservation_unconfirmed`）；预热查询改用自身 1.5 秒预算，不再被开抢同步兜底 0.5 秒上限压缩；DNS 解析线程启动失败时归还槽位；诊断/事件本地追加加锁，避免后台 poller 对齐行与主循环交错；认证被拒兜底不再重复写事件；同步修正 requirements／usage／验收记录中的冷却 5 秒、告警清单、预热预算、提前量口径、70/82 秒、DNS 重试语义、表格断行等文档偏差。新增 3 条回归（待确认请求节流与事件去重、预热预算、DNS 槽位），更新 2 条断言；全量 **740 通过、3 跳过**，mypy 12 个源文件通过；同日真实学校服务器只读复测（`--check --account`、活动列表／我的活动／验证码，15 秒双只读会话）通过，未提交或取消预约，详见[本轮记录](acceptance/2026-11-03-review-fixes.md) |
-| 2026-11-03 启动清理竞态与 DNS 有界解析 | `Task` 在锁内记录 `created_checkpoint`，启动失败清理只删本进程创建的 `task.json` 且仍持锁执行，不再解锁后递归删除目录（覆盖加锁前、解锁后两种交错，其中加锁前交错可加载到其他实例的 `pending`）；DNS 解析纳入连接层请求预算：后台线程解析、限时等待、超时按临时解析失败、成功结果由解析线程写入 60 秒缓存（本次超时也写入、下次可复用）、连接失败丢弃缓存、并行解析上限 8，预算口径修正为 0.5/0.5/8 秒。新增 7 条回归（2 条启动清理 + 5 条 DNS）、更新 3 条断言；全量 **737 通过、3 跳过**，mypy 12 个源文件通过，详见[本轮记录](acceptance/2026-11-03-startup-cleanup-and-bounded-dns.md) |
-| 2026-11-01 开抢期快速路径与诊断 | 开抢窗口内主循环不再等待在途后台请求，快照不可用时保持 0.1 秒节奏；后台线程普通失败约 0.1 秒重建（`Retry-After` 优先），连续 3 轮无快照后才允许一次 0.5 秒同步兜底；后台读取预算 0.5 秒；开抢期历史缓存不可用时跨轮重试，连续 3 轮后才允许一次 0.5 秒同步历史兜底。新增 `opening_snapshot_missing`／`opening_sync_fallback`／`opening_history_missing`／`opening_history_sync_fallback`／`poller_aligned`／`attendance_category_unknown.wid` 诊断、`submission_started` 名额字段与 `last_error_active`；`background_reader_stopped` 5 秒节流；并修复线程缺失绕过三轮计数、`last_error_active` 误判、停止时误记对齐，以及开抢期历史等待阻塞、历史线程缺失绕过三轮保护、`FBZT='-1'` 记录仍占时间冲突、时间占位主机／学校时钟混用、认证被拒时 CLI 不告警，以及认证告警持久化键导致重启 `state_invalid` 的回归；两轴审查后的第四轮复核修复把重建间隔对齐为 0.1 秒、移除不可达的旧等待分支、缺失诊断按失联期去重、历史三轮保护覆盖运行中不可用的线程、待确认无快照不再伪造网络错误、占位紧缩在待确认期间也执行，并统一 `last_error_active` 回退与临时超时覆盖助手。全量 **730 通过、3 跳过**，mypy 12 个源文件通过，详见[本轮验收](acceptance/2026-11-01-opening-fast-path.md) |
-| 2026-11-01 服务器真实开抢 | Ubuntu 24.04 + systemd 单账号；19:00 线上心理健康类讲座在开抢时刻后 0.319 秒提交、0.811 秒回复成功、1.124 秒按活动 ID 确认；窗口内无 429/5xx、无待确认/重复提交，开抢后约 82 秒网络超时与后台只读线程回收已自动恢复；窗口后维护者重启服务并停止账号。单账号单场样本，不证明多账号、长期运行与命中率分布；部署侧管理台公网可达属已知风险。详见[本轮记录](acceptance/2026-11-01-live-run.md) |
-| 2026-10-31 锁、告警与待确认口径修复 | 告警邮件发送移出账号操作门（SMTP 慢或不可达不再阻塞停止/保存/删除/关停）；单个账号状态目录异常只使该账号显示 `invalid`，不再让账号列表整体 409；保存遇 CLI 抢锁时回落 `desired`/`error`，避免“想运行但无进程”；停止意图在检查点锁内写入；连接超时不再消耗原活动重试次数；`FBZT='-1'` 的“我的活动”记录不再作为待确认成功证据（与进度统计一致）；删除账号清理 per-account 记录。新增 8 条回归；全量 **719 通过、3 跳过**，mypy 12 个源文件通过，详见[本轮验收](acceptance/2026-10-31-lock-and-pending-fixes.md) |
-| 2026-10-31 审查修复复核 | 配置保存在持有账号检查点锁的临界区内写入，外部 CLI 无法在检查与写入之间插入；`--account` 取得锁后重读账号配置；保存后重启被 CLI 阻塞时返回已保存结果。新增 3 条回归（持锁写入、取锁交错、CLI 重读）；全量 **711 通过、3 跳过**，mypy 12 个源文件通过，详见[本轮验收](acceptance/2026-10-31-review-fixes.md#4-复核补丁写入配置持锁与-cli-重读) |
-| 2026-10-31 审查修复 | 运行中 Web 账号保存不再被自己的检查点锁误判为外部 CLI（真实子进程回归）；`Content-Length: 1`＋分块传输的超大正文按实际接收字节拒绝（413）；登录失败预算改为原子预留名额，12 条并发同源错误密码只有 5 次进入校验。新增 3 条回归；全量 **708 通过、3 跳过**，mypy 12 个源文件通过，详见[本轮验收](acceptance/2026-10-31-review-fixes.md) |
-| 2026-10-31 考勤未决不阻塞 | 已结束但学校尚无读考勤结果的记录（`SFDK` 为 0/空/未知；空 `SFWY` 视为未违约）不再报错或阻塞：不计已选听、不计待参加，学校回填后自动计入；未结束记录的缺失/非法考勤字段按待参加；结构错误仍暂停。以 2026-10-30 本机只读记录（3 条已结束，2 条未打卡）为依据，新增/改写 10 条回归；全量 **705 通过、3 跳过**，mypy 12 个源文件通过，详见[本轮验收](acceptance/2026-10-31-attendance-nonblocking.md) |
-| 2026-10-30 设备信任逐次诊断 | 管理台账号实测首次登录仍需一次短信（新状态目录、新设备指纹），随后同会话内 4 次重启均静默登录成功。补本地诊断 `trust_cookies_loaded`／`unavailable`、`trust_cookies_saved`／`save_failed`、`trust_silent_login_succeeded`／`failed`（只记数量与成败，不记 Cookie 值），并补 3 条离线回归；全量 **695 通过、3 跳过**，mypy 12 个源文件通过。跨学校会话过期（约 2 小时）是否免短信仍未验证 |
-| 2026-10-30 改版后审查修复 | 外部 CLI `--account` 持锁运行时管理台的启动/保存/停止/删除返回 `state_in_use` 且不进入重启预算与告警；登录限速只计失败、成功清除来源记录、429 带 `Retry-After`；启动只派生一次管理员密码哈希；`revision` 迁移容忍并发启动；OCR 失败清理新建检查点；补 25 条回归（含快照陈旧、页面不触发学校请求、重启清会话、隐藏策略、输入校验、静态资源）。完整离线 **692 通过、3 跳过**，mypy 12 个源文件通过，详见[改版验收·后续审查修复](acceptance/2026-10-30-console-redesign.md#后续审查修复2026-10-30) |
-| 2026-10-30 管理员登录与单页改版 | 配置的多管理员（支持直接密码与已有哈希）、12 小时会话、配置版本冲突、统一隐藏选项、精简预约快照及纯图案 Logo；完整离线 **667 通过、3 跳过**，mypy 12 个源文件通过，桌面与手机界面检查见[改版验收](acceptance/2026-10-30-console-redesign.md) |
-| 2026-10-30 审查修复 | 删除账号先取锁再检查文件、全程持有状态目录锁，避免无 `task.json` 的首次启动及并发 CLI 写入被清理；CLI 正常启动在加载 OCR 前持锁复查账号并复用检查点，删除与启动准备互斥；`--check` 与 `--resolve-pending` 不再因共用 SMTP 配置无效而退出。完整离线 **645 通过、3 跳过**，详见[本轮记录](acceptance/2026-10-30-http-console.md#后续审查修复) |
-| 2026-10-30 HTTP 简化 | 管理台改为明文 HTTP、移除管理员登录/文件权限限制/旧账号迁移；身份锁移除、保留 task.lock 与 manager.lock；修复上一轮审计问题与文档不一致；完整离线 **637 通过、3 跳过**，mypy 11 个源文件通过，详细结果见[本轮记录](acceptance/2026-10-30-http-console.md) |
-| 2026-10-30 Web 与多账号 | FastAPI／Uvicorn 直接 HTTPS、账号增删配置、独立工作进程、网页短信、重启恢复、受保护删除及显式迁移已实现（当轮版本，已被本轮 HTTP 简化取代）；完整离线 629 通过、5 跳过，mypy、锁文件、依赖与打包检查通过；十进程隔离及第十一个启动、桌面与手机浏览器、本机 TLS 往返和 OCR 基础资源测量完成。真实学校多账号、Linux 部署与长期运行未验证，见[HTTPS 版本记录](acceptance/2026-10-30-web-offline.md) |
-| 2026-10-30 同账号并发登录 | 同一账号、同一 PC 与网络出口、两个独立进程（独立临时状态目录、各自密码＋短信登录、关闭设备信任）并存约 4 分 22 秒：A 认证后持续只读查询，B 约 27 秒后独立登录成功；B 登录后 A 的查询全部正常，合计约 50 次只读请求无认证失败／查询错误，未观察到会话互踢或后登录被拒。A 因校园直连进入应用失败回退网关，额外消耗一次短信（附带观察）。边界：单账号单机、非开抢、约 4 分钟、只读、未提交预约；不证明开抢期、多机、长期或提交链路行为。详见[并发登录验证记录](acceptance/2026-10-30-concurrent-login.md) |
-| 2026-10-19 本轮改造 | 完整离线测试 331 项通过、3 项因 Windows 平台限制跳过（两项 Unix 信号、一项打开文件替换）；mypy、锁文件及依赖检查通过。全部 11 份 Markdown、49 个本地链接及锚点、28 段 shell 语法、双语命令与启动顺序、隔离样例配置检查通过 |
-| 2026-10-25 真实预约链路 | 用 HTTP 版对购票公告（非目标、测试活动）真实提交成功（`addReservation.do` 返回 `code=0`，按 `HD_WID` 在“我的活动”确认），验证码 OCR 单次识别成功；随后 `deleteReservation.do` 取消并在“我的活动”复核消失。本机与服务器均完成该验证；另实测连续 5 次/秒、10 次/秒的活动列表只读查询未触发 429。目标系列讲座的真实预约与命中率仍待验证 |
-| 2026-10-25 第二批改造 | 诊断文件、A 版重大告警策略（无日报/无冷却）、健康快照、沙龙计入目标（旧口径，2026-10-28 起不计数）及测试/购票公告排除完成；离线测试 353 项通过、3 项平台限制跳过，mypy 通过；已提交（`89e9558`），并于当日 22:34 在服务器启动系统级后台服务 |
-| 2026-10-26 服务器运行观察 | 后台服务自 2026-10-25 22:34 起连续运行约 16 小时 37 分（截至 15:11）：`--status` 为 scanning／waiting，最近查询无错误、失败计数 0、候选 0（6 条记录中 5 场未开放、1 场测试公告），journal 无错误；不足二十四小时，长期运行、重启恢复与目标讲座真实预约仍待验收 |
-| 2026-10-26 复查修复 | 待确认不再因查不到而自动释放或重试，保持 pending 并只核对原场；新增 `--resolve-pending` 人工核对与显式确认恢复；冷却清理延后到学校时钟校准完成后，重启不再误删有效冷却；429 按 `Retry-After` 等待，502/503/504 改走 1/2/4/5 秒短退避；活动列表失败保留有效历史缓存；验证码冷却统一使用学校校准时间；离线测试 369 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署（待确认规则已由 2026-10-26 无人值守修正取代） |
-| 2026-10-26 开抢前修复 | 连接阶段超时不再进入 pending，可按“请求未发送”安全恢复；开抢窗口沿用开抢前 60 秒内的历史缓存，避免开放瞬间同步刷新阻塞；移除提交前额外列表复核；离线测试 374 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
-| 2026-10-26 预约后修复 | 新预约尚未结束且缺少 `SFDK`/`SFWY` 时按“未参加、未违约”计入待参加，不再误报 `attendance_status_unknown` 阻塞后续；已结束记录仍缺字段时才暂停；离线测试 377 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
-| 2026-10-26 开抢延迟与邮件修复 | 历史缓存有效期改为 60 秒，避免开放瞬间同步刷新“我的活动”；预约成功邮件改为后台线程发送，不阻塞扫描；离线测试 378 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
-| 2026-10-26 本机真实预约 | 19:00 艺术讲座线下预约成功并按活动 ID 确认，线上版本首发已满；完整时间线、脱敏诊断与修复记录见[本机实战日志](acceptance/2026-10-26-live-run.md) |
-| 2026-10-26 请求总时限 | HTTP 响应体读取按单请求总预算限制，慢速持续返回数据不再无限拖住同步扫描；当时用逐字节读取，且未限制单次阻塞读取的时长；离线测试 379 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
-| 2026-10-26 响应读取修正 | 429/502/503/504 改为在读取响应体前按状态码与响应头判定，慢速或损坏的错误响应不再把它们变成 `network_timeout` 并丢掉 `Retry-After`；响应体改用 64 KiB 分块 `read1`（按 Requests 同款解码压缩响应），单次阻塞读取以剩余总预算作为 socket 超时；body 读取超时映射为 `network_timeout`，其他读取失败映射为 `connection_failure`；当时 gzip 解码和 chunked 分帧的内部连续读取仍可越过预算，见下一行；离线测试 388 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
-| 2026-10-26 响应读取修正二 | 响应体读取期间底层 socket 的每次 recv 改为经 `select` 等待剩余预算，gzip 解码、chunked 分帧等一次性 `read1` 内部的多轮读取同样受总预算约束；预算耗尽仍按 `network_timeout` 中断并恢复 socket 状态；用真实本地服务验证慢 gzip、慢 chunked 分块头（含 TLS 路径）和正常快响应的连接复用；离线测试 392 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
-| 2026-10-26 无人值守修正 | 保留已知未结束的开抢窗口，合法空列表不再让轮询退回 10 秒；429 等待前不再发历史探测；新增验证码／提交连续五分钟失败的 `reservation_step_failure` 告警（开抢窗口内延后、去重、恢复清除）；待确认连续 3 次有效查询缺席后自动解除并继续扫描，`--resolve-pending` 保留为人工兜底；响应首部与响应体共用请求总预算，慢首部按 `network_timeout` 中断；离线测试 400 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署（待确认策略已由下一行取代） |
-| 2026-10-26 复查修正三 | 待确认核对后保留原活动时间占位恢复扫描，冲突候选跳过、原活动最多重试 2 次、明确成功证据立即确认、占位 600 秒或原活动开始前到期；补齐 `reservation_step_failure` 邮件定义并验证告警后重启；默认会话代理连接池也使用 deadline 连接类，代理慢首部受总预算约束；离线测试 412 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
-| 2026-10-27 复查修正四 | 待确认占位改为按活动 ID 独立维护，多笔超时各有占位；确认一笔只清理该笔，已确认未进历史时保留冲突保护；成功证据先进入本地冲突集合并重算候选、停止旧候选循环（活动列表与提交回复两条路径）；pending 核对同时使用“我的活动”和活动列表；select 后按剩余预算收紧 socket 超时、连接/TLS 使用剩余时间并事后校验；DNS/CPU 解析仍为已知边界；离线测试 420 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
-| 2026-10-27 复查修正五 | pending 双来源核对遇构造的 429／服务端等待响应时立即等待、不请求另一来源、不增加核对次数；成功回复的 pending 清除与 confirmed hold 合并为一次原子保存；confirmed hold 按活动 ID 计入本地计划进度；`--resolve-pending` 同时清理旧格式占位；离线测试 425 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署 |
-| 2026-10-27 恢复保护修正 | 创建占位后才清除 pending，覆盖 Ctrl+C 中断和缺少起止时间；人工恢复及迁移保留其他活动的新旧占位；旧确认记录用已有响应补类别，仍未知则暂停新增；空占位集合正确初始化。离线测试 437 项通过、3 项平台限制跳过，mypy 通过；普通开抢与 503/504/429 组合拥塞回放的请求及模拟时序与修复前一致；未推送、未部署 |
-| 2026-10-27 拥塞退避与 OCR 预热 | 移除 20–300 秒通用指数退避：可恢复异常、429 无可用 `Retry-After`、认证过期及提交错误统一改为 1/2/4/5 秒有界短退避；持久化退避区分服务端要求，重启时旧通用等待钳制到 5 秒；认证成功后预热 OCR 模型，`submission_started` 诊断记录取图与识别耗时。离线测试 441 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署，尚无真实开抢样本 |
-| 2026-10-27 开抢只读轮询 | 开抢窗口内新增后台只读活动列表轮询：独立会话复制已登录 cookies，目标 0.25 秒间隔，仅 GET 活动列表；主循环优先消费 0.75 秒内快照，过期回退同步查询；后台不提交、不写状态、不告警，出错停止并由主线程按现有短退避处理，至少冷却 5 秒后重启；仅开抢期运行。离线测试 446 项通过、3 项平台限制跳过，mypy 通过；未推送、未部署；真实开抢并发表现待验证 |
-| 2026-10-28 审计修复 | 后台只读轮询收到的 429／带等待值的过载响应现在同时约束主循环：等待或短退避期内主循环不再同步回退列表请求；普通后台失败仍回退同步查询。待确认核对在任一来源查询失败、记录矛盾或结构不可读时保持待确认，该次不计入连续 3 次有效缺席、不推进自动解除，恢复后重新累计；任一来源明确成功仍立即确认。补后台轮询构造 429、普通失败回退、失败核对不计数、失败后仍按 3 次有效核对解除的回归。离线测试 452 项通过、3 项平台限制跳过，mypy 通过；未在真实开抢/学校记录延迟场景验证 |
-| 2026-10-28 复查补修 | 验证码与提交前再次复查后台轮询的服务端等待，避免本轮刚启动后台轮询、随后收到 429／服务端等待响应时仍取图或提交；提交前检查点位于持久化待确认之前，中止后任务仍为 scanning。待确认核对因来源失败或结构不可读而中止时同步清零已保存的连续计数，恢复后从 0 重新累计（3 次连续有效核对才自动解除）。补“有候选时提交前复查等待”“中途失败重算计数”回归。离线测试 454 项通过、3 项平台限制跳过，mypy 通过；未在真实开抢中验证 |
-| 2026-10-28 复查补修二 | 统一“中止核对即重新累计”：两个来源遇到 429／带等待值的过载响应而中止时同样清零已保存的连续计数（仍按服务端要求等待）；“我的活动”行结构不可读（未知预约状态、缺少活动 ID）也走同一清零路径。补“中途 429”“中途历史不可读”两条回归，均验证需 3 次连续有效核对才自动解除。离线测试 456 项通过、3 项平台限制跳过，mypy 通过；未在真实开抢/学校记录延迟场景验证 |
-| 2026-10-28 沙龙口径修正 | 按用户提供并确认的新公告说明，沙龙不计入已选听或待参加目标，仍保留按配置预约；默认类别继续包含沙龙，历史及已确认占位排除计数，保留时间冲突保护。覆盖类别开关、两种引号、7 场正式讲座加沙龙不达标、旧完成任务恢复补约、已结束沙龙缺少打卡结论、旧占位及正式讲座目标覆盖后的暂停／结束。离线测试 473 项通过、3 项平台限制跳过，mypy 通过；未访问学校核实公告原文或进行真实预约 |
-| 2026-10-28 监控修复 | 19:00 真实开抢监控暴露两处问题：同一次确认重复写两条 `reservation_confirmed` 诊断（待确认分支与 `emit_success` 各记一次），现只保留 `emit_success` 一处；Windows 上备份、杀毒或本地读取状态文件的进程短暂占用 `task.json` 会使原子替换失败并连续输出 `health_write_failed`，现对 `PermissionError` 做 4 次、总计约 30ms 的有界重试，持续失败时每分钟最多提示一次。补状态写入重试/放弃、单条确认诊断、每分钟告警四项回归。离线测试 477 项通过、3 项平台限制跳过，mypy 通过；修复后尚未重新真实开抢验证 |
-| 2026-10-28 本机实战 | 19:00【线下】【前沿科技】讲座在候选出现约 1.3 秒后预约成功并按活动 ID 确认；开抢期 2481 次扫描、`poller` 占 99.6%，无 429／超时／OCR 失败／待确认滞留／重复提交。完整时间线、指标与问题处置见[本机实战日志](acceptance/2026-10-28-live-run.md) |
-| 2026-10-28 开抢提速 | 开抢等待期改为后台轮询完成事件唤醒（wait_update 本身即等待，超时后不再 sleep），并按已消费的轮询版本判断：只对更新的轮询完成生效，旧通知不空转，版本读取与清除之间完成的轮询也不丢失；快照与版本号在同一把锁内读取，不会出现旧数据配新版本；活动列表快照过期但后台轮询正在请求时最多等 0.3 秒复用它（等待该过期快照之后的新版本，而非上次已消费版本），避免重复同步查询；不增加请求且不绕过 429／`Retry-After`、过载与本地退避等待。开抢窗口内新增后台“我的活动”刷新（`SEU_HISTORY_BACKGROUND`，默认开启，约 20 秒一次；主线程只用 30 秒内且无错误的快照并校验行格式，过期/出错/非法回退同步查询，仅开抢窗口且非待确认时运行；替代 60 秒同步刷新，净请求约每窗口 +20 次，关闭后回到旧路径）；两个后台只读线程收到的 429／`Retry-After` 共用同一服务端等待截止点：每轮扫描先吸收两线程等待、检查共同截止时间再决定是否（重）启动后台线程，启动函数内部未到期也直接停止返回；取验证码前、取图后提交前、同步回退及每次新请求前都会同时吸收；退避时暂停两个查询线程，冷却都钳到共同截止时间（取最长等待），恢复后各自重启。开抢对齐为可选实验项（`SEU_POLLER_ALIGN`，默认关闭，学校时钟秒级截断＋快照年龄可能使目标晚约 0~1 秒，需真实开抢对比）。开抢前约 2 秒预热“我的活动”（`SEU_PREWARM`，超时上界 `min(1.5 秒, 距开抢剩余 −0.1 秒)`，剩余不足 0.4 秒跳过），约 0.6 秒预取并识别验证码（`SEU_CAPTCHA_PREFETCH`，超时上界 `min(0.6 秒, 距开抢剩余 −0.03 秒)`，剩余不足 0.45 秒跳过、预热结束后重算剩余时间），两项默认开启、可分别关闭，超时/判错/超过 5 秒未用时回退现场取图。本地开抢估算改为 `开抢时间戳 − 学校时钟偏移 − 余量`，余量取 `1.1 秒 + 该次列表快照年龄 + 该次列表请求耗时`，按稳定学校开抢时间戳固定，重算只允许向更早移动、不会把准备截止点后移；余量超过 2 秒（`PREPARATION_MAX_UNCERTAINTY`）时跳过预热、预取与可选对齐并记录 `preparation_skipped`（`reason=clock_uncertainty`，按场次去重），候选仍现场取图提交。准备动作按学校开抢时间戳去重、同一场开抢各最多一次；准备与对齐目标取下一场尚未开放的场次，仍在快轮询窗口的旧场次不会挡住后续场次的准备。候选到提交之间只保留两次落盘：首次进入验证码阶段时的健康快照写入，以及待确认记录与 `submitting` 阶段合并的一次原子保存；崩溃后仍先按活动 ID 查询。耗时指标补齐：后台快照记录请求开始时间／耗时，`scan_timing` 新增 `rows_fetch_seconds`、`rows_data_age`，`submission_started` 新增 `rows_data_age`、`precommit_save_seconds`，并新增 `history_background_used`／`history_background_invalid` 诊断。待确认核对优先使用轮询内存快照的正向证据（仅快照时间不早于提交持久化时间时有效）；健康快照普通等待下最多滞后约 1 秒，关键阶段进入前立即写 phase、错误与邮件状态立即写。离线测试 519 项通过、3 项平台限制跳过，mypy 通过；仅有离线证据，尚未在真实开抢复验，提速收益、预取准确率、剩余时间不足时跳过、旧场次未结束时的下一场准备及对齐误差、两个查询线程共享服务端等待的真实表现、共享等待期间线程确实不重启、退避期间后台历史确实停止、余量含请求耗时在真实慢响应下的效果、不确定性大时跳过准备的实际影响、版本化回退等待的实际收益、后台历史刷新的真实请求量与稳定性、提交前落盘实测毫秒与新指标判读待验证。规则见[需求](requirements.md)「认证、轮询与提交」，实施记录见[需求实施与验收](requirements.md#实施与验收) |
-| 2026-10-29 核对与服务端等待修复 | 修复三处离线复现缺陷：后台线程学到的 429／`Retry-After` 现在会立即停止两个只读线程，并在同步历史回退、待确认核对与异常进度探测前检查同一等待截止点，等待期内不再发出历史请求；活动列表缺少活动 ID 的行按核对不完整处理，清零连续计数、保持待确认、不据此解除；后台历史快照在接受前按扫描实际使用的结构校验，非法（如时间不可解析）时记录 `history_background_invalid` 并在同一轮回退同步查询，不再升级为全局退避。补三条回归（等待期内同步历史请求、缺 ID 活动列表不推进计数、后台历史非法时间同轮回退）。离线测试 522 项通过、3 项平台限制跳过，mypy 通过；未在真实开抢或学校记录延迟场景验证 |
-| 2026-10-29 线程共享等待与后台预算修复 | 新增只读线程共享的 `WaitGate`：活动列表与历史线程在每次请求前检查同一受锁等待截止点，收到 429／`Retry-After` 的线程立即更新（锁只保护截止点，网络请求期间不持锁），不再依赖主线程发现后停止；主线程的停止与冷却逻辑保留。后台历史校验拆为两层：先校验全部有效预约（含沙龙、测试公告）的活动 ID、预约状态与起止时间，再校验目标计数语义；沙龙非法时间不再穿透到冲突检查并触发全局退避，而是记录 `history_background_invalid` 并同一轮回退同步查询。后台列表与历史线程的克隆会话显式使用开抢查询预算 6 秒，不再继承主会话的 8 秒提交预算。补真实双线程共享等待、后台预算与 gate 共享、沙龙非法时间同轮回退等五条回归。离线测试 527 项通过、3 项平台限制跳过，mypy 通过；未部署、未在真实开抢或学校记录延迟场景验证 |
-| 2026-10-29 历史刷新与线程回收提速 | 开抢期历史缓存失效时按 2 秒节流主动请求后台刷新，候选路径优先等待这一份后台快照而不是同轮重复同步查询；只读线程停止改为只发信号，会话由线程退出后关闭，主线程不再固定等待在途请求；列表快照过期但轮询仍在请求时先等待该单个在途请求，再决定是否同步回退，减少重复并发请求；`submission_reply` 新增提交连接耗时。补四条回归。离线测试 531 项通过、3 项平台限制跳过，mypy 通过；未部署、未在真实开抢或慢响应场景验证 |
-| 2026-10-29 等待后列表重读与刷新合并 | 历史解析（后台等待或同步查询）耗时超过 0.5 秒时，选候选前按版本／发布时间重新消费更新过的后台列表快照，并重算候选、开抢窗口与计时字段，避免用等待前的旧列表先提交已满或已被取代的场次；开抢期在历史步骤前启动列表线程，让长等待期间仍有新快照可消费。`ActivityPoller.request_refresh()` 用完成版本目标合并在途刷新请求：查询进行中收到的刷新信号由该次查询满足，不再追加一次立即查询；仅在线程休眠时唤醒。补两条回归。离线测试 533 项通过、3 项平台限制跳过，mypy 通过；未在真实开抢或慢响应场景验证 |
-| 2026-10-29 刷新合并与停止竞态修复 | 在途查询先收到刷新请求、再收到 `stop(join=False)` 时，查询完成后的刷新信号清除会同时清掉停止唤醒，线程可能继续等待约一个轮询间隔（历史线程约 20 秒）才退出并关闭会话。现仅在未停止时清除刷新唤醒，并在进入间隔等待前再次检查停止，保证停止后立即退出。补“刷新＋停止＋在途查询完成”组合回归。离线测试 534 项通过、3 项平台限制跳过，mypy 通过；未在真实开抢中验证 |
-| 2026-10-29 待确认保护修复 | 待确认核对此前直接用“我的活动”／活动列表／后台快照生成已预约集合，未按 `progress` 的同一口径检查重复记录：同一活动 ID 出现互相矛盾的记录时可能误确认成功，其他活动的矛盾记录也能推进自动解除计数。现历史、后台列表快照与同步列表在作为证据前统一校验矛盾重复记录，矛盾时保持待确认并清零已保存的连续核对次数（历史记 `attendance_record_conflict`，列表按 `activity_schema_unknown` 中止）；未确认占位的“我的活动”确认与活动列表确认在同步占位前同样校验，人工 `--resolve-pending` 遇到矛盾记录保持待确认并返回核对失败；扫描入口 429／服务端等待响应或认证过期在待确认期间中止核对的路径同步清除并保存 `pending_checks`，恢复后重新累计三次有效核对。补七条回归。离线测试 541 项通过、3 项平台限制跳过，mypy 通过；仅有离线证据，未在真实开抢中验证 |
-| 2026-10-29 学校接口只读对照 | 单会话顺序查询，0.25／0.10／0.05 秒各档每组约 15 秒、穿插基线，含预热共 592 次活动列表查询成功；未观察到 429、过载、超时或明显响应变慢。原网关路径人工短信登录成功。仅测试连接指定校园网卡与校园 DNS 时，入口直接返回应用 CAS；未登录校内 CAS、未修改 Clash/TUN。详见[实测记录](acceptance/2026-10-29-read-only-probe.md)，不代表长期高频或真实开抢表现 |
-| 2026-10-29 校内 CAS 与刷新提速 | 校内应用 CAS 优先登录，其他路径保留网关认证；不修改 Clash/TUN、DNS 或路由。开抢活动列表目标间隔 0.10 秒，“我的活动”后台刷新 5 秒，主线程及时采用更新快照，启用后台时缓存与快照新鲜度上界均为 10 秒，关闭后仍为 60 秒。普通扫描 10 秒、网络错误快重试 0.25 秒及服务端等待策略保留。新增四项回归；离线测试 545 项通过、3 项平台限制跳过，mypy 通过。校内 CAS 真实登录与新节奏开抢收益当时均未验证；登录随后由同日 17:00 复测完成 |
-| 2026-10-29 校园直连并发复测 | 本机入口直接返回应用 CAS（`vpn.seu.edu.cn` 域名解析失败），新版校园直连完成真实登录，仅访问 `auth.seu.edu.cn`／`ehall.seu.edu.cn`、仍需短信；两个只读会话按列表 0.10 秒、我的活动 5 秒并发 30 秒，列表 276/276、历史 6/6 成功，无 429／过载／超时，列表中位 31ms、P95 47ms。约 90 秒后再次登录时短信发送被拒（`sms_send_failed`）。未提交预约、未取验证码、未修改网络配置；单账号单机 30 秒非开抢样本，不代表开抢收益或长期稳定性 |
-| 2026-10-29 校园直连回退与短信重试 | 校园直连缺少 CAS 服务信息（`cas_service_missing`）或登录后未能进入应用（当时的 `application_unavailable`；现扩展为进入应用步骤的任何非认证失败，见本轮）时回退一次原网关认证；凭据错误与人工挑战不回落。短信发送失败提示稍后重试，约一分钟内不再向学校重复请求。补三条回归。离线测试 548 项通过、3 项平台限制跳过，mypy 通过；回退路径与短信重试间隔未在真实网络切换中验证 |
-| 2026-10-29 短信提示输入修复 | 短信发送失败或冷却提示不再单独调用输入并丢弃返回值，而是并入下一次输入提示；失败后直接输入验证码可继续登录，冷却期内输入 `send` 不再请求学校。补两条不插入空输入的回归。离线测试 549 项通过、3 项平台限制跳过，mypy 通过；未重新触发真实短信失败场景 |
-| 2026-10-29 刷新合并竞态与校园回退修复 | 后台历史刷新请求返回原子目标轮询版本，主循环在 `polls < target` 时等待目标，有界等待结束后、同步“我的活动”回退前总是重读并尝试接受后台快照；在途轮询恰好完成时直接消费，不再多发一次同步历史查询，被节流的刷新请求保留已挂起目标，重建的只读线程把目标重置为 0。校园直连 CAS 登录成功后，进入应用阶段（`loginRedirect`）的任何非认证 HTTP／TLS／网络失败都回退一次网关认证，此前只有非应用页面触发；凭据错误、人工挑战及 `login()` 内部失败维持原行为。短信重发冷却改为客户端实例级截止时间，校园→网关的第二次 `login()` 不再重置；`sendStage2Code` 的网络／429 失败记录 `sms_send_failed`，按 max(60 秒, `Retry-After`) 冷却并提示稍后重试，不再升级为任务级失败，下一次输入不丢失；只读克隆会话不复制冷却。同日更正“学校限流”为未证实的主观猜测，429／502–504 与 `Retry-After` 处理仅为防御性措施（见[开抢与拥塞恢复](#开抢与拥塞恢复)）。补刷新竞态、版本目标、校园回退与短信冷却回归。离线测试 559 项通过、3 项平台限制跳过，mypy 通过；仅有离线证据，未在真实开抢或真实网络切换中验证 |
-| 2026-10-29 本机实战（19:00 线上讲座） | 19:00 开放的线上心理健康类讲座在候选出现约 1.23 秒后预约成功并按活动 ID 确认，同日同标题线下场次因时间冲突跳过。开抢窗口约 630 秒内 8327 次扫描（13.2 次/秒）、后台活动列表轮询 5120 次，`failure_count=0`，无 429／超时／OCR 失败／待确认滞留／重复提交。同日观察到一次 10.5 秒扫描停顿、约 19.3 秒后台历史刷新暂停与停顿恢复期短暂同步列表回退，均发生在成功提交之后，根因未取得日志证据。会话在认证后约 1 小时 54 分过期并要求重新短信认证（单样本）。成功通知邮件已由用户确认收到。完整时间线、指标与边界见[本机实战日志](acceptance/2026-10-29-live-run.md) |
-| 2026-10-29 后台只读失败可见性与回退限速 | 针对 19:00 实战中后台只读线程静默失败暴露的三个问题：① 主循环回收失败的后台只读线程时记录一次 `background_reader_stopped` 诊断（`reader`、固定原因码或异常类名、`server_directed`、服务端要求等待秒数 `retry_seconds`），仅本地诊断，不进入终端、事件或邮件；服务端要求的失败通常先被共享等待路径吸收、可能不产生该行。② 开抢窗口内后台活动列表线程不可用时，相邻同步列表查询至少间隔 0.25 秒（`FAST_SYNC_MIN_INTERVAL`），窗口内首次回退不延迟、普通模式不变、仍现场取数；代价是线程确实不可用时可能错过约 0.15 秒的预热／预取窗口而退回现场取图。③ 正常启动时若 `diagnostics.jsonl` 超过 8 MiB，先改名为 `diagnostics-<时间戳>.jsonl`（重名加数字后缀），保留全部旧文件、不删除，运行期间不轮转。补后台线程失败诊断、同步回退限速与启动轮转回归共 12 项；离线测试 571 项通过、3 项平台限制跳过，mypy 通过；仅有离线证据，未部署、未在真实开抢或真实后台失败场景验证 |
-| 2026-10-30 设备信任（记住此设备） | 两阶段本机验证。① 代码 `cbad3b2`：开启 `SEU_TRUST_DEVICE=true` 后仅发送 `rememberTrustDevice` 与本地 `fingerPrint`，首次 `--check` 经短信完成；紧接着新进程第二次 `--check` 仍要求短信，说明指纹字段本身不足以免短信。② 代码 `ac38ee8`：登录成功后将域名以 `seu.edu.cn` 结尾的 CAS Cookie 原子保存到 `state/trust-cookies.json`（`0600`、仅固定字段），下次登录先装入并显式调用 `verifyTgt` 校验应用页；首次 `--check` 照常短信完成并生成该文件，约 60 秒后新进程第二次 `--check` 未要求短信并输出 `event=read_only_complete`，本机同账号单样本验证静默登录可用。边界：单账号单机单样本；学校 TGT 有效期、轮换与信任注册后的会话过期行为未测；Cookie 文件等效登录凭据，删除即结束静默登录，被拒／过期／损坏时静默回退密码＋短信；2026-10-30 起已补逐次本地诊断（`trust_cookies_*`、`trust_silent_login_*`）。详见[设备信任验证记录](acceptance/2026-10-30-device-trust.md) |
-| 既有离线基线 | 2026-10-18 的 `d3e2b7b` 记录完整 307 项测试及类型检查通过，覆盖提交确认、状态损坏、恢复通知与异常退避 |
-| 学校只读接入 | 历史版本已验证认证、活动和我的活动查询、验证码图片；2026-10-18 核对六条非空列表的真实字段与开放时间解析，没有据此确认预约成功 |
-| 邮件送达 | 2026-10-16 一封真实测试邮件被 SMTP 接受，用户确认收到；2026-10-28 19:00 与 2026-10-29 19:00 预约成功后，用户均确认收到成功通知邮件。SMTP 接受与收件箱送达分别判断：成功通知不更新 `last_mail_*`，本地日志也只在发送失败时记录 `notification_failed`，因此成功通知的送达只能由用户收件箱确认，本地日志无法独立观察。2026-10-29 启动与重新认证时的重大告警邮件只在日志中确认 SMTP 接受，未逐项核对收件箱。新增服务商、更多真实业务通知仍需各自验收 |
-| 待验证 | 多次开抢的真实命中率、验证码批量准确率、运行中会话失效后的短信端到端恢复、修复后跨天会话、Windows 故障恢复、无人值守自动解除与验证码连续失败告警的真实链路、多笔占位及升级／中断恢复、代理路径总时限、单线程串行在真实持续慢响应下的实际扫描频率、OCR 预热后的首次提交耗时、同账号多会话只读轮询（活动列表与后台历史）在真实开抢高并发下的稳定性与请求量、服务端等待向主循环传导及失败核对不计数在真实学校延迟下的表现、提交前复查后台等待的实际效果、真实学校历史中沙龙记录按新口径排除且沙龙仍可预约的实际行为、Windows 上杀毒/备份并发读取时状态写入重试的实际效果、验证码预取在真实开抢中的识别成功率与误判率、连接建立耗时（`connect_seconds`）在实际网络下的观测、开抢前预热是否真正缩短提交前耗时、事件唤醒在真实开抢中的实际收益、`SEU_POLLER_ALIGN` 开启后的真实对齐误差、开抢前准备在剩余时间不足时是否按预期跳过、旧场次仍在快轮询窗口时的下一场准备、后台历史刷新在真实开抢中的请求量与稳定性、两个查询线程共享服务端等待的真实表现、共享等待期间线程确实不重启、退避期间后台历史确实停止、余量含请求耗时在真实慢响应下的效果、不确定性大时跳过准备的实际影响、版本化回退等待的实际收益、提交前落盘实测毫秒、`rows_fetch_seconds`／`rows_data_age`／`precommit_save_seconds` 等新指标的判读、后台只读线程失败时 `background_reader_stopped` 在真实停顿中的覆盖（服务端要求场景可能不产生该行）、开抢窗口同步回退 0.25 秒间隔在真实超时下的实际影响、设备信任 Cookie（本样本观察到 `TRUST_DEVICE`，约 30 天有效）的轮换与吊销、`TGT` 有效期、信任注册后的会话过期行为、静默登录失败时的诊断可见性（2026-10-30 已验证新进程免短信一次，单账号单机单样本）。2026-10-26 的单场真实预约和 Windows 接入已经通过，不再列为待验证 |
-| 服务器长期运行 | 2026-10-26 15:11 的历史观测累计约 16 小时 37 分，不能作为当前运行状态或满二十四小时的证据；最新修复后的至少二十四小时运行、SSH 断开、网络恢复及服务器重启后手动恢复仍待验证。2026-10-29 本机一次约 1 小时 54 分的运行中会话失效（`authentication_expired`）按预期发出重大告警并要求重新短信认证，用户随后停止进程、任务保留；这是单次样本且未完成重新登录，跨天会话与运行中短信端到端恢复仍需验证。2026-11-01 Ubuntu 24.04 服务器单账号 systemd 部署运行约 50 分钟后由维护者重启并停止账号，不足二十四小时，长期运行、长期网络波动与多账号并发仍需验证，见[服务器实战记录](acceptance/2026-11-01-live-run.md) |
-
-离线回归只使用构造响应、临时状态及替代输入，不访问学校、提交预约或发信。2026-10-29 的独立真实只读对照、人工短信登录及校园直连并发复测单独记录：短时登录与并发查询已完成，真实开抢、长期运行及运行中短信恢复仍未验收。代码更新后须重启才生效，本次未重启预约实例、修改 Clash/TUN 或系统网络配置。Windows 检查不作为 Ubuntu systemd 实机证据；2026-11-01 已在 Ubuntu 24.04 实机完成一次开抢并单独记录，见[服务器实战记录](acceptance/2026-11-01-live-run.md)；历史 [Linux 截图](images/使用截图.png)和[宣传素材](promo/usage.md)仅供追溯。
+离线检查使用构造响应或本地服务、临时配置和状态，不加载真实 `.env`，不访问学校或发邮件。主要测试入口为 `app.run`、`web.create_app`、`Manager`。真实学校链路测试另行取得授权，并记录验证码、提交、确认和恢复结果。

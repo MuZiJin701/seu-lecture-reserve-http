@@ -18,13 +18,29 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
-from urllib3.exceptions import NameResolutionError, ProtocolError
+from urllib3.exceptions import ProtocolError
 
 from seu_reserve import client as client_module
 from seu_reserve.client import (Client, DEADLINE_POOLS, ENTRY, GATEWAY, GatewayIPAdapter,
                                 RemoteError, install_deadline_pools)
 from seu_reserve.state import (FINGERPRINT_FILE, TRUST_COOKIES_FILE, load_trust_cookies,
                                save_trust_cookies)
+
+
+def test_offline_fixture_bypasses_inherited_and_system_proxies(monkeypatch):
+    """The autouse fixture forces NO_PROXY so offline tests never use inherited/system proxies.
+
+    Windows can expose a system proxy through the registry even when no proxy environment
+    variables are set, so simulate that fallback via ``getproxies``. The bypass must still hold
+    for every offline destination, including the gateway used by the TLS-loopback fixtures.
+    """
+    proxies = {'http': 'http://127.0.0.1:7892', 'https': 'http://127.0.0.1:7892'}
+    monkeypatch.setattr(requests.utils, 'getproxies', lambda: proxies)
+    with requests.Session() as session:
+        for url in ('http://example.invalid/', GATEWAY):
+            assert requests.utils.should_bypass_proxies(url, None) is True
+            settings = session.merge_environment_settings(url, {}, None, True, None)
+            assert requests.utils.select_proxy(url, settings['proxies']) is None
 
 
 @pytest.fixture
@@ -112,8 +128,6 @@ def gateway_server(tmp_path, monkeypatch, request):
     monkeypatch.setattr(client_module, '_bounded_create_connection', connect)
     monkeypatch.setattr(socket, 'getaddrinfo', resolve)
     monkeypatch.setenv('REQUESTS_CA_BUNDLE', str(cert_path))
-    for variable in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'):
-        monkeypatch.delenv(variable, raising=False)
     try:
         yield received, sni, destinations
     finally:
@@ -193,16 +207,58 @@ def test_bounded_dns_resolution_stops_at_the_request_deadline(monkeypatch):
     client_module.REQUEST_DEADLINE.value = time.monotonic() + 0.05
     try:
         started = time.monotonic()
-        with pytest.raises(NameResolutionError) as error:
+        with pytest.raises(client_module.ConnectTimeoutError):
             connection.connect()
         elapsed = time.monotonic() - started
     finally:
         client_module.REQUEST_DEADLINE.value = None
     assert calls == ['bounded-dns.invalid']
     assert elapsed < 0.25          # unbounded resolver would take the full 0.3 s
-    assert 'dns resolution timed out' in str(error.value)
-    reason = error.value._reason
-    assert isinstance(reason, socket.gaierror) and reason.errno == socket.EAI_AGAIN
+
+
+class FakeSocket:
+    """Minimal socket stand-in that only records timeout changes and close()."""
+
+    def __init__(self):
+        self.timeouts = []
+        self.closed = False
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+    def close(self):
+        self.closed = True
+
+
+def test_tls_handshake_gets_only_the_remaining_request_budget(monkeypatch):
+    """TCP + TLS must share the deadline: TCP may not leave TLS the original full timeout."""
+    sock = FakeSocket()
+    monkeypatch.setattr(client_module, '_bounded_create_connection',
+                        lambda *args, **kwargs: sock)
+    connection = client_module._DeadlineHTTPSConnection('budget.invalid', 443, timeout=5)
+    client_module.REQUEST_DEADLINE.value = time.monotonic() + 0.5
+    try:
+        assert connection._new_conn() is sock
+    finally:
+        client_module.REQUEST_DEADLINE.value = None
+    assert sock.timeouts
+    assert 0 < sock.timeouts[-1] <= 0.5
+    assert not sock.closed
+
+
+def test_tls_handshake_stops_when_the_request_budget_is_gone(monkeypatch):
+    sock = FakeSocket()
+    monkeypatch.setattr(client_module, '_bounded_create_connection',
+                        lambda *args, **kwargs: sock)
+    connection = client_module._DeadlineHTTPSConnection('budget.invalid', 443, timeout=5)
+    client_module.REQUEST_DEADLINE.value = time.monotonic() - 1
+    try:
+        with pytest.raises(socket.timeout, match='response deadline exceeded'):
+            connection._new_conn()
+    finally:
+        client_module.REQUEST_DEADLINE.value = None
+    assert sock.closed
+    assert sock.timeouts == []
 
 
 def test_client_request_bounds_dns_with_the_request_budget(monkeypatch):
@@ -214,9 +270,6 @@ def test_client_request_bounds_dns_with_the_request_budget(monkeypatch):
         return original('127.0.0.1', *args, **kwargs)
 
     monkeypatch.setattr(socket, 'getaddrinfo', slow_resolve)
-    for variable in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy',
-                     'all_proxy'):
-        monkeypatch.delenv(variable, raising=False)
     with requests.Session() as session:
         client = Client(session, {}, input, lambda _: None)
         client.timeout = 0.05
@@ -224,7 +277,7 @@ def test_client_request_bounds_dns_with_the_request_budget(monkeypatch):
         with pytest.raises(RemoteError) as error:
             client.request('GET', ENTRY)
         elapsed = time.monotonic() - started
-    assert str(error.value) == 'connection_failure'
+    assert str(error.value) == 'connect_timeout'
     assert elapsed < 0.25
 
 
@@ -260,9 +313,8 @@ def test_dns_result_is_cached_after_the_requesting_call_times_out(monkeypatch):
     monkeypatch.setattr(socket, 'getaddrinfo', slow_resolve)
     client_module._drop_dns_cache(host, 443)
     try:
-        with pytest.raises(socket.gaierror) as error:
+        with pytest.raises(socket.timeout):
             client_module._resolve_within(host, 443, time.monotonic() + 0.05)
-        assert error.value.errno == socket.EAI_AGAIN
         # The abandoned resolver thread still publishes its result, so the next request reuses it
         # instead of starting another lookup and timing out again.
         deadline = time.monotonic() + 2.0
@@ -435,6 +487,7 @@ def client_returning(response):
     (502, 'service_unavailable', '2', 2.0),
     (503, 'service_unavailable', '3', 3.0),
     (504, 'service_unavailable', None, 0.0),
+    (500, 'server_backoff', '7', 7.0),
 ])
 def test_error_status_and_retry_after_are_decided_before_the_body(status, reason, header, retry_after):
     body = UnreadableBody()
@@ -664,26 +717,6 @@ def test_login_with_trusted_device_sends_and_reuses_the_persisted_fingerprint(tm
     assert cas_login_data(other_session)['fingerPrint'] == stored
 
 
-def test_login_regenerates_a_corrupt_trusted_device_file(tmp_path):
-    path = tmp_path / FINGERPRINT_FILE
-    path.write_text('PRIVATE corrupt value')
-    client, session = cas_client(trust_device=True, fingerprint_dir=tmp_path)
-    client.login('https://ehall.seu.edu.cn/service')
-    data = cas_login_data(session)
-    assert re.fullmatch(r'[A-Za-z0-9_-]{8,128}', data['fingerPrint'])
-    assert data['fingerPrint'] != 'PRIVATE corrupt value'
-    assert path.read_text() == data['fingerPrint']
-
-
-def test_device_fingerprint_is_none_when_disabled_or_unconfigured(tmp_path):
-    session = StubSession({'code': 0})
-    disabled = Client(session, {}, input, lambda _: None, fingerprint_dir=tmp_path)
-    assert disabled.device_fingerprint() is None
-    unconfigured = Client(session, {}, input, lambda _: None, trust_device=True)
-    assert unconfigured.device_fingerprint() is None
-    assert not (tmp_path / FINGERPRINT_FILE).exists()
-
-
 def test_activities_joins_reservation_counts_and_server_clock():
     payload = {'code': 0, 'datas': {
         'hdlbList': [{'WID': 'one', 'HDZRS': '30'}, {'WID': 'two', 'HDZRS': 30}, {'WID': 'three'}],
@@ -693,7 +726,7 @@ def test_activities_joins_reservation_counts_and_server_clock():
     client, session = stub_client(payload)
     rows = client.activities()
     assert [row.get('YYRS') for row in rows] == [30, '29', None]
-    assert all(row['_SERVER_NOW'] == '2030-01-01 08:00:00' for row in rows)
+    assert all('_SERVER_NOW' not in row for row in rows)
     assert rows[0]['HDZRS'] == '30'
     method, url, kwargs = session.calls[0]
     assert method == 'POST' and kwargs['data'] == {}
@@ -908,126 +941,6 @@ def test_proxy_header_deadline_is_enforced(slow_header_proxy):
             session.get('http://example.invalid/slow', proxies={'http': slow_header_proxy},
                         timeout=0.2)
         assert time.monotonic() - started < 0.8
-
-
-@pytest.fixture(autouse=True)
-def reset_request_connect():
-    """Keep the connection-observation thread-local from leaking between tests."""
-    import seu_reserve.client as client_module
-    client_module.REQUEST_CONNECT.value = None
-    yield
-    client_module.REQUEST_CONNECT.value = None
-
-
-def test_fake_session_reports_no_connection_and_counts_attempts():
-    client, session = stub_client({'code': 0})
-    assert client.requests_made == 0
-    assert client.last_connect_seconds is None
-    client.request('GET', 'https://ehall.seu.edu.cn/modules/hdyy/vcode.do')
-    assert client.last_connect_seconds is None
-    assert client.requests_made == 1
-    # A connection cost measured for an earlier request must not survive a session that does
-    # not go through urllib3 at all.
-    client.last_connect_seconds = 1.5
-    client.request('GET', 'https://ehall.seu.edu.cn/modules/hdyy/vcode.do')
-    assert client.last_connect_seconds is None
-    assert client.requests_made == 2
-    assert len(session.calls) == 2
-
-
-def test_request_reads_the_connect_cost_and_restores_the_thread_local():
-    import seu_reserve.client as client_module
-
-    class Session:
-        def request(self, method, url, **kwargs):
-            client_module.REQUEST_CONNECT.value = 0.25
-            response = requests.Response()
-            response.status_code = 200
-            response._content = b'{}'
-            return response
-
-    client = Client(Session(), {}, input, lambda _: None)
-    client_module.REQUEST_CONNECT.value = 'outer'
-    client.request('GET', 'https://ehall.seu.edu.cn/modules/hdyy/vcode.do')
-    assert client.last_connect_seconds == 0.25
-    assert client.requests_made == 1
-    assert getattr(client_module.REQUEST_CONNECT, 'value', None) == 'outer'
-
-
-def test_failed_request_counts_the_attempt_and_restores_the_thread_local():
-    import seu_reserve.client as client_module
-
-    class Session:
-        def request(self, method, url, **kwargs):
-            raise requests.ConnectionError(socket.gaierror(socket.EAI_NONAME, 'SECRET DNS failure'))
-
-    client = Client(Session(), {}, input, lambda _: None)
-    client_module.REQUEST_CONNECT.value = 'outer'
-    with pytest.raises(RemoteError, match='connection_failure'):
-        client.request('GET', 'https://ehall.seu.edu.cn/modules/hdyy/vcode.do')
-    assert client.requests_made == 1
-    assert client.last_connect_seconds is None
-    assert getattr(client_module.REQUEST_CONNECT, 'value', None) == 'outer'
-
-
-def test_clone_readonly_has_independent_observability_counters():
-    client, _ = stub_client({'code': 0})
-    client.request('GET', 'https://ehall.seu.edu.cn/modules/hdyy/vcode.do')
-    client.last_connect_seconds = 2.0
-    clone = client.clone_readonly()
-    assert client.requests_made == 1
-    assert client.last_connect_seconds == 2.0
-    assert clone.requests_made == 0
-    assert clone.last_connect_seconds is None
-
-
-def test_new_connection_duration_is_measured_for_http_and_https(monkeypatch):
-    import seu_reserve.client as client_module
-
-    def fake_connect(connection):
-        # time.monotonic() is coarse on Windows (~15 ms), so a sleep shorter than that can
-        # measure as 0.0.
-        time.sleep(0.05)
-
-    monkeypatch.setattr(client_module.Urllib3HTTPConnection, 'connect', fake_connect)
-    monkeypatch.setattr(client_module.Urllib3HTTPSConnection, 'connect', fake_connect)
-    for connection_cls in (client_module._DeadlineHTTPConnection,
-                           client_module._DeadlineHTTPSConnection):
-        connection = connection_cls('example.invalid', 443)
-        client_module.REQUEST_CONNECT.value = None
-        connection_cls.connect(connection)
-        seconds = getattr(client_module.REQUEST_CONNECT, 'value', None)
-        assert isinstance(seconds, float)
-        assert seconds >= 0.02
-
-
-def test_failed_new_connection_still_records_its_duration(monkeypatch):
-    import seu_reserve.client as client_module
-
-    def fail(connection):
-        raise socket.gaierror(socket.EAI_NONAME, 'simulated DNS failure')
-
-    monkeypatch.setattr(client_module.Urllib3HTTPConnection, 'connect', fail)
-    connection = client_module._DeadlineHTTPConnection('example.invalid', 80)
-    with pytest.raises(socket.gaierror):
-        client_module._DeadlineHTTPConnection.connect(connection)
-    seconds = getattr(client_module.REQUEST_CONNECT, 'value', None)
-    assert isinstance(seconds, float)
-    assert seconds >= 0
-
-
-@pytest.mark.parametrize('gateway_server', ['vpn.seu.edu.cn'], indirect=True)
-def test_real_tls_handshake_reaches_last_connect_seconds(gateway_server, monkeypatch):
-    with requests.Session() as session:
-        client = Client(session, {'SEU_VPN_IP': '127.0.0.1'}, input, lambda _: None)
-        monkeypatch.setattr(client, '_authenticate', lambda: client.get(GATEWAY + '/public'))
-        client.authenticate()
-        assert client.requests_made == 2
-        assert isinstance(client.last_connect_seconds, float)
-        assert 0 <= client.last_connect_seconds < 5
-        client.request('GET', GATEWAY + ':443/public')
-        assert client.requests_made == 3
-        assert isinstance(client.last_connect_seconds, float)
 
 
 TRUST_CREDENTIALS = {'SEU_USERNAME': 'test-user', 'SEU_PASSWORD': 'test-password'}
@@ -1257,57 +1170,7 @@ def test_verify_tgt_runs_only_when_persisted_cookies_were_loaded(tmp_path, trust
     assert session.cas_login_calls == 1
     assert session.authenticated
 
-def test_trust_diagnostics_report_cookie_load_and_save(tmp_path):
-    events = []
 
-    def sink(event, **fields):
-        events.append((event, fields))
-
-    session = requests.Session()
-    client = Client(session, TRUST_CREDENTIALS, input, lambda _: None,
-                    trust_device=True, fingerprint_dir=tmp_path, diagnostic=sink)
-    client._load_trust_cookies()
-    assert events == [('trust_cookies_unavailable', {})]
-
-    save_trust_cookies(tmp_path, school_trust_cookies(), account=TRUST_CREDENTIALS['SEU_USERNAME'])
-    events.clear()
-    client._load_trust_cookies()
-    assert events == [('trust_cookies_loaded', {'cookies': 2})]
-
-    events.clear()
-    client._save_trust_cookies()
-    assert events == [('trust_cookies_saved', {'cookies': 2})]
-
-
-def test_trust_diagnostics_report_silent_login_outcome(tmp_path):
-    events = []
-
-    def sink(event, **fields):
-        events.append((event, fields))
-
-    client = Client(requests.Session(), TRUST_CREDENTIALS, input, lambda _: None,
-                    trust_device=True, fingerprint_dir=tmp_path, diagnostic=sink)
-    client._trust_cookies_loaded = True
-    client.cas = lambda *args, **kwargs: {'success': 0, 'code': 500}
-    assert client._trusted_cas_login('service') is None
-    assert events == [('trust_silent_login_failed', {'step': 'verify_tgt'})]
-
-    events.clear()
-    client.cas = lambda *args, **kwargs: {'success': 1, 'code': 200}
-    client.get = lambda url, **kwargs: SimpleNamespace(
-        url='https://ehall.seu.edu.cn/gsapp/index.do', text='indexjsp.js')
-    assert client._trusted_cas_login('service') is not None
-    assert events == [('trust_silent_login_succeeded', {})]
-
-
-def test_trust_diagnostics_never_break_authentication(tmp_path):
-    def broken_sink(event, **fields):
-        raise RuntimeError('sink failed')
-
-    client = Client(requests.Session(), TRUST_CREDENTIALS, input, lambda _: None,
-                    trust_device=True, fingerprint_dir=tmp_path, diagnostic=broken_sink)
-    client._load_trust_cookies()
-    assert client._trust_cookies_loaded is False
 @pytest.mark.parametrize('gateway_server', ['vpn.seu.edu.cn'], indirect=True)
 @pytest.mark.parametrize(('path', 'stage'), [('/slow-headers', 'headers'), ('/slow-gzip', 'body')])
 def test_failure_diagnostic_identifies_the_slow_stage_without_secrets(

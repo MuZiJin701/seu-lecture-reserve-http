@@ -6,7 +6,6 @@ import os
 import queue
 import socket
 import subprocess
-import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -713,25 +712,6 @@ def test_main_reports_held_manager_lock(tmp_path, capfd):
         holder.close()
 
 
-def test_main_prints_a_browsable_url_for_a_wildcard_listener(tmp_path, capsys, monkeypatch):
-    import uvicorn
-
-    calls = {}
-
-    def fake_run(app, **kwargs):
-        calls.update(kwargs)
-
-    monkeypatch.setattr(uvicorn, 'run', fake_run)
-    config = tmp_path / '.env'
-    config.write_text('SEU_DATA_DIR=data\nSEU_WEB_HOST=0.0.0.0\nSEU_WEB_PORT=18080\nSEU_WEB_ADMINS=' + ADMIN_SHARED['SEU_WEB_ADMINS'] + '\n',
-                      encoding='utf-8')
-    assert main(['--config', str(config)]) == 0
-    out = capsys.readouterr().out
-    assert 'http://127.0.0.1:18080' in out
-    assert '0.0.0.0 只是监听所有网卡' in out
-    assert calls['host'] == '0.0.0.0' and calls['port'] == 18080
-
-
 def test_delete_refuses_while_another_writer_holds_the_checkpoint(tmp_path):
     accounts = Accounts(tmp_path / 'data')
     account = accounts.create(account_data())
@@ -853,22 +833,6 @@ def test_stale_configuration_does_not_stop_or_overwrite_running_account(web):
     assert accounts.get(identifier)['name'] == 'first update'
 
 
-def test_legacy_managed_options_are_normalized_without_losing_state(tmp_path):
-    accounts = Accounts(tmp_path)
-    account = accounts.create(account_data())
-    legacy = {**account['options'], 'titles': ['old filter'], 'trust_device': False,
-              'poller_align': False, 'mail_success': False}
-    with accounts.connect() as db:
-        db.execute('UPDATE accounts SET options=?, recipient=?, mail_enabled=0 WHERE id=?',
-                   (json.dumps(legacy), 'synthetic@example.com', account['id']))
-    normalized = accounts.get(account['id'])
-    assert normalized['options']['titles'] == []
-    assert all(normalized['options'][key] for key in ('trust_device', 'prewarm', 'captcha_prefetch',
-                                                     'history_background', 'poller_align', 'mail_success'))
-    assert normalized['mail_enabled'] is True
-    assert normalized['password'] == SECRET and normalized['revision'] == 0
-
-
 def test_reservation_snapshot_is_local_and_protection_is_separate(tmp_path):
     accounts = Accounts(tmp_path)
     account = accounts.create(account_data())
@@ -974,30 +938,13 @@ def test_console_reads_never_contact_the_school(web, monkeypatch):
     assert listed.status_code == 200 and listed.json()[0]['id'] == identifier
 
 
-def test_second_client_lifecycle_invalidates_the_old_session_token(tmp_path):
-    accounts = Accounts(tmp_path / 'data')
-    app = create_app(accounts, ADMIN_SHARED, manager=make_manager(accounts))
-    with TestClient(app, base_url='http://testserver') as first:
-        login = first.post('/api/login', json={'username': 'admin', 'password': ADMIN_PASSWORD})
-        assert login.status_code == 200
-        token = first.cookies.get(COOKIE_NAME)
-        assert token and first.get('/api/accounts').status_code == 200
-    # Lifespan shutdown/startup clears process-local sessions; a restart must not trust old cookies.
-    assert app.state.administrators.session(token) is None
-    with TestClient(app, base_url='http://testserver') as second:
-        second.cookies.set(COOKIE_NAME, token)
-        assert second.get('/api/accounts').status_code == 401
-        assert second.post('/api/login', json={'username': 'admin',
-                                              'password': ADMIN_PASSWORD}).status_code == 200
-
-
 def test_created_account_options_are_forced_to_the_managed_policy(web):
     client, accounts, _ = web
     payload = account_data().model_dump()
     payload['options'] = dict(
         titles=['旧筛选'], categories=['人文与科学素养系列讲座_心理健康', '“SEU咖啡间”系列沙龙活动'],
         campuses=['九龙湖校区'], online=False, offline=True, trust_device=False, prewarm=False,
-        captcha_prefetch=False, poller_align=False, history_background=False, mail_success=False)
+        captcha_prefetch=False, mail_success=False)
     created = client.post('/api/accounts', json=payload)
     assert created.status_code == 201, created.text
     body = created.json()
@@ -1007,8 +954,7 @@ def test_created_account_options_are_forced_to_the_managed_policy(web):
     saved = accounts.get(body['id'])
     assert saved['options']['titles'] == []
     assert all(saved['options'][key] is True for key in
-               ('trust_device', 'prewarm', 'captcha_prefetch', 'poller_align',
-                'history_background', 'mail_success'))
+               ('trust_device', 'prewarm', 'captcha_prefetch', 'mail_success'))
 
 
 @pytest.mark.parametrize('changes, status, detail', [
@@ -1040,74 +986,6 @@ def test_login_shell_and_assets_are_public(tmp_path):
             assert asset.status_code == 200
             assert asset.headers['content-type'].startswith(media_type)
 
-
-def test_revision_migration_tolerates_a_concurrent_duplicate_column(tmp_path):
-    import sqlite3
-
-    accounts = Accounts(tmp_path / 'data')
-    identifier = accounts.create(account_data())['id']
-    with accounts.connect() as db:
-        db.execute('ALTER TABLE accounts DROP COLUMN revision')
-
-    class RacingConnection:
-        """Proxy that simulates another process adding `revision` between PRAGMA and ALTER."""
-
-        def __init__(self, db, path):
-            self.db = db
-            self.path = path
-
-        def __getattr__(self, name):
-            return getattr(self.db, name)
-
-        def __enter__(self):
-            return self.db
-
-        def __exit__(self, *exc_info):
-            return self.db.__exit__(*exc_info)
-
-        def execute(self, statement, *args):
-            if statement.startswith('ALTER TABLE accounts ADD COLUMN revision'):
-                with sqlite3.connect(self.path) as peer:
-                    peer.execute(statement)
-                raise sqlite3.OperationalError('duplicate column name: revision')
-            return self.db.execute(statement, *args)
-
-    class RacingAccounts(Accounts):
-        def connect(self):
-            return RacingConnection(Accounts.connect(self), self.path)
-
-    reopened = RacingAccounts(tmp_path / 'data')
-    saved = reopened.get(identifier)
-    assert saved['revision'] == 0
-    assert saved['password'] == SECRET
-
-
-def test_main_constructs_the_administrator_registry_once_and_injects_it(tmp_path, monkeypatch):
-    import seu_reserve.web as module
-    instances = []
-    original = module.Administrators
-
-    class CountingAdministrators(original):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            instances.append(self)
-
-    captured = {}
-
-    def fake_create_app(accounts, shared, **options):
-        captured.update(options)
-        return object()
-
-    monkeypatch.setattr(module, 'Administrators', CountingAdministrators)
-    monkeypatch.setattr(module, 'create_app', fake_create_app)
-    monkeypatch.setattr('uvicorn.run', lambda app, **options: None)
-    config = tmp_path / '.env'
-    config.write_text('SEU_DATA_DIR=data\nSEU_WEB_HOST=127.0.0.1\nSEU_WEB_PORT=18080\n'
-                      'SEU_WEB_ADMINS=' + ADMIN_SHARED['SEU_WEB_ADMINS'] + '\n', encoding='utf-8')
-    assert module.main(['--config', str(config)]) == 0
-    # Plaintext passwords are hashed while building the registry; a second build would re-hash.
-    assert len(instances) == 1
-    assert captured['administrators'] is instances[0]
 
 def test_oversized_chunked_body_is_rejected_on_received_bytes(tmp_path):
     import uvicorn

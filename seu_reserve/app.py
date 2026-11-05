@@ -5,7 +5,6 @@ import json
 import os
 import random
 import sys
-import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -16,13 +15,14 @@ from typing import Any
 
 import requests
 
-from .client import AuthenticationExpired, AuthenticationRejected, Client, RemoteError, has_code
-from .model import (COFFEE_CATEGORY, GOAL_CATEGORIES, AttendanceCategoryUnknown, Lecture, Progress,
+from .client import (AuthenticationExpired, AuthenticationRejected, Client, RemoteError,
+                     has_code, server_backoff_error)
+from .model import (COFFEE_CATEGORY, GOAL_CATEGORIES, Lecture, Progress,
                     REQUIRED_CATEGORIES, SHANGHAI, activity_id, category_name,
                     confirmed_reservation, conflicting_records, interval, moment, progress,
                     reservation_display, reserved, test_notice)
 from .mail import MailWorker, Mailer, mail_failure_reason, mail_history
-from .poller import ActivityPoller, WaitGate
+from .poller import ActivityPoller, WaitGate, server_directed_error
 from .runtime import CaptchaWorker, LocalLogs, PreparedCaptcha, WorkSignal
 from .state import FINGERPRINT_FILE, Task, open_nofollow
 
@@ -33,13 +33,8 @@ MAJOR_MAIL_EVENTS = {'authentication_required', 'authentication_rejected', 'quer
                      'unexpected_failure', 'reservation_step_failure'}
 SCAN_INTERVAL = 5
 FAST_INTERVAL = 0.10
-FAST_RETRY_INTERVAL = 0.25
-# Transient opening failures retry quickly; explicit server waits still take precedence.
-FAST_RETRY_REASONS = {'network_timeout', 'connect_timeout', 'network_failure', 'connection_failure',
-                      'proxy_failure', 'invalid_json', 'invalid_response', 'http_failure',
-                      'business_response_invalid', 'business_rows_invalid', 'business_rows_incomplete'}
 SELECTION_REASONS = {'candidate', 'reservation_not_started', 'reservation_ended', 'capacity_full',
-    'not_reservable', 'already_reserved', 'category_not_allowed', 'category_not_needed',
+    'not_reservable', 'already_reserved', 'category_not_allowed',
     'title_not_selected', 'online_disabled', 'offline_disabled', 'campus_not_selected',
     'time_conflict', 'cooldown', 'invalid_activity_time', 'notice_test_only', 'retry_limit'}
 # A pending submission is verified repeatedly by activity ID before any automatic release: the
@@ -47,9 +42,6 @@ SELECTION_REASONS = {'candidate', 'reservation_not_started', 'reservation_ended'
 # checks. Automatic release keeps unattended operation possible; the local log keeps the evidence.
 PENDING_MISS_PAUSE = 2
 PENDING_AUTO_RELEASE_CHECKS = 3
-# The align callback runs in the poller thread and writes a diagnostic line; serialize the local
-# log appends so a background line cannot interleave with a main-loop line.
-_LOG_LOCK = threading.Lock()
 # After the first release, keep the original activity's time interval as a local hold so a
 # different lecture at the same time cannot be booked while the first submission is unresolved.
 PENDING_HOLD_SECONDS = 600
@@ -60,39 +52,25 @@ class QueryInFlight(Exception):
     """A required reader snapshot is not ready; wait without recording a query failure."""
 
 
-def pending_hold_until(start: float, now: float, *, offset_known: bool,
-                       server_offset: float) -> float:
-    """Local-clock hold deadline for an activity start expressed in school time.
-
-    ``start`` comes from the school rows (absolute school-time epoch) while ``now`` and the
-    stored deadline are host-clock based. Before the school clock is calibrated there is no
-    safe conversion, so keep the full local hold instead of expiring at a skewed activity start.
-    """
-    deadline = now + PENDING_HOLD_SECONDS
-    if offset_known:
-        deadline = min(deadline, float(start) - server_offset)
-    return max(deadline, now)
+class ReaderFailure(RemoteError):
+    """A failed snapshot whose retry is owned by its reader."""
 
 
-def tighten_hold_deadlines(holds: Mapping[str, Any], *, offset_known: bool,
-                           server_offset: float) -> bool:
-    """Tighten stored local-clock hold deadlines once the school clock is known.
+def pending_hold_until(start: float, now: float) -> float:
+    return max(now, min(now + PENDING_HOLD_SECONDS, start))
 
-    Hold ``start`` values are school-time epochs while ``until`` is host-clock. Before calibration
-    the hold keeps its full local fallback; afterwards it must not outlive the activity start by
-    more than the clock skew. Returns True when a deadline changed.
-    """
-    if not offset_known:
-        return False
+
+def normalize_hold_deadlines(holds: Mapping[str, Any]) -> bool:
+    """Recalculate older checkpoint deadlines from the stored start and creation time."""
     changed = False
     for entry in holds.values():
-        if not isinstance(entry, dict) or not isinstance(entry.get('start'), (int, float)):
-            continue
-        start_local = float(entry['start']) - server_offset
-        if start_local < float(entry.get('until', start_local)):
-            entry['until'] = start_local
+        until = pending_hold_until(entry['start'], entry['since'])
+        if entry['until'] != until:
+            entry['until'] = until
             changed = True
     return changed
+
+
 # After the candidate appears, a slow successful submission must not be aborted by the fast list
 # timeout; captcha and submit keep a longer budget while the list stays fast.
 SUBMIT_TIMEOUT = 8
@@ -100,26 +78,8 @@ SUBMIT_TIMEOUT = 8
 OPENING_QUERY_TIMEOUT = 6
 # Slow reads stay off the main thread without abandoning every response over half a second.
 OPENING_BACKGROUND_TIMEOUT = 2.0
-# Readers retain their sessions across transient failures and own their retry schedule.
-OPENING_POLLER_RETRY = FAST_INTERVAL
-# Legacy CLI without periodic history refresh retains the older opening cache lifetime.
-OPENING_HISTORY_TTL = 60.0
-NORMAL_HISTORY_TTL = 30.0
-# Both opening phases allow the last success for 2 s; an error still invalidates its rows.
-POLLER_SNAPSHOT_MAX_AGE = 2.0
-# After history resolution, the list rows
-# fetched before it may already be stale. Re-consume a newer poller snapshot above this age
-# difference before selecting candidates.
+HISTORY_TIMEOUT = 8.0
 HISTORY_LIST_REFRESH_AFTER = 0.5
-# An independent history owner serves periodic and on-demand refreshes in every phase.
-HISTORY_REFRESH_INTERVAL = 5.0
-HISTORY_BACKGROUND_FRESH = 10.0
-# Minimum spacing between on-demand history refreshes; keeps a broken history response from
-# turning the proactive refresh into a tight request loop.
-HISTORY_REFRESH_MIN_INTERVAL = 2.0
-# When the school-clock estimate is this uncertain, prewarm/prefetch are skipped: timing them from
-# an early/deadline guess is not safe, and the normal in-scan captcha fetch still works.
-PREPARATION_MAX_UNCERTAINTY = 2.0
 # The opening fast path retries a failed reader quickly; throttle its local diagnostic so a
 # persistent network fault cannot append one line every 0.1 s.
 BACKGROUND_READER_DIAG_INTERVAL = 5.0
@@ -136,21 +96,19 @@ HEALTH_WRITE_INTERVAL = 1.0
 # Phase changes that an operator must see immediately (long blocking requests happen in these
 # phases, so the coalesced wait-boundary flush alone would hide them for seconds).
 HEALTH_URGENT_PHASES = frozenset({'authentication', 'captcha', 'submitting', 'confirming',
-                                  'manual_required', 'failed', 'done', 'waiting_for_attendance'})
-# Ask the history owner for a fresh result shortly before the opening, without main-thread I/O.
-PREWARM_LEAD_SECONDS = 2.0
-# Fetch and recognise a captcha just before the opening so the candidate can be submitted without
-# the captcha round-trip on the critical path. The lead is also the timeout budget below: a slow
-# prefetch must finish by the opening instant or fall back to a fresh fetch.
-CAPTCHA_PREFETCH_LEAD_SECONDS = 0.6
-# A prefetched captcha is only reused while this young; otherwise the submit path fetches fresh.
-CAPTCHA_PREFETCH_MAX_AGE = 5.0
-# A slow captcha prefetch must not consume the opening.
-CAPTCHA_PREFETCH_TIMEOUT = 0.6
-# When less time than this is left before the opening, preparation is skipped instead of being
-# forced a minimum request budget that would run past the opening instant.
-PREWARM_MIN_REMAINING = 0.4
+                                  'manual_required', 'failed'})
+CAPTCHA_PREFETCH_LEAD_SECONDS = 2.7
+CAPTCHA_PREFETCH_TIMEOUT = 8.0
+# One retry keeps the prepared captcha and the warm main-session connection within reach when the
+# first attempt fails on a slow handshake. A concurrent second captcha is still impossible.
+CAPTCHA_PREFETCH_ATTEMPTS = 2
+# Leave a little lead time before starting a speculative fetch on the submission session.
 CAPTCHA_PREFETCH_MIN_REMAINING = 0.45
+# Open the submission session's connection once when fast opening starts: the T-2.7 captcha
+# prefetch and the submit after it then reuse a pooled TLS connection instead of paying a cold
+# handshake in the congested opening seconds. The request itself stays a cheap list read.
+MAIN_SESSION_WARM_TIMEOUT = 2.0
+MAIN_SESSION_WARM_MARGIN = 0.2
 # Local diagnostics are append-only and never deleted: an oversized log is renamed once at startup
 # so old evidence stays on disk while the active file restarts empty.
 DIAGNOSTICS_MAX_BYTES = 8 * 1024 * 1024
@@ -179,10 +137,15 @@ def new_history_poller(query: Callable[[], list[dict[str, Any]]], *,
                        gate: WaitGate | None = None,
                        on_exit: Callable[[], None] | None = None,
                        on_update: Callable[[], None] | None = None,
-                       retry_delay: Callable[[int, Any], float] | None = None) -> ActivityPoller:
-    """Build the background "my activities" refresher (injectable for offline tests)."""
+                       retry_delay: Callable[[int, Any], float] | None = None,
+                       retry_interval: Callable[[], float] | None = None) -> ActivityPoller:
+    """Build the event-driven "my activities" owner (injectable for offline tests).
+
+    There is no periodic schedule: each refresh event retries until a reliable response arrives.
+    """
     return ActivityPoller(query, interval=interval, clock=clock, gate=gate, on_exit=on_exit,
-                          on_update=on_update, retry_delay=retry_delay, name='history-reader')
+                          on_update=on_update, retry_delay=retry_delay,
+                          retry_interval=retry_interval, name='history-reader')
 
 
 def terminal_prompt(label: str) -> str:
@@ -201,23 +164,17 @@ class Settings:
     online: bool = True
     offline: bool = True
     mail_success: bool = False
-    # Opening-window latency experiments; both keep the same request ordering and only shift
-    # read-only work off the candidate-to-submit path.
+    # Prepare the captcha off the candidate-to-submit path.
     captcha_prefetch: bool = True
     prewarm: bool = True
-    # Aligning a poller poll to the exact opening instant depends on the school-clock offset, which
-    # carries up to a second of truncation/request-latency error; off by default until measured.
-    poller_align: bool = False
-    # Disable periodic history polling for legacy CLI; on-demand reads still use its owner.
-    history_background: bool = True
     # Opt-in trusted device for the SMS second factor: off by default so the login payload keeps
     # its previous (untrusted) shape unless the user explicitly enables it.
     trust_device: bool = False
 
 def server_wait_error(exc: BaseException) -> bool:
-    """True when the school explicitly asked us to wait before another request."""
-    return (isinstance(exc, RemoteError)
-            and (exc.retry_after > 0 or str(exc) == 'server_backoff'))
+    """True only for server replies permitted to introduce an error backoff."""
+    return (isinstance(exc, RemoteError) and not isinstance(exc, ReaderFailure)
+            and server_backoff_error(exc))
 
 
 def progress_rows(history: list[dict[str, Any]], holds: Mapping[str, Any] | None,
@@ -236,8 +193,10 @@ def progress_rows(history: list[dict[str, Any]], holds: Mapping[str, Any] | None
         if wid in known:
             continue
         category = entry.get('category')
-        if not isinstance(category, str) or not category:
-            raise AttendanceCategoryUnknown(wid)
+        if not isinstance(category, str):
+            # The reference target cannot count an unknown category, but the confirmed hold must
+            # still participate in conflict checks, so keep the row with an empty category.
+            category = ''
         try:
             start = datetime.fromtimestamp(float(entry['start']), SHANGHAI)
             end = datetime.fromtimestamp(float(entry['end']), SHANGHAI)
@@ -256,7 +215,7 @@ def progress_rows(history: list[dict[str, Any]], holds: Mapping[str, Any] | None
 # attendance results no longer block: an ended lecture without a readable result is skipped until
 # the school updates it; format-level errors require a new history snapshot.
 HISTORY_ROW_FORMAT_ERRORS = frozenset({
-    'activity_id_missing', 'publication_status_unknown', 'reservation_status_unknown',
+    'activity_id_missing', 'attendance_record_conflict', 'publication_status_unknown', 'reservation_status_unknown',
     'time_missing', 'time_invalid', 'interval_invalid'})
 
 
@@ -287,7 +246,7 @@ def background_history_usable(rows: list[dict[str, Any]], now: float) -> str | N
 
 def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: Progress,
                       mine: list[dict[str, Any]], cooldowns: Mapping[str, float],
-                      now: float, *, cooldown_clock_known: bool = True,
+                      now: float, *,
                       holds: list[Mapping[str, Any]] | None = None
                       ) -> tuple[list[Lecture], list[dict[str, Any]]]:
     booked = {activity_id(row) for row in mine if confirmed_reservation(row)}
@@ -344,8 +303,6 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
                                            or int(held.get('attempts', 0)) >= PENDING_RETRY_LIMIT)
         if lecture.wid in booked or lecture.availability == 'already_reserved':
             reason = 'already_reserved'
-        elif not current.needs(lecture.category):
-            reason = 'category_not_needed'
         elif settings.titles and lecture.title not in settings.titles:
             reason = 'title_not_selected'
         elif lecture.online and not settings.online:
@@ -360,7 +317,7 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
             reason = 'time_conflict'
         elif hold_retry:
             reason = 'retry_limit'
-        elif lecture.wid in cooldowns and (not cooldown_clock_known or cooldowns[lecture.wid] > now):
+        elif lecture.wid in cooldowns and cooldowns[lecture.wid] > now:
             reason = 'cooldown'
         elif lecture.availability != 'candidate':
             reason = lecture.availability
@@ -370,8 +327,8 @@ def select_candidates(rows: list[dict[str, Any]], settings: Settings, current: P
         details.append(dict(wid=lecture.wid, title=lecture.title, reason=reason,
             reservation_start=lecture.reservation_start.isoformat(timespec='seconds') if lecture.reservation_start else None,
             reservation_end=lecture.reservation_end.isoformat(timespec='seconds') if lecture.reservation_end else None))
-    candidates.sort(key=lambda row: (row.category not in current.missing,
-                    categories.index(row.category), not row.online, row.start, row.wid))
+    candidates.sort(key=lambda row: (categories.index(row.category),
+                    not row.online, row.start, row.wid))
     return candidates, details
 
 
@@ -422,28 +379,29 @@ def merge_openings(known: dict[str | int, dict[str, Any]], details: list[dict[st
     return merged
 
 
+def in_fast_opening(start: float, end: float, now: float) -> bool:
+    return start - 5 <= now < min(end, start + 9)
+
+
 def opening_intervals(openings: list[tuple[float, float]], now: float) -> tuple[float, float] | None:
-    active = [(start, end) for start, end in openings
-              if start - 30 <= now < min(end, start + 300)]
-    if not active:
-        return None
-    return (0.05, 0.10) if any(start - 5 <= now < start + 9 for start, _ in active) else (0.5, 1.5)
+    if any(in_fast_opening(start, end, now) for start, end in openings):
+        return 0.05, 0.10
+    if any(start - 30 <= now < min(end, start + 300) for start, end in openings):
+        return 0.5, 1.5
+    return None
 
 
 @dataclass(frozen=True)
 class ReadPolicy:
     timeout: float
     list_max_age: float
-    history_interval: float
-    history_max_age: float
 
 
 def read_policy(openings: list[tuple[float, float]], now: float) -> ReadPolicy:
     bounds = opening_intervals(openings, now)
     if bounds is None:
-        return ReadPolicy(10.0, 10.0, 25.0, NORMAL_HISTORY_TTL)
-    return ReadPolicy(OPENING_BACKGROUND_TIMEOUT, POLLER_SNAPSHOT_MAX_AGE,
-                      HISTORY_REFRESH_INTERVAL, HISTORY_BACKGROUND_FRESH)
+        return ReadPolicy(10.0, 10.0)
+    return ReadPolicy(OPENING_BACKGROUND_TIMEOUT, OPENING_BACKGROUND_TIMEOUT)
 
 
 def scan_delay(details: list[dict[str, Any]], now: float, elapsed: float,
@@ -456,49 +414,6 @@ def scan_delay(details: list[dict[str, Any]], now: float, elapsed: float,
                   for boundary in (start - 30, start - 5, min(start + 9, end), min(end, start + 300))
                   if boundary > now]
     return min([delay, *boundaries]), bounds is not None
-
-
-def _school_offset(rows: list[dict[str, Any]], now: float) -> float | None:
-    server_now = next((row.get('_SERVER_NOW') for row in rows
-                       if isinstance(row.get('_SERVER_NOW'), str)), None)
-    if not server_now:
-        return None
-    try:
-        offset = moment(server_now).timestamp() - now
-    except ValueError:
-        return None
-    # A day-scale offset means a broken clock or a test fixture, not useful scheduling input.
-    return offset if abs(offset) <= 3600 else None
-
-
-def school_clock_offset(rows: list[dict[str, Any]], now: float) -> float:
-    """Estimate the school clock offset so opening windows use the school's time, not the host's."""
-    offset = _school_offset(rows, now)
-    return 0.0 if offset is None else offset
-
-
-def school_clock_known(rows: list[dict[str, Any]], now: float) -> bool:
-    """Whether this response carries a usable school clock for time-basis decisions."""
-    return _school_offset(rows, now) is not None
-
-
-def school_clock_uncertainty(snapshot_age: float, request_seconds: float = 0.0) -> float:
-    """Conservative lateness of a school-clock based local opening estimate.
-
-    The school timestamp is second-truncated (up to one second), the snapshot is consumed later
-    than it was produced, and a slow list request delays when the reading takes effect, so the
-    naive ``start - offset`` can be later than the true opening by the truncation fraction plus
-    the snapshot age plus the request duration. There is deliberately no small hard cap here: the
-    caller skips preparation when the uncertainty is too large to time it safely.
-    """
-    return 1.1 + max(0.0, snapshot_age) + max(0.0, request_seconds)
-
-
-def earliest_opening_local(start: float, offset: float, margin: float,
-                           previous: float | None = None) -> float:
-    """Earliest plausible local opening time; recomputation may only move it earlier."""
-    candidate = start - offset - margin
-    return candidate if previous is None else min(previous, candidate)
 
 
 def _state_event(settings: Settings, event: str) -> None:
@@ -637,7 +552,8 @@ def run(settings: Settings, *, session: Any = None,
     next_preparation_at: float | None = None
     latest_progress: Progress | None = None
     progress_at = 0.0
-    unresolved_reported: frozenset[str] = frozenset()
+    goal_reported = False
+    last_recorded_error: tuple[str, float] | None = None
     task: Task | None = None
     client = None
     activity_poller: ActivityPoller | None = None
@@ -663,11 +579,9 @@ def run(settings: Settings, *, session: Any = None,
     history_poller: ActivityPoller | None = None
     history_client: Client | None = None
     history_retry_at = 0.0
-    history_refresh_at = 0.0
-    # Reader instance that produced the current refresh throttle window: a recycled reader must
-    # be allowed to refresh immediately instead of inheriting the old reader's throttle.
-    history_refresh_poller: ActivityPoller | None = None
     history_request: tuple[ActivityPoller, int] | None = None
+    prewarmed_openings: set[float] = set()
+    main_warmed_openings: set[float] = set()
     missing_readers: set[str] = set()
     # Start of the current "no reliable snapshot" outage per reader, whether its missing line was
     # already written, and whether the stall line was written; all cleared on recovery.
@@ -980,6 +894,20 @@ def run(settings: Settings, *, session: Any = None,
         step_recovered()
         clear_alert('reservation_unconfirmed')
         emit('reservation_succeeded')
+        # A confirmed reservation is a history refresh event; the scan fires it after the
+        # current submission round so progress/conflicts are updated for the next scan.
+        trigger_history_refresh()
+
+    def report_goal_once() -> None:
+        """Record the reference target once per task; never stop or pause reservations."""
+        nonlocal goal_reported
+        if goal_reported:
+            return
+        goal_reported = True
+        if task is not None:
+            task.data['goal_reported'] = True
+            task.save()
+        emit('goal_completed')
 
     def ensure_hold(wid: str, start: float, end: float, *, confirmed: bool, source: str,
                     category: str | None = None, save: bool = True) -> bool:
@@ -994,8 +922,7 @@ def run(settings: Settings, *, session: Any = None,
         entry = holds.get(wid)
         if not isinstance(entry, dict):
             now = clock()
-            until = pending_hold_until(start, now, offset_known=offset_known,
-                                       server_offset=server_offset)
+            until = pending_hold_until(start, now)
             entry = dict(start=float(start), end=float(end), since=now,
                          until=until, attempts=0, confirmed=False)
             holds[wid] = entry
@@ -1034,12 +961,12 @@ def run(settings: Settings, *, session: Any = None,
         return views
 
     def notification_details() -> str:
-        counts = '已选听：未知\n待参加：未知\n必需类别缺口：未知'
+        counts = '已预约：未知\n参考目标：未知\n必需类别缺口：未知'
         if latest_progress is not None:
             missing = '、'.join(label for category, label in zip(REQUIRED_CATEGORIES, ('心理健康', '法律', '艺术'))
-                               if category in latest_progress.missing) or '无（含待参加计划）'
-            counts = (f'已选听：{sum(latest_progress.completed.values())} / 8\n'
-                      f'待参加：{sum(latest_progress.planned.values())}\n必需类别缺口：{missing}')
+                               if category in latest_progress.missing) or '无'
+            counts = (f'已预约：{latest_progress.total} / 8（参考目标）\n'
+                      f'参考达标：{"是" if latest_progress.complete else "否"}\n必需类别缺口：{missing}')
         progress_time = datetime.fromtimestamp(progress_at, SHANGHAI).isoformat(timespec='seconds') if progress_at else '尚未取得'
         query_time = (datetime.fromtimestamp(snapshot['last_query_at'], SHANGHAI).isoformat(timespec='seconds')
                       if snapshot['last_query_at'] else '尚无成功查询')
@@ -1050,7 +977,7 @@ def run(settings: Settings, *, session: Any = None,
         return (f'{counts}\n进度记录时间：{progress_time}\n最近成功查询：{query_time}\n'
                    f'连续失败：{snapshot["failure_count"]} 次\n待处理问题：{issue}\n'
                    f'最近业务错误：{snapshot["last_error"]}\n下次检查计划：{next_check}\n'
-                   '进度为最近一次成功核对的记录；未知或较旧时请检查本地运行状态。')
+                   '进度为最近一次事件刷新得到的已预约记录；未知或较旧时请检查本地运行状态。')
 
     def pause(seconds: float, wake: Callable[[float], bool] | None = None) -> None:
         deadline = timer() + max(0.0, seconds)
@@ -1124,26 +1051,29 @@ def run(settings: Settings, *, session: Any = None,
         if not background_poller:
             return query_interval()
         now = clock()
-        school_now = now + server_offset
-        deadlines = [boundary - school_now for start, end in known_openings
+        deadlines = [boundary - now for start, end in known_openings
                      for boundary in (start - 30, start - 5, min(start + 9, end), end)
-                     if boundary > school_now]
+                     if boundary > now]
         deadlines += [at - now for at in (poller_retry_at, history_retry_at, next_preparation_at)
                       if at is not None and at > now]
-        opening = next_opening()
-        if opening is not None and task is not None and task.data['status'] != 'pending':
-            start = opening[0]
-            local = opening_local_estimate(start)
-            for enabled, lead in ((settings.prewarm and start not in prewarmed, PREWARM_LEAD_SECONDS),
-                                  (settings.captcha_prefetch and start != prefetched_for,
-                                   CAPTCHA_PREFETCH_LEAD_SECONDS)):
-                if enabled and local - lead > now:
-                    deadlines.append(local - lead - now)
+        start = next_opening(now)
+        if (settings.captcha_prefetch and start is not None and start != prefetched_for
+                and task is not None and task.data['status'] != 'pending'):
+            until_prefetch = start - CAPTCHA_PREFETCH_LEAD_SECONDS - now
+            if until_prefetch > 0:
+                deadlines.append(until_prefetch)
         if pending_check_due > timer():
             deadlines.append(pending_check_due - timer())
         return min([SCAN_INTERVAL, *deadlines])
 
     def query_mine() -> list[dict[str, Any]]:
+        """Event-driven "my activities" refresh through its owner; returns the newest snapshot.
+
+        The history reader has no periodic schedule: this is the query path used by
+        authentication and pending confirmation. A failed refresh
+        never invalidates the previous snapshot: there is no time-based validity window, and the
+        caller decides whether the last known history is still usable.
+        """
         nonlocal history_request, last_mine_started
         assert client is not None
         if not background_poller:
@@ -1161,25 +1091,31 @@ def run(settings: Settings, *, session: Any = None,
                 reader_stopped('history', failed)
             raise_reader_error(failed)
             raise QueryInFlight
-        if history_request is None or history_request[0] is not poller:
-            history_request = (poller, poller.request_refresh())
-        snapshot, version = poller.snapshot_with_version()
-        if snapshot is None or version < history_request[1]:
-            raise QueryInFlight
-        raise_reader_error(snapshot)
-        if not 0 <= clock() - snapshot.at <= history_max_age():
-            history_request = (poller, poller.request_refresh())
-            raise QueryInFlight
         after = (max(float(task.data.get('pending_since', 0)), pending_read_after or 0)
                  if task and task.data['status'] == 'pending' else 0)
-        if (getattr(snapshot, 'started', 0) or snapshot.at) < after:
+        snapshot, version = poller.snapshot_with_version()
+        if after > 0 and history is not None and snapshot is not None and snapshot.error is None:
+            started = getattr(snapshot, 'started', 0) or snapshot.at
+            if started == last_mine_started and started >= after and snapshot.at == mine_at:
+                return history
+        if history_request is None or history_request[0] is not poller:
+            history_request = (poller, poller.request_refresh())
+            snapshot, version = poller.snapshot_with_version()
+        if snapshot is None or (history_request is not None and version < history_request[1]):
+            raise QueryInFlight
+        if snapshot.error is not None:
+            # Let the next check track the reader's retry instead of consuming the same failure.
+            history_request = None
+            raise_reader_error(snapshot)
+        started = getattr(snapshot, 'started', 0) or snapshot.at
+        if started < after:
             history_request = (poller, poller.request_refresh())
             raise QueryInFlight
         if not accept_background_history(snapshot):
             history_request = None
             raise RemoteError('business_rows_invalid')
         history_request = None
-        last_mine_started = getattr(snapshot, 'started', 0) or snapshot.at
+        last_mine_started = started
         return list(snapshot.rows)
 
     def raise_reader_error(snapshot: Any) -> None:
@@ -1192,8 +1128,7 @@ def run(settings: Settings, *, session: Any = None,
         reason = getattr(snapshot, 'reason', None) or 'network_failure'
         if snapshot.error == 'AuthenticationExpired':
             raise AuthenticationExpired(reason)
-        raise RemoteError(reason, snapshot.retry_after,
-                          http_status=429 if snapshot.server_directed else None)
+        raise ReaderFailure(reason)
 
     def reader_recovered(reader: str) -> None:
         missing_readers.discard(reader)
@@ -1259,6 +1194,7 @@ def run(settings: Settings, *, session: Any = None,
             print('event=read_only_complete', flush=True)
             return 0
         task = checkpoint if checkpoint is not None else Task(settings.state_dir, environ.get('SEU_USERNAME', ''))
+        goal_reported = bool(task.data.get('goal_reported'))
         # One startup rotation, before the scan writes any diagnostic: never while running.
         rotate_diagnostics(settings.state_dir)
         if settings.trust_device:
@@ -1292,12 +1228,14 @@ def run(settings: Settings, *, session: Any = None,
                     attempts=legacy_hold.get('attempts', 0), confirmed=False))
                 task.data.pop('hold', None)
                 task.save()
+        if normalize_hold_deadlines(hold_entries()):
+            task.save()
         checkpoint = task
         def defer(seconds: float, *, server_directed: bool = False) -> None:
             if server_directed:
                 wait_gate.record(seconds)
             checkpoint.data['retry_at'] = clock() + seconds
-            checkpoint.data['retry_server'] = server_directed
+            checkpoint.data['retry_server'] = True
             checkpoint.save()
             health(phase='backoff', next_check_at=checkpoint.data['retry_at'])
             pause(seconds)
@@ -1311,14 +1249,16 @@ def run(settings: Settings, *, session: Any = None,
                     and task.data.pop('pending_checks', None) is not None):
                 task.save()
 
+        if task.data['cooldowns']:
+            task.data['cooldowns'] = {}
+            task.save()
         remaining = task.data.get('retry_at', 0) - clock()
-        if remaining > 0:
-            # Older snapshots could hold a generic 20-300 s wait; only a server-directed
-            # (Retry-After) wait may survive a restart at its full length.
-            server_directed = task.data.get('retry_server') is True
-            if not server_directed:
-                remaining = min(remaining, OVERLOAD_RETRY_CAP)
-            defer(remaining, server_directed=server_directed)
+        if remaining > 0 and task.data.get('retry_server') is True:
+            defer(remaining, server_directed=True)
+        elif task.data.get('retry_at') or 'retry_server' in task.data:
+            task.data['retry_at'] = 0
+            task.data.pop('retry_server', None)
+            task.save()
         authenticated = False
         failures = 0
         unconfirmed_checks = 0
@@ -1327,77 +1267,13 @@ def run(settings: Settings, *, session: Any = None,
         # so a process-local flag would announce the same episode again in both cases.
         # It is cleared whenever a new pending episode starts and whenever one is resolved.
         last_timing_at = 0.0
-        server_offset = 0.0
-        offset_known = False
-        # Conservative error of the school-clock estimate: the school timestamp is truncated to a
-        # whole second and is computed after the response arrives, so the true opening can be up
-        # to this much earlier than ``start - server_offset``. Preparation uses the earliest
-        # plausible time, never a later one.
-        school_clock_margin = 0.0
         history: list[dict[str, Any]] | None = None
         mine_at = 0.0
         mine_seconds = 0.0
         refresh_mine = False
-        progress_probe_attempted = False
 
-        # Preparation state is keyed by the school opening timestamp (stable across scans), not by
-        # the locally adjusted time: the school-clock offset is re-estimated from a second-
-        # truncated field and jitters, so a local key would repeat preparation for one opening.
-        scheduled_openings: dict[float, float] = {}
-        scheduled_margins: dict[float, float] = {}
-        calibrated_openings: set[float] = set()
-        preparation_skipped: set[float] = set()
-
-        def next_opening() -> tuple[float, float] | None:
-            """Earliest opening that has not started yet (school clock basis).
-
-            Preparation must target the next not-yet-open lecture, not an already-open window
-            that is still running: selecting a past start makes ``prepare_opening`` bail out and
-            skips prewarm/prefetch for a later lecture in the same fast-polling period.
-            """
-            school_now = clock() + server_offset
-            future = [window for window in known_openings if window[0] > school_now - 1.0]
-            return min(future) if future else None
-
-        def opening_local_estimate(start: float) -> float:
-            """Earliest plausible local time of one opening, fixed on first sight.
-
-            The school timestamp is second-truncated and read after the response arrives, so
-            ``start - server_offset`` can be later than the true opening; subtracting a margin
-            turns that systematic error into an earlier (safe) preparation deadline. The
-            estimate may be recomputed only when the school clock first becomes known or when
-            the measured margin grows, never later than a prior estimate.
-            """
-            margin = school_clock_margin if offset_known else 0.0
-            previous = scheduled_openings.get(start)
-            previous_margin = scheduled_margins.get(start, -1.0)
-            if previous is None or (offset_known and (
-                    start not in calibrated_openings or margin > previous_margin + 0.05)):
-                previous = earliest_opening_local(start, server_offset, margin, previous)
-                scheduled_openings[start] = previous
-                scheduled_margins[start] = margin
-            if offset_known:
-                calibrated_openings.add(start)
-            return previous
-
-        def align_poller() -> None:
-            """Ask the poller to place one poll right on the next opening instant.
-
-            Off by default: after the school clock is calibrated the target is the earliest
-            plausible opening (start - offset - margin), so it errs earlier; before calibration
-            the raw school timestamp may still be off. Enable with SEU_POLLER_ALIGN only after
-            real-run measurement.
-            """
-            if not settings.poller_align:
-                return
-            if offset_known and school_clock_margin > PREPARATION_MAX_UNCERTAINTY:
-                return
-            poller = activity_poller
-            align = getattr(poller, 'align_at', None)
-            if poller is None or align is None:
-                return
-            opening = next_opening()
-            align(None if opening is None else opening_local_estimate(opening[0]))
+        def next_opening(now: float) -> float | None:
+            return min((start for start, _ in known_openings if start > now), default=None)
 
         def background_client(reader: str) -> Client:
             clone = client.clone_readonly()
@@ -1405,54 +1281,45 @@ def run(settings: Settings, *, session: Any = None,
             return clone
 
         def background_read(reader: str, clone: Client) -> list[dict[str, Any]]:
-            clone.timeout = read_policy(known_openings, clock() + server_offset).timeout
-            return clone.activities() if reader == 'activities' else clone.mine()
+            if reader == 'activities':
+                clone.timeout = read_policy(known_openings, clock()).timeout
+                return clone.activities()
+            clone.timeout = HISTORY_TIMEOUT
+            rows = clone.mine()
+            invalid = background_history_usable(rows, clock())
+            if invalid is not None:
+                raise RemoteError(invalid)
+            return rows
 
         def reader_retry(failures: int, snapshot: Any) -> float:
-            if (opening_intervals(known_openings, clock() + server_offset) is not None
-                    and snapshot is not None and snapshot.reason in FAST_RETRY_REASONS):
-                return OPENING_POLLER_RETRY
-            return short_backoff(failures)
+            if snapshot is not None and (snapshot.server_directed or snapshot.reason == 'service_unavailable'):
+                return short_backoff(failures)
+            return 0.0
 
-        def history_interval() -> float | None:
-            if not settings.history_background:
-                return None
-            return read_policy(known_openings, clock() + server_offset).history_interval
+        def captcha_max_age() -> float:
+            return (SUBMIT_TIMEOUT if opening_intervals(
+                known_openings, clock()) is not None else 10.0)
 
-        def history_max_age() -> float:
-            policy = read_policy(known_openings, clock() + server_offset)
-            return (OPENING_HISTORY_TTL if not settings.history_background and opening_scan
-                    else policy.history_max_age)
-
-        def trigger_history_refresh() -> bool:
-            """Ask the history thread to refresh now, throttled; True when a request was sent."""
-            nonlocal history_refresh_at, history_refresh_poller
+        def trigger_history_refresh() -> None:
+            """Notify the history owner after a confirmed reservation, without waiting."""
             poller = history_poller
-            refresh = getattr(poller, 'request_refresh', None)
-            if poller is None or not poller.running or not callable(refresh):
-                return False
-            if poller is not history_refresh_poller:
-                # A recreated reader must not inherit the old reader's throttle window.
-                history_refresh_poller = poller
-                history_refresh_at = 0.0
-            now = clock()
-            if now - history_refresh_at < HISTORY_REFRESH_MIN_INTERVAL:
-                return False
-            history_refresh_at = now
-            refresh()
-            return True
+            if poller is not None and poller.running:
+                poller.request_refresh()
 
         def accept_background_history(snapshot: Any) -> bool:
-            """Consume one fresh, structurally valid history snapshot; True when accepted."""
+            """Consume one structurally valid history snapshot; True when accepted.
+
+            There is no time-based validity: an accepted snapshot stays authoritative until the
+            next refresh event (or a process restart). Manual school-side changes are therefore
+            observed only after an event or a restart.
+            """
             nonlocal history, mine_at, mine_seconds, refresh_mine, history_request
             if snapshot is None or snapshot.error is not None:
                 return False
-            if not (0 <= clock() - snapshot.at <= history_max_age()):
-                return False
             rows = list(snapshot.rows)
-            invalid = background_history_usable(rows, clock() + server_offset)
+            invalid = background_history_usable(rows, clock())
             if invalid is not None:
-                diagnostic('history_background_invalid', reason=invalid)
+                diagnostic('history_invalid', reason=invalid)
                 return False
             reader_recovered('history')
             history = rows
@@ -1461,7 +1328,8 @@ def run(settings: Settings, *, session: Any = None,
             remember_reservations(rows, mine_at)
             mine_seconds = getattr(snapshot, 'seconds', 0.0) or 0.0
             refresh_mine = True
-            diagnostic('history_background_used', age_seconds=round(clock() - mine_at, 3))
+            diagnostic('history_refreshed', seconds=round(mine_seconds, 3),
+                       rows=len(rows), source='event')
             return True
 
         def reader_stopped(reader: str, snapshot: Any) -> None:
@@ -1494,7 +1362,6 @@ def run(settings: Settings, *, session: Any = None,
                 return
             if activity_poller is not None and activity_poller.running:
                 update_reader_policy('activities', activity_poller)
-                align_poller()
                 return
             if activity_poller is not None:
                 snapshot = activity_poller.snapshot()
@@ -1517,14 +1384,9 @@ def run(settings: Settings, *, session: Any = None,
                                              gate=wait_gate,
                                              on_exit=functools.partial(close_session, session),
                                              on_update=functools.partial(work_updated.set, 'activities'), retry_delay=reader_retry,
-                                             name='activities-reader',
-                                             on_align=lambda target, actual, delta: diagnostic(
-                                                 'poller_aligned', target=round(target, 3),
-                                                 actual=round(actual, 3),
-                                                 delta_seconds=round(delta, 3)))
+                                             name='activities-reader')
             activity_poller.start()
             update_reader_policy('activities', activity_poller)
-            align_poller()
 
         def sync_history_poller() -> None:
             """Keep one history owner alive while authenticated."""
@@ -1538,8 +1400,14 @@ def run(settings: Settings, *, session: Any = None,
             if reader_draining('history'):
                 return
             if history_poller is not None and history_poller.running:
-                update_reader_policy('history', history_poller)
                 absorb_history_wait()
+                if settings.prewarm:
+                    now = clock()
+                    entering = {start for start, end in known_openings
+                                if in_fast_opening(start, end, now)} - prewarmed_openings
+                    if entering and history_poller.request_refresh():
+                        prewarmed_openings.update(entering)
+                        diagnostic('prewarm_history_requested')
                 return
             if history_poller is not None:
                 snapshot = history_poller.snapshot()
@@ -1564,27 +1432,39 @@ def run(settings: Settings, *, session: Any = None,
                 return
             session = getattr(history_client, 'session', None)
             history_poller = new_history_poller(functools.partial(background_read, 'history', history_client),
-                                                interval=history_interval,
+                                                interval=None,
                                                 clock=clock, gate=wait_gate,
                                                 on_exit=functools.partial(close_session, session),
-                                                on_update=functools.partial(work_updated.set, 'history'), retry_delay=reader_retry)
+                                                on_update=functools.partial(work_updated.set, 'history'),
+                                                retry_delay=reader_retry, retry_interval=query_interval)
             history_poller.start()
-            update_reader_policy('history', history_poller)
 
         def update_reader_policy(reader: str, poller: ActivityPoller) -> None:
-            policy = read_policy(known_openings, clock() + server_offset)
+            policy = read_policy(known_openings, clock())
             old = reader_policies.get(reader)
             reader_policies[reader] = policy
             reschedule = getattr(poller, 'reschedule', None)
-            if (old is not None and old != policy and reschedule is not None
-                    and (reader == 'activities' or settings.history_background)):
+            if reader == 'activities' and old is not None and old != policy and reschedule is not None:
                 reschedule()
 
         def query_interval() -> float:
-            return scan_delay([], clock() + server_offset, 0, SCAN_INTERVAL, known_openings)[0]
+            return scan_delay([], clock(), 0, SCAN_INTERVAL, known_openings)[0]
 
         def list_snapshot_max_age() -> float:
-            return read_policy(known_openings, clock() + server_offset).list_max_age
+            return read_policy(known_openings, clock()).list_max_age
+
+        def list_snapshot(*, for_scan: bool) -> tuple[Any, int]:
+            poller = activity_poller
+            if poller is None:
+                return None, 0
+            if for_scan:
+                cached = getattr(poller, 'snapshot_for_scan', None)
+                if cached is not None:
+                    return cached()
+            versioned = getattr(poller, 'snapshot_with_version', None)
+            if versioned is not None:
+                return versioned()
+            return poller.snapshot(), getattr(poller, 'polls', 0)
 
         def list_rows(*, after: float = 0.0) -> tuple[list[dict[str, Any]], float, str, float, float, float]:
             """Consume a fresh owner snapshot; direct reads are an offline test adapter.
@@ -1596,16 +1476,7 @@ def run(settings: Settings, *, session: Any = None,
             nonlocal consumed_polls, last_rows_started, rows_snapshot_at
             poller = activity_poller
 
-            def current_pair() -> tuple[Any, Any]:
-                versioned = getattr(poller, 'snapshot_with_version', None)
-                if poller is not None and versioned is not None:
-                    # Snapshot and version must come from the same lock: otherwise a poll landing
-                    # between the two reads is marked consumed although its rows were never seen.
-                    return versioned()
-                return (poller.snapshot() if poller is not None else None,
-                        getattr(poller, 'polls', 0))
-
-            snapshot, version = current_pair()
+            snapshot, version = list_snapshot(for_scan=not after)
             if (poller is not None and snapshot is not None and snapshot.error is None
                     and 0 <= clock() - snapshot.at <= list_snapshot_max_age()
                     and (getattr(snapshot, 'started', 0) or snapshot.at) >= after):
@@ -1619,7 +1490,7 @@ def run(settings: Settings, *, session: Any = None,
             if background_poller:
                 reader_missing('activities')
                 poller_wait_error()
-                raise_reader_error(snapshot)
+                raise_reader_error(poller.snapshot() if poller is not None else None)
                 if after and poller is not None and poller.running:
                     poller.request_refresh()
                 return [], 0.0, 'none', 0.0, 0.0, 0.0
@@ -1633,14 +1504,7 @@ def run(settings: Settings, *, session: Any = None,
         def newer_poller_rows() -> tuple[
                 list[dict[str, Any]], str, float, float, float, int, float, float] | None:
             """Newest fresh poller rows if they are newer than the rows already in hand."""
-            poller = activity_poller
-            if poller is None:
-                return None
-            versioned = getattr(poller, 'snapshot_with_version', None)
-            if versioned is not None:
-                snapshot, version = versioned()
-            else:
-                snapshot, version = poller.snapshot(), getattr(poller, 'polls', 0)
+            snapshot, version = list_snapshot(for_scan=True)
             if snapshot is None or snapshot.error is not None:
                 return None
             age = clock() - snapshot.at
@@ -1653,13 +1517,15 @@ def run(settings: Settings, *, session: Any = None,
                     getattr(snapshot, 'seconds', 0.0) or 0.0,
                     max(0.0, clock() - started), version, snapshot.at, started)
 
-        # Opening preparation: one warmed history refresh and one prefetched captcha per opening.
-        prewarmed: set[float] = set()
+        # Up to two captcha prefetch attempts per opening also warm the main session connection.
         prefetched_code: str | None = None
+        unsubmitted_captcha: tuple[PreparedCaptcha, float] | None = None
         prefetched_at = 0.0
         prefetched_seconds = 0.0
         prefetched_ocr_seconds = 0.0
         prefetched_for = 0.0
+        prefetch_attempts: dict[float, int] = {}
+        prefetch_skipped: set[float] = set()
 
         def captcha_fetch(budget: float) -> Callable[[], PreparedCaptcha]:
             nonlocal recognize
@@ -1675,14 +1541,17 @@ def run(settings: Settings, *, session: Any = None,
                 if server_wait > 0:
                     raise RemoteError('server_backoff', server_wait, http_status=429)
                 saved_timeout = client.timeout
-                client.timeout = min(float(saved_timeout), available)
+                client.timeout = available
                 try:
                     started = clock()
                     binary = client.captcha()
                     fetched_at = clock()
                     seconds = max(0.0, fetched_at - started)
                     ocr_started = clock()
-                    code = recognizer(binary).strip()
+                    try:
+                        code = recognizer(binary).strip()
+                    except Exception:
+                        raise RemoteError('ocr_failed') from None
                     return PreparedCaptcha(code, fetched_at, seconds,
                         max(0.0, clock() - ocr_started), client.last_connect_seconds,
                         timer() > expires)
@@ -1691,12 +1560,13 @@ def run(settings: Settings, *, session: Any = None,
             return fetch
 
         def dispatch_captcha(fetch: Callable[[], PreparedCaptcha], *, source: str) -> None:
-            nonlocal captcha_worker, preparation, preparation_source, prefetched_code
+            nonlocal captcha_worker, preparation, preparation_source, prefetched_code, unsubmitted_captcha
             poller_wait_error()
             if captcha_worker is None:
                 captcha_worker = CaptchaWorker(functools.partial(work_updated.set, 'captcha'))
             captcha_worker.submit(fetch, generation=authentication_generation)
             prefetched_code = None
+            unsubmitted_captcha = None
             preparation, preparation_source = captcha_worker, source
             diagnostic('captcha_job_started', source=source, job=captcha_worker.number,
                        generation=authentication_generation)
@@ -1721,27 +1591,30 @@ def run(settings: Settings, *, session: Any = None,
             result = completed.result()
             if completed.generation != authentication_generation:
                 raise AuthenticationExpired('business_authentication_expired')
-            if result.expired or not 0 <= clock() - result.at <= CAPTCHA_PREFETCH_MAX_AGE:
+            if result.expired or not 0 <= clock() - result.at <= captcha_max_age():
                 raise RemoteError('network_timeout')
             return result
 
         def consume_captcha_updates() -> None:
             poller_wait_error()
-            for reader in (activity_poller, history_poller):
-                reader_snapshot = reader.snapshot() if reader is not None else None
-                raise_reader_error(reader_snapshot)
+            # Reader failures do not invalidate a captcha. The main thread checks the list again
+            # before submitting, and only an authentication change invalidates the session.
+            activities_snapshot = activity_poller.snapshot() if activity_poller is not None else None
             history_snapshot = history_poller.snapshot() if history_poller is not None else None
-            if history_snapshot is not None and history_snapshot.at > mine_at:
-                if not accept_background_history(history_snapshot):
-                    raise ValueError('invalid_activity_data')
+            for result in (activities_snapshot, history_snapshot):
+                if result is not None and result.error == 'AuthenticationExpired':
+                    raise_reader_error(result)
+            if (history_snapshot is not None and history_snapshot.error is None
+                    and history_snapshot.at > mine_at):
+                accept_background_history(history_snapshot)
 
-        def accept_preparation(result: PreparedCaptcha, opening_at: float) -> None:
+        def accept_preparation(result: PreparedCaptcha, opening_at: float) -> bool:
             nonlocal prefetched_code, prefetched_at, prefetched_seconds, prefetched_ocr_seconds
             if result.expired:
                 diagnostic('captcha_prefetch_failed', reason='deadline_expired')
             elif not result.code or not result.code.isascii() or not result.code.isalnum() or len(result.code) > 16:
                 diagnostic('captcha_prefetch_invalid')
-            elif not 0 <= clock() - result.at <= CAPTCHA_PREFETCH_MAX_AGE:
+            elif not 0 <= clock() - result.at <= CAPTCHA_PREFETCH_TIMEOUT:
                 diagnostic('captcha_prefetch_stale', age_seconds=round(clock() - result.at, 3))
             else:
                 prefetched_code, prefetched_at = result.code, result.at
@@ -1749,101 +1622,128 @@ def run(settings: Settings, *, session: Any = None,
                 diagnostic('captcha_prefetched', seconds=round(result.seconds, 3),
                     ocr_seconds=round(result.ocr_seconds, 3), lead_seconds=round(opening_at-result.at, 3),
                     connect_seconds=round(result.connect_seconds, 3) if result.connect_seconds is not None else None)
+                return True
+            return False
 
         def collect_preparation(*, discard: bool = False) -> None:
-            nonlocal preparation
+            nonlocal preparation, prefetched_for
             if preparation is None or not preparation.ready:
                 return
             completed, preparation = preparation, None
+            source = preparation_source
+            attempt = prefetch_attempts.get(prefetched_for, 0) or None
             discard = (discard or completed.generation != authentication_generation
-                       or preparation_source != 'prefetch')
-            failed_event = ('captcha_prefetch_failed' if preparation_source == 'prefetch'
-                            else 'captcha_job_discarded')
+                       or source != 'prefetch')
+            failed_event = 'captcha_prefetch_failed' if source == 'prefetch' else 'captcha_job_discarded'
             try:
                 result = completed.result()
-                if not discard:
-                    accept_preparation(result, opening_local_estimate(prefetched_for))
-                else:
-                    diagnostic('captcha_job_discarded', source=preparation_source,
+                if discard:
+                    diagnostic('captcha_job_discarded', source=source,
                                job=completed.number, generation=completed.generation)
+                elif not accept_preparation(result, prefetched_for):
+                    # A failed prefetch attempt may be retried once per opening.
+                    prefetched_for = 0.0
             except (RemoteError, ValueError) as exc:
-                if not discard and (isinstance(exc, AuthenticationExpired) or server_wait_error(exc)):
+                if not discard and (isinstance(exc, AuthenticationExpired) or server_directed_error(exc)):
                     raise
-                diagnostic(failed_event, reason=type(exc).__name__)
+                if not discard:
+                    prefetched_for = 0.0
+                diagnostic(failed_event, reason=type(exc).__name__, attempt=attempt)
             except Exception as exc:
-                diagnostic(failed_event, reason=type(exc).__name__)
+                if not discard:
+                    prefetched_for = 0.0
+                diagnostic(failed_event, reason=type(exc).__name__, attempt=attempt)
 
-        def prepare_opening(opening: tuple[float, float] | None) -> float | None:
-            """Do read-only work that must not sit on the candidate-to-submit path.
-
-            Returns the local-clock time of the next pending piece of work so the scan loop can
-            wake exactly then; None when nothing is pending. History only enqueues a refresh;
-            captcha I/O lends the main session to one bounded preparation task.
-            """
-            nonlocal prefetched_code, prefetched_at, prefetched_seconds, prefetched_ocr_seconds
-            nonlocal prefetched_for, preparation
-            if opening is None:
+        def prepare_opening(start: float | None) -> float | None:
+            """Start prefetch or return its scheduled wake time."""
+            nonlocal prefetched_for
+            if start is None:
                 return None
-            start = opening[0]
-            if offset_known and school_clock_margin > PREPARATION_MAX_UNCERTAINTY:
-                if start not in preparation_skipped:
-                    preparation_skipped.add(start)
-                    diagnostic('preparation_skipped', reason='clock_uncertainty',
-                               uncertainty=round(school_clock_margin, 3))
-                return None
-            open_local = opening_local_estimate(start)
-            if open_local < clock() - 1.0:
-                return None
-            deadline: float | None = None
-            if settings.prewarm and start not in prewarmed:
+            if (settings.captcha_prefetch and recognize is not None and preparation is None
+                    and prefetch_attempts.get(start, 0) < CAPTCHA_PREFETCH_ATTEMPTS
+                    and prefetched_for != start):
                 now = clock()
-                remaining = open_local - now
-                if now < open_local - PREWARM_LEAD_SECONDS:
-                    if remaining > PREWARM_MIN_REMAINING:
-                        deadline = open_local - PREWARM_LEAD_SECONDS
-                elif remaining > PREWARM_MIN_REMAINING:
-                    if trigger_history_refresh():
-                        prewarmed.add(start)
-                        diagnostic('prewarm_history_requested')
-            if (settings.captcha_prefetch and recognize is not None
-                    and prefetched_for != start and preparation is None):
-                # Recompute before captcha I/O; the history refresh above only enqueues work.
-                now = clock()
-                remaining = open_local - now
-                target = open_local - CAPTCHA_PREFETCH_LEAD_SECONDS
+                remaining = start - now
+                target = start - CAPTCHA_PREFETCH_LEAD_SECONDS
                 if now < target:
-                    if remaining > CAPTCHA_PREFETCH_MIN_REMAINING:
-                        deadline = target if deadline is None else min(deadline, target)
-                elif remaining > CAPTCHA_PREFETCH_MIN_REMAINING:
+                    return target
+                if remaining > CAPTCHA_PREFETCH_MIN_REMAINING:
+                    consume_captcha_updates()
                     # Only prefetch before the opening instant; once it has started a candidate
                     # may already be waiting, so fetching off the path would only add requests.
                     prefetched_for = start
-                    poller_wait_error()
-                    # The whole prefetch must finish by the opening instant; otherwise the submit
-                    # path fetches fresh and this attempt has only cost a bounded delay.
-                    budget = max(0.15, min(CAPTCHA_PREFETCH_TIMEOUT, remaining - 0.03))
-                    fetch = captcha_fetch(budget)
+                    prefetch_attempts[start] = prefetch_attempts.get(start, 0) + 1
+                    attempt = prefetch_attempts[start]
+                    # The remaining lead sets when the job starts, not its TLS and read budget.
+                    fetch = captcha_fetch(CAPTCHA_PREFETCH_TIMEOUT)
                     if background_poller:
                         dispatch_captcha(fetch, source='prefetch')
-                        diagnostic('captcha_prefetch_started')
+                        diagnostic('captcha_prefetch_started', attempt=attempt,
+                                   lead_seconds=round(remaining, 3))
                     else:
                         # The direct adapter keeps deterministic clocks and fake sessions single-threaded.
                         try:
-                            accept_preparation(fetch(), open_local)
+                            if not accept_preparation(fetch(), start):
+                                prefetched_for = 0.0
                         except (RemoteError, ValueError) as exc:
-                            if isinstance(exc, AuthenticationExpired) or server_wait_error(exc):
+                            if isinstance(exc, AuthenticationExpired) or server_directed_error(exc):
                                 raise
-                            diagnostic('captcha_prefetch_failed', reason=type(exc).__name__)
+                            prefetched_for = 0.0
+                            diagnostic('captcha_prefetch_failed', reason=type(exc).__name__,
+                                       attempt=attempt)
                         except Exception as exc:
-                            diagnostic('captcha_prefetch_failed', reason=type(exc).__name__)
-            return deadline
+                            prefetched_for = 0.0
+                            diagnostic('captcha_prefetch_failed', reason=type(exc).__name__,
+                                       attempt=attempt)
+                elif start not in prefetch_skipped:
+                    prefetch_skipped.add(start)
+                    diagnostic('captcha_prefetch_skipped', reason='insufficient_remaining',
+                               remaining=round(remaining, 3))
+            elif settings.captcha_prefetch and recognize is None and start not in prefetch_skipped:
+                prefetch_skipped.add(start)
+                diagnostic('captcha_prefetch_skipped', reason='no_recognizer')
+            return None
+
+        def warm_main_session(start: float) -> None:
+            """Leave a pooled connection on the session that captcha prefetch and submit share.
+
+            The request is a normal list read whose body is consumed normally, so the keep-alive
+            connection returns to the pool. A failure is only diagnosed: the prefetch still runs
+            on its own schedule, and a server-directed wait is left to the normal scan backoff.
+            """
+            now = clock()
+            budget = min(MAIN_SESSION_WARM_TIMEOUT,
+                         start - CAPTCHA_PREFETCH_LEAD_SECONDS - now - MAIN_SESSION_WARM_MARGIN)
+            if budget < CAPTCHA_PREFETCH_MIN_REMAINING:
+                return
+            saved_timeout = client.timeout
+            client.timeout = budget
+            started = clock()
+            try:
+                client.activities()
+            except (AuthenticationExpired, AuthenticationRejected):
+                raise
+            except RemoteError as exc:
+                diagnostic('main_session_warm_failed', reason=str(exc),
+                           seconds=round(max(0.0, clock() - started), 3))
+                if server_backoff_error(exc):
+                    raise
+            except Exception as exc:
+                diagnostic('main_session_warm_failed', reason=type(exc).__name__,
+                           seconds=round(max(0.0, clock() - started), 3))
+            else:
+                diagnostic('main_session_warmed',
+                           seconds=round(max(0.0, clock() - started), 3),
+                           connect_seconds=(round(client.last_connect_seconds, 3)
+                                            if client.last_connect_seconds is not None else None))
+            finally:
+                client.timeout = saved_timeout
 
         previous_selection = task.data.get('selection')
         details: list[dict[str, Any]] = (previous_selection.get('activities', [])
                                          if isinstance(previous_selection, dict) else [])
-        known_targets = merge_openings({}, details, clock() + server_offset)
+        known_targets = merge_openings({}, details, clock())
         known_openings = sorted(set(opening_windows(list(known_targets.values()))))[:128]
-        last_opening_mode = False
         while True:
             try:
                 work_updated.clear()
@@ -1851,12 +1751,9 @@ def run(settings: Settings, *, session: Any = None,
                 flush_mail()
                 collect_preparation(discard=not authenticated)
                 scan_started = clock()
-                school_now = clock() + server_offset
-                known_openings = [window for window in known_openings if window[1] >= school_now - 1]
-                opening_scan = opening_intervals(known_openings, school_now) is not None
-                if opening_scan and not last_opening_mode:
-                    trigger_history_refresh()
-                last_opening_mode = opening_scan
+                now = clock()
+                known_openings = [window for window in known_openings if window[1] >= now - 1]
+                opening_scan = opening_intervals(known_openings, now) is not None
                 if preparation is None:
                     client.timeout = OPENING_QUERY_TIMEOUT if opening_scan else 10
                 activities_source = 'query'
@@ -1886,27 +1783,10 @@ def run(settings: Settings, *, session: Any = None,
                     stop_poller()
                     sync_poller()
                     stop_history_poller()
+                    # Starting the new owner is the login refresh; don't request it twice.
                     sync_history_poller()
-                if (opening_scan and settings.history_background and background_poller
-                        and history_poller is not None and history_poller.running):
-                    # Ask for a replacement before candidates need the expired history.
-                    background_snapshot = history_poller.snapshot()
-                    background_fresh = (background_snapshot is not None
-                                        and background_snapshot.error is None
-                                        and 0 <= clock() - background_snapshot.at
-                                        <= HISTORY_BACKGROUND_FRESH)
-                    cache_fresh = (history is not None
-                                   and 0 <= clock() - mine_at < HISTORY_BACKGROUND_FRESH)
-                    if not background_fresh and not cache_fresh:
-                        trigger_history_refresh()
-                # Holds store local-clock deadlines. Once the school clock is known, tighten any
-                # hold created before calibration to the activity start converted into the host
-                # clock. This also runs while a submission is pending: a hold can outlive the
-                # pending check, and waiting for it to resolve would keep the full 600 s fallback.
-                holds_now = hold_entries()
-                adjusted = tighten_hold_deadlines(holds_now, offset_known=offset_known,
-                                                  server_offset=server_offset)
                 if task.data['status'] != 'pending':
+                    holds_now = hold_entries()
                     now = clock()
                     expired = [wid for wid, entry in holds_now.items()
                                if isinstance(entry, dict) and now >= float(entry.get('until', 0))]
@@ -1914,9 +1794,8 @@ def run(settings: Settings, *, session: Any = None,
                         holds_now.pop(wid, None)
                         diagnostic('reservation_hold_expired', wid=wid)
                         record('reservation_hold_expired')
-                    adjusted = adjusted or bool(expired)
-                if adjusted:
-                    task.save()
+                    if expired:
+                        task.save()
                 confirmed = False
                 mine_seconds = 0.0
                 refresh_mine = False
@@ -1959,11 +1838,7 @@ def run(settings: Settings, *, session: Any = None,
                                               else pending_since)
                     if (poller_snapshot is not None and poller_snapshot.error is None
                             and poller_snapshot.at >= pending_evidence_after
-                            and poller_snapshot.rows):
-                        # Contradictory duplicate rows cannot confirm the submission, nor can
-                        # they prove absence: pause instead of trusting either row.
-                        if conflicting_records(poller_snapshot.rows):
-                            abandon_check(RemoteError('activity_schema_unknown'))
+                            and poller_snapshot.rows and not conflicting_records(poller_snapshot.rows)):
                         for row in poller_snapshot.rows:
                             try:
                                 row_wid = activity_id(row)
@@ -1972,7 +1847,7 @@ def run(settings: Settings, *, session: Any = None,
                             if row_wid != pending_wid:
                                 continue
                             try:
-                                judged = Lecture.read(row, now=clock() + server_offset)
+                                judged = Lecture.read(row, now=clock())
                             except ValueError:
                                 break
                             if judged.availability == 'already_reserved':
@@ -1991,8 +1866,7 @@ def run(settings: Settings, *, session: Any = None,
                         positive = history_poller.snapshot() if history_poller is not None else None
                         if (positive is not None and positive.error is None
                                 and positive.at >= pending_evidence_after
-                                and 0 <= clock() - positive.at <= history_max_age()
-                                and background_history_usable(positive.rows, clock() + server_offset) is None
+                                and background_history_usable(positive.rows, clock()) is None
                                 and not conflicting_records(positive.rows)
                                 and any(activity_id(row) == pending_wid and confirmed_reservation(row)
                                         for row in positive.rows)
@@ -2007,17 +1881,16 @@ def run(settings: Settings, *, session: Any = None,
                     if pending_read_after is None:
                         pending_read_after = max(pending_since, clock())
 
-                    # Probe the list before requesting history: an unavailable list cannot prove
-                    # absence, so repeated history queries would add no evidence. A failed list is
-                    # different: history may still carry positive evidence, so fall through and let
-                    # the normal error handling abort the check.
+                    # Request both sources for this check. Either can confirm a reservation;
+                    # only a complete pair can count toward releasing an unconfirmed submission.
                     probed_rows: list[dict[str, Any]] | None = None
                     probed_error: BaseException | None = None
                     probed_source = 'none'
-                    probe_none = False
                     if not confirmed and background_poller:
                         try:
                             probed_rows, _, activities_source, _, _, _ = list_rows(after=pending_read_after)
+                            if conflicting_records(probed_rows):
+                                raise RemoteError('activity_schema_unknown')
                             probed_source = activities_source
                         except (RemoteError, ValueError) as exc:
                             probed_rows = None
@@ -2026,15 +1899,7 @@ def run(settings: Settings, *, session: Any = None,
                                 # 429/Retry-After applies to every request: honour it before the
                                 # history query instead of sending one inside the requested wait.
                                 abandon_check(exc)
-                        else:
-                            probe_none = activities_source == 'none'
-                    if probe_none:
-                        # Waiting adds no absence evidence and preserves earlier valid checks.
-                        delay = reader_wait_seconds()
-                        health(phase='waiting', next_check_at=clock() + delay)
-                        sync_poller()
-                        pause_for_update(delay)
-                        continue
+                            reset_pending_checks()
 
                     if not confirmed:
                         health(phase='my_activities', next_check_at=0)
@@ -2052,6 +1917,7 @@ def run(settings: Settings, *, session: Any = None,
                         except (RemoteError, ValueError) as exc:
                             if server_wait_error(exc):
                                 abandon_check(exc)
+                            reset_pending_checks()
                             pending_error = exc
                     if pending_history is not None and conflicting_records(pending_history):
                         # A conflicting "my activities" record is neither success nor absence
@@ -2067,9 +1933,7 @@ def run(settings: Settings, *, session: Any = None,
                     if pending_wid not in booked and not confirmed:
                         health(phase='activities', next_check_at=0)
                         list_error: BaseException | None = None
-                        if probed_rows is not None or probed_error is not None:
-                            # Reuse the probe: neither reading the list twice nor falling back to
-                            # the legacy 'none' branch is needed here.
+                        if background_poller:
                             rows = probed_rows
                             activities_source = probed_source if probed_rows is not None else 'none'
                             list_error = probed_error
@@ -2113,7 +1977,7 @@ def run(settings: Settings, *, session: Any = None,
                                 if row_wid != pending_wid:
                                     continue
                                 try:
-                                    judged = Lecture.read(row, now=clock() + server_offset)
+                                    judged = Lecture.read(row, now=clock())
                                 except ValueError:
                                     source_complete = False
                                     break
@@ -2216,41 +2080,30 @@ def run(settings: Settings, *, session: Any = None,
                         health(phase='confirming', next_check_at=clock() + pause_value)
                         pause_for_update(pause_value)
                         continue
-                # Query the opening-critical list before the slower history refresh: a slow or
-                # failing my-activities endpoint must not hide the next reservation opening.
+                # Consume the last published result without asking the history owner to query.
+                background_history = (history_poller.snapshot()
+                                      if history_poller is not None else None)
+                if (background_poller and not refresh_mine and background_history is not None
+                        and background_history.at > mine_at):
+                    accept_background_history(background_history)
                 health(phase='activities')
-                rows, activities_seconds, activities_source, rows_age, rows_fetch_seconds, \
-                    rows_data_age = list_rows()
-                if activities_source == 'none':
-                    # The owner publishes a wakeup; wait for that result or a real deadline.
-                    delay = reader_wait_seconds()
-                    health(phase='waiting', next_check_at=clock() + delay)
-                    sync_poller()
-                    sync_history_poller()
-                    pause_for_update(delay)
-                    continue
+                try:
+                    rows, activities_seconds, activities_source, rows_age, rows_fetch_seconds, \
+                        rows_data_age = list_rows()
+                    if activities_source == 'none':
+                        raise QueryInFlight
+                except (QueryInFlight, RemoteError) as exc:
+                    if (background_poller and history is not None
+                            and not isinstance(exc, (AuthenticationExpired, AuthenticationRejected))
+                            and not server_directed_error(exc)):
+                        next_preparation_at = prepare_opening(next_opening(clock()))
+                    raise
                 rows_fetched_at = clock()
                 # Start the list reader before the history step: if resolving history takes
                 # seconds, the scan can then consume a newer list snapshot instead of submitting
                 # a candidate from the pre-wait rows.
                 if opening_scan:
                     sync_poller()
-                if school_clock_known(rows, clock()):
-                    server_offset = school_clock_offset(rows, clock())
-                    offset_known = True
-                    # The truncation fraction plus the query round trip can make the estimate
-                    # late by up to ~1s + request time; treat that much as uncertainty.
-                    school_clock_margin = school_clock_uncertainty(rows_age, rows_fetch_seconds)
-                # Prune cooldowns only after the school clock is known: on restart the stored
-                # deadlines are in school time, and pruning them against an uncalibrated local
-                # clock would delete still-valid cooldowns when the school clock runs behind.
-                if offset_known:
-                    school_now = clock() + server_offset
-                    fresh = {wid: until for wid, until in task.data['cooldowns'].items()
-                             if until > school_now}
-                    if len(fresh) != len(task.data['cooldowns']):
-                        task.data['cooldowns'] = fresh
-                        task.save()
                 if task.data['status'] != 'pending' and hold_entries():
                     if conflicting_records(rows):
                         # A contradictory list cannot confirm a hold before the normal
@@ -2265,7 +2118,7 @@ def run(settings: Settings, *, session: Any = None,
                             if row_wid != held_wid:
                                 continue
                             try:
-                                judged = Lecture.read(row, now=clock() + server_offset)
+                                judged = Lecture.read(row, now=clock())
                             except ValueError:
                                 break
                             if (judged.availability == 'already_reserved'
@@ -2274,48 +2127,18 @@ def run(settings: Settings, *, session: Any = None,
                                             judged.end.timestamp(), confirmed=True,
                                             source='activity_list', category=judged.category)
                             break
-                background_history = (history_poller.snapshot()
-                                      if history_poller is not None else None)
-                history_ttl = (HISTORY_BACKGROUND_FRESH
-                               if settings.history_background and background_poller
-                               else OPENING_HISTORY_TTL)
-                if not opening_scan:
-                    history_ttl = NORMAL_HISTORY_TTL
-                history_still_fresh = (
-                    history is not None
-                    and 0 <= clock() - mine_at < history_ttl)
-                candidate_refresh = False
-                if history is not None and history_still_fresh and not opening_scan and not refresh_mine:
-                    cached_progress = progress(progress_rows(history, hold_entries(), clock() + server_offset),
-                                               clock() + server_offset)
-                    possible, _ = select_candidates(rows, settings, cached_progress, history,
-                        task.data['cooldowns'], clock() + server_offset,
-                        cooldown_clock_known=offset_known, holds=hold_views())
-                    if possible:
-                        history_still_fresh = False
-                        candidate_refresh = True
-                used_background_history = False
-                if (background_poller and not candidate_refresh and not refresh_mine and background_history is not None
-                        and (background_history.at > mine_at or not history_still_fresh
-                             or background_history.error is not None)):
-                    # A newer background result must replace the cached history immediately.
-                    used_background_history = accept_background_history(background_history)
-                    if not used_background_history:
-                        history_still_fresh = False
-                if history_still_fresh or used_background_history:
-                    reader_recovered('history')
-                if (background_poller and not refresh_mine and not history_still_fresh):
-                    reader_missing('history')
-                if not used_background_history and not refresh_mine and not history_still_fresh:
+                if history is None:
                     poller_wait_error()
                     health(phase='my_activities', next_check_at=0,
                            activity_count=None, candidate_count=None)
                     mine_started = clock()
+                    if background_poller:
+                        raise_reader_error(background_history)
+                        raise QueryInFlight
                     history = query_mine()
                     if not background_poller:
                         mine_at = clock()
                         mine_seconds = max(0, clock() - mine_started)
-                    refresh_mine = True
                     reader_recovered('history')
                 assert history is not None
                 if conflicting_records(history):
@@ -2339,44 +2162,19 @@ def run(settings: Settings, *, session: Any = None,
                         diagnostic('reservation_hold_synced', wid=held_wid)
                         if not already_confirmed:
                             emit_success(held_wid, 'history')
-                current = progress(progress_rows(history, hold_entries(), clock() + server_offset),
-                                   clock() + server_offset)
-                if current.unresolved != unresolved_reported:
-                    unresolved_reported = current.unresolved
-                    diagnostic('attendance_unresolved', count=len(current.unresolved))
+                current = progress(progress_rows(history, hold_entries(), clock()),
+                                   clock())
                 latest_progress, progress_at = current, mine_at
-                snapshot['progress'] = dict(completed=dict(current.completed), planned=dict(current.planned),
-                                            missing=sorted(current.missing), unresolved=len(current.unresolved),
+                snapshot['progress'] = dict(reserved=dict(current.reserved), total=current.total,
+                                            missing=sorted(current.missing), complete=current.complete,
                                             at=mine_at)
-                if current.done:
-                    newly_completed = task.data['status'] != 'done'
-                    task.data.update(status='done', activity='')
-                    task.save()
-                    final_phase = 'done'
-                    health(phase='done', last_query_at=clock(), failure_count=0)
-                    query_recovered()
-                    clear_alert('task_failed')
-                    if newly_completed:
-                        emit('goal_completed')
-                    return 0
+                if current.complete:
+                    # Reference only: reaching the target never stops new reservations.
+                    report_goal_once()
                 if task.data['status'] == 'done':
+                    # Old state files may still carry the removed terminal status; keep running.
                     task.data.update(status='scanning', activity='')
                     task.save()
-                if not any(current.needs(category) for category in settings.categories):
-                    known_targets.clear()
-                    known_openings.clear()
-                    opening_scan = False
-                    sync_poller()
-                    sync_history_poller()
-                    flush_mail()
-                    failures = 0
-                    delay = random.uniform(SCAN_INTERVAL - 1, SCAN_INTERVAL + 1)
-                    health(phase='waiting_for_attendance', last_query_at=clock(), failure_count=0,
-                           next_check_at=clock() + delay)
-                    query_recovered()
-                    clear_alert('task_failed')
-                    pause_for_update(delay)
-                    continue
                 if clock() - rows_fetched_at > HISTORY_LIST_REFRESH_AFTER:
                     # Resolving history may have taken seconds; do not submit a candidate that the
                     # newer background list snapshot has already shown as full or superseded.
@@ -2385,26 +2183,21 @@ def run(settings: Settings, *, session: Any = None,
                         (rows, activities_source, rows_age, rows_fetch_seconds, rows_data_age,
                          consumed_polls, rows_snapshot_at, last_rows_started) = fresher
                         activities_seconds = 0.0
-                        if school_clock_known(rows, clock()):
-                            server_offset = school_clock_offset(rows, clock())
-                            offset_known = True
-                            school_clock_margin = school_clock_uncertainty(
-                                rows_age, rows_fetch_seconds)
                 candidates, details = select_candidates(rows, settings, current, history,
-                    task.data['cooldowns'], clock() + server_offset,
-                    cooldown_clock_known=offset_known, holds=hold_views())
+                    task.data['cooldowns'], clock(),
+                    holds=hold_views())
                 query_recovered()
                 if not candidates:
                     # No submission step can be attempted in this scan; do not keep an old
                     # captcha/submit failure timer alive while only list queries run.
                     step_recovered()
-                known_targets = merge_openings(known_targets, details, clock() + server_offset)
+                known_targets = merge_openings(known_targets, details, clock())
                 known_openings = sorted(set(opening_windows(list(known_targets.values()))))[:128]
-                opening_scan = opening_intervals(known_openings, clock() + server_offset) is not None
+                opening_scan = opening_intervals(known_openings, clock()) is not None
                 if candidates and preparation is not None:
                     raise QueryInFlight
                 if preparation is None:
-                    client.timeout = SUBMIT_TIMEOUT if opening_scan else 10
+                    client.timeout = captcha_max_age()
                 sync_poller()
                 sync_history_poller()
                 previous_selection = task.data.get('selection')
@@ -2416,13 +2209,21 @@ def run(settings: Settings, *, session: Any = None,
                        candidate_count=len(candidates), phase='captcha' if candidates else 'waiting')
                 wake_at: float | None = None
                 if not candidates and task.data['status'] != 'pending':
-                    wake_at = prepare_opening(next_opening())
+                    if (settings.prewarm and background_poller and authenticated
+                            and preparation is None):
+                        now = clock()
+                        for start in ({start for start, end in known_openings
+                                       if in_fast_opening(start, end, now)}
+                                      - main_warmed_openings):
+                            main_warmed_openings.add(start)
+                            warm_main_session(start)
+                    wake_at = prepare_opening(next_opening(clock()))
                 next_preparation_at = wake_at
                 prefetch_ready = False
                 prefetch_age: float | None = None
                 if prefetched_code is not None:
                     age = clock() - prefetched_at
-                    if 0.0 <= age <= CAPTCHA_PREFETCH_MAX_AGE:
+                    if 0.0 <= age <= CAPTCHA_PREFETCH_TIMEOUT:
                         prefetch_ready = True
                         prefetch_age = age
                     else:
@@ -2441,47 +2242,54 @@ def run(settings: Settings, *, session: Any = None,
                             # The captcha was fetched (and recognised) off the critical path;
                             # submit the candidate immediately.
                             code = prefetched_code
-                            prefetched_code = None
-                            prefetch_ready = False
                             attempt_prefetch_age = prefetch_age
                             captcha_seconds = 0.0
                             ocr_seconds = 0.0
                             captcha_source = 'prefetch'
                         else:
-                            try:
-                                result = fresh_captcha(float(client.timeout))
-                            except RemoteError as exc:
-                                step_failed(clock())
-                                diagnostic('captcha_error', wid=lecture.wid, reason=str(exc),
-                                           attempt=attempt + 1)
-                                raise
+                            if (unsubmitted_captcha is not None
+                                    and unsubmitted_captcha[0].at <= clock() <= unsubmitted_captcha[1]):
+                                result, _ = unsubmitted_captcha
+                            else:
+                                unsubmitted_captcha = None
+                                budget = float(client.timeout)
+                                try:
+                                    result = fresh_captcha(budget)
+                                except (AuthenticationExpired, AuthenticationRejected):
+                                    raise
+                                except RemoteError as exc:
+                                    if server_directed_error(exc):
+                                        raise
+                                    step_failed(clock())
+                                    diagnostic('captcha_error', wid=lecture.wid, reason=str(exc),
+                                               attempt=attempt + 1)
+                                    continue
+                                unsubmitted_captcha = (result, result.at + budget)
                             code = result.code
                             captcha_seconds, ocr_seconds = result.seconds, result.ocr_seconds
                             captcha_connect = result.connect_seconds
                         if not code or not code.isascii() or not code.isalnum() or len(code) > 16:
+                            unsubmitted_captcha = None
                             diagnostic('ocr_invalid', wid=lecture.wid, attempt=attempt + 1)
-                            if attempt == 3:
-                                task.data['cooldowns'][lecture.wid] = clock() + server_offset + 300
-                                task.save()
-                                diagnostic('captcha_cooldown', wid=lecture.wid, seconds=300)
                             continue
                         # Recheck already available snapshots, without another school query.
                         if background_poller:
                             consume_captcha_updates()
                             (rows, activities_seconds, activities_source, rows_age,
                              rows_fetch_seconds, rows_data_age) = list_rows()
-                            if activities_source == 'none' or not 0 <= clock() - mine_at <= history_max_age():
+                            if activities_source == 'none' or history is None:
                                 diagnostic('captcha_candidate_changed', wid=lecture.wid,
                                            reason='snapshot_unavailable')
                                 restart_scan = True
                                 break
-                            current = progress(progress_rows(history, hold_entries(), clock() + server_offset),
-                                               clock() + server_offset)
+                            current = progress(progress_rows(history, hold_entries(), clock()),
+                                               clock())
                             refreshed, _ = select_candidates(rows, settings, current, history,
-                                task.data['cooldowns'], clock() + server_offset,
-                                cooldown_clock_known=offset_known, holds=hold_views())
+                                task.data['cooldowns'], clock(),
+                                holds=hold_views())
                             updated = next((item for item in refreshed if item.wid == lecture.wid), None)
                             if updated is None:
+                                unsubmitted_captcha = None
                                 diagnostic('captcha_candidate_changed', wid=lecture.wid,
                                            reason='candidate_unavailable')
                                 restart_scan = True
@@ -2489,6 +2297,10 @@ def run(settings: Settings, *, session: Any = None,
                             lecture = updated
                         # A wait learned during the round-trip must stop the submission.
                         poller_wait_error()
+                        unsubmitted_captcha = None
+                        if captcha_source == 'prefetch':
+                            prefetched_code = None
+                            prefetch_ready = False
                         # Persist before sending: a crash must recover by querying, never resubmitting.
                         retry_hold = hold_entries().get(lecture.wid)
                         if isinstance(retry_hold, dict):
@@ -2555,12 +2367,12 @@ def run(settings: Settings, *, session: Any = None,
                                 break
                             if isinstance(exc, AuthenticationExpired):
                                 authenticated = False
-                            wait = exc.retry_after if exc.retry_after > 0 else (
-                                FAST_RETRY_INTERVAL if opening_scan else short_backoff(1))
                             if not authenticated:
                                 stop_poller()
                                 stop_history_poller()
-                            defer(wait, server_directed=exc.retry_after > 0)
+                            if server_backoff_error(exc):
+                                wait = exc.retry_after if exc.retry_after > 0 else short_backoff(1)
+                                defer(wait, server_directed=server_directed_error(exc))
                             break
                         step_recovered()
                         message = reply.get('msg', '')
@@ -2608,9 +2420,6 @@ def run(settings: Settings, *, session: Any = None,
                         if captcha_wrong and captcha_source == 'prefetch':
                             # A prefetched captcha was rejected; the next attempt fetches fresh.
                             diagnostic('captcha_prefetch_rejected', attempt=attempt + 1)
-                        if captcha_wrong and attempt == 3:
-                            task.data['cooldowns'][lecture.wid] = clock() + server_offset + 300
-                            diagnostic('captcha_cooldown', wid=lecture.wid, seconds=300)
                         task.save()
                         if unavailable:
                             break
@@ -2624,7 +2433,7 @@ def run(settings: Settings, *, session: Any = None,
                 clear_alert('task_failed')
                 if task.data['status'] != 'pending':
                     elapsed = max(0, clock() - scan_started)
-                    delay, fast = scan_delay(details, clock() + server_offset, elapsed, SCAN_INTERVAL,
+                    delay, fast = scan_delay(details, clock(), elapsed, SCAN_INTERVAL,
                                              known_openings)
                     if (fast != opening_scan or fast or not last_timing_at
                             or clock() - last_timing_at >= 300):
@@ -2645,8 +2454,7 @@ def run(settings: Settings, *, session: Any = None,
                     health(phase='waiting', next_check_at=clock() + delay, failure_count=0)
                     query_recovered()
                     if wake_at is not None:
-                        # Wake exactly when the prewarm/history refresh or the captcha prefetch
-                        # is due instead of drifting with the fast interval.
+                        # Wake when captcha prefetch is due instead of drifting with the interval.
                         delay = min(delay, max(0.0, wake_at - clock()))
                     pause_for_update(delay)
                 else:
@@ -2660,70 +2468,53 @@ def run(settings: Settings, *, session: Any = None,
                 pause_for_update(delay)
             except AuthenticationExpired:
                 prefetched_code = None
+                unsubmitted_captcha = None
                 pending_check_due = 0.0
                 pending_read_after = None
                 history = None
                 authenticated = False
                 unconfirmed_checks = 0
                 reset_pending_checks()
-                failures += 1
+                failures = 0
                 query_failed(scan_started)
                 health(last_error='authentication_expired', last_error_at=clock(), failure_count=failures)
                 stop_poller()
                 stop_history_poller()
-                defer(short_backoff(failures))
+                delay = reader_wait_seconds()
+                health(phase='authentication', next_check_at=clock() + delay)
+                pause_for_update(delay)
             except (RemoteError, ValueError) as exc:
                 pending_read_after = None
-                if isinstance(exc, ValueError):
-                    # A structurally invalid history is not a cache we can keep using.
+                if not background_poller and isinstance(exc, ValueError):
+                    # The direct adapter has no reader to validate history before use.
                     history = None
                 unconfirmed_checks = 0
                 reset_pending_checks()
                 reason = str(exc)
-                if isinstance(exc, AttendanceCategoryUnknown):
-                    # Local-only detail: the history row had no usable category. The public error
-                    # code stays unchanged; the activity ID helps identify the lagging record.
-                    diagnostic('attendance_category_unknown', wid=exc.wid or None)
                 safe_reason = reason if isinstance(exc, RemoteError) or reason in (
-                    'attendance_category_unknown', 'attendance_record_conflict') else 'invalid_activity_data'
-                record(safe_reason)
+                    'attendance_record_conflict',) else 'invalid_activity_data'
+                # A repeated reader error while the opening fast path retries every 0.25 s must not
+                # write hundreds of identical event lines: record the first one and any change.
+                now = clock()
+                if (last_recorded_error is None or last_recorded_error[0] != safe_reason
+                        or now - last_recorded_error[1] >= 1.0):
+                    last_recorded_error = (safe_reason, now)
+                    record(safe_reason)
                 query_failed(scan_started)
-                # Never issue another request before a rate-limit wait: the probe exists only to
-                # fill progress for a later alert, not to bypass the server's Retry-After.
-                server_directed_wait = (isinstance(exc, RemoteError)
-                                        and (exc.retry_after > 0 or str(exc) == 'server_backoff'))
-                if (authenticated and not progress_probe_attempted and latest_progress is None
-                        and not server_directed_wait and not shared_wait_pending()):
-                    # One best-effort history read so a sustained query-failure alert can still
-                    # report confirmed progress; never submit from this probe.
-                    progress_probe_attempted = True
-                    try:
-                        history = query_mine()
-                        if not background_poller:
-                            mine_at = clock()
-                        latest_progress = progress(history, clock() + server_offset)
-                        progress_at = mine_at
-                    except (RemoteError, ValueError, QueryInFlight):
-                        history = None
-                opening_scan = opening_intervals(known_openings, clock() + server_offset) is not None
-                quick = (opening_scan and authenticated and isinstance(exc, RemoteError)
-                         and reason in FAST_RETRY_REASONS and not exc.retry_after)
+                opening_scan = opening_intervals(known_openings, clock()) is not None
+                if not server_wait_error(exc):
+                    failures = 0
+                    delay = reader_wait_seconds()
+                    health(last_error=safe_reason, last_error_at=clock(), failure_count=0,
+                           phase='confirming' if task.data['status'] == 'pending' else 'waiting',
+                           next_check_at=clock() + delay)
+                    pause_for_update(delay)
+                    continue
+                failures += 1
+                health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
                 retry = exc.retry_after if isinstance(exc, RemoteError) else 0
-                if reason == 'service_unavailable':
-                    # Temporary overload/gateway failure: recover within seconds. An explicit
-                    # Retry-After still takes precedence.
-                    failures += 1
-                    health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
-                    delay = retry if retry > 0 else short_backoff(failures)
-                elif quick:
-                    # Opening seconds are scarce: retry transient request failures at the fast cadence.
-                    health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
-                    delay = FAST_RETRY_INTERVAL
-                else:
-                    failures += 1
-                    health(last_error=safe_reason, last_error_at=clock(), failure_count=failures)
-                    delay = retry if retry > 0 else short_backoff(failures)
-                defer(delay, server_directed=retry > 0)
+                defer(retry if retry > 0 else short_backoff(failures),
+                      server_directed=server_directed_error(exc))
     except (KeyboardInterrupt, EOFError):
         return 130
     except (AuthenticationRejected, RemoteError, ValueError, OSError) as exc:

@@ -141,21 +141,14 @@ def test_native_activity_still_obeys_existing_reservation_conflicts(tmp_path):
     assert not school.submitted
 
 
-@pytest.mark.parametrize('changes, expected', [({}, 0), ({'JZMC': None}, 1)])
-def test_read_only_check_validates_native_schema_without_booking_or_state(tmp_path, changes, expected):
-    school = School()
-    school.activities = [activity(**changes)]
-    assert execute(school, tmp_path, clock=lambda: OPEN - 1, check_only=True) == expected
-    assert not school.submitted
-    assert not (tmp_path / 'task.json').exists()
-
-
 @pytest.mark.parametrize('clock_now, server_now, available', [
-    (OPEN, '2029-12-31 18:59:59', False),
-    (OPEN, '2030-01-01 09:00:01', False),
-    (OPEN - 86400, '2030-01-01 08:00:00', True),
+    (OPEN, '2029-12-31 18:59:59', True),
+    (OPEN, '2030-01-01 09:00:01', True),
+    (OPEN - 1, '2030-01-01 08:00:00', False),
+    (CLOSE + 1, '2030-01-01 08:00:00', False),
+    (OPEN, 'invalid', True),
 ])
-def test_server_clock_controls_native_availability(tmp_path, clock_now, server_now, available):
+def test_native_availability_uses_host_clock(tmp_path, clock_now, server_now, available):
     school = ActivitySchool()
     school.activities = [activity()]
     school.server_now = server_now
@@ -170,7 +163,7 @@ def test_server_clock_controls_native_availability(tmp_path, clock_now, server_n
     ({}, 'candidate'),
 ])
 def test_native_capacity_uses_joined_counts(changes, expected):
-    row = {**activity(**changes), '_SERVER_NOW': '2030-01-01 08:00:00'}
+    row = activity(**changes)
     assert Lecture.read(row, now=OPEN).availability == expected
 
 
@@ -201,7 +194,7 @@ def test_opening_network_failure_retries_at_fast_cadence_without_counting(tmp_pa
         waits.append(seconds)
         raise KeyboardInterrupt
     assert execute(flaky, tmp_path, clock=lambda: OPEN - 30, sleep=stop) == 130
-    assert waits == [0.25]
+    assert len(waits) == 1 and .5 <= waits[0] <= 1.5
     assert json.loads((tmp_path / 'task.json').read_text())['health']['failure_count'] == 0
 
 
@@ -226,7 +219,7 @@ def test_opening_history_failure_does_not_hide_activity_polling(tmp_path):
     assert execute(school, tmp_path, clock=lambda: OPEN - 1, sleep=stop) == 130
     lists = [url for _, url, _ in school.requests if url.endswith('queryActivityList.do')]
     assert len(lists) >= 2
-    assert waits == [0.25, 0.25]
+    assert len(waits) == 2 and all(.05 <= seconds <= .1 for seconds in waits)
 
 
 def test_known_opening_survives_a_valid_empty_list(tmp_path):
@@ -275,38 +268,6 @@ def test_slow_captcha_path_submits_without_an_extra_list_query(tmp_path):
     assert school.submitted == ['native']
     lines = [json.loads(line) for line in (tmp_path / 'diagnostics.jsonl').read_text().splitlines()]
     assert not any(line['event'] == 'candidate_revalidated' for line in lines)
-
-
-def test_opening_history_cache_survives_forty_seconds_without_refresh(tmp_path):
-    school = ActivitySchool()
-    school.activities = [activity()]
-    school.server_now = '2029-12-31 18:59:50'
-    now = [OPEN]
-    waits = []
-    def wait(seconds):
-        waits.append(seconds)
-        now[0] += 20
-        if len(waits) == 3:
-            raise KeyboardInterrupt
-    assert execute(school, tmp_path, clock=lambda: now[0], sleep=wait) == 130
-    history_calls = [url for _, url, _ in school.requests if url.endswith('queryMyActivityList.do')]
-    assert len(history_calls) == 1
-
-
-def test_opening_scan_reuses_history_until_cache_expires(tmp_path):
-    school = ActivitySchool()
-    school.activities = [activity()]
-    assert execute(school, tmp_path, clock=lambda: OPEN - 31) == 130
-    school.server_now = '2029-12-31 18:59:50'
-    school.requests.clear()
-    waits = []
-    def stop(seconds):
-        waits.append(seconds)
-        if len(waits) == 3:
-            raise KeyboardInterrupt
-    assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop) == 130
-    assert sum(url.endswith('queryMyActivityList.do') for _, url, _ in school.requests) == 1
-    assert len(waits) == 3 and all(.5 <= wait <= 1.5 for wait in waits)
 
 
 def test_overload_503_uses_short_bounded_backoff_in_opening(tmp_path):
@@ -387,16 +348,14 @@ def test_opening_overload_and_rate_limit_recover_without_extra_probes(tmp_path):
         now[0] += seconds
     assert execute(school, tmp_path, clock=lambda: now[0], sleep=wait) == 130
     assert waits == [1, 2, 4, 5, 2]
-    assert calls == [('queryActivityList.do', 6), ('queryMyActivityList.do', 6),
-                     *[('queryActivityList.do', 6)] * 5,
+    assert calls == [*[('queryActivityList.do', 6)] * 6, ('queryMyActivityList.do', 6),
                      ('vcode.do', 8), ('addReservation.do', 8), ('queryMyActivityList.do', 6)]
     assert school.submitted == ['native']
     assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
 
 
 def test_recent_history_cache_survives_list_failure_and_enables_submission(tmp_path):
-    open_text = moment('2029-12-31 19:00:00').strftime('%Y-%m-%d %H:%M:%S')
-    pre_open_text = moment('2029-12-31 18:59:50').strftime('%Y-%m-%d %H:%M:%S')
+    now = [OPEN - 10]
     class CacheSchool(ActivitySchool):
         list_calls = 0
         mine_calls = 0
@@ -405,8 +364,6 @@ def test_recent_history_cache_survives_list_failure_and_enables_submission(tmp_p
                 self.list_calls += 1
                 if self.list_calls == 2:
                     raise requests.Timeout('SECRET list timeout')
-                if self.list_calls >= 3:
-                    self.server_now = open_text
             if url.endswith('queryMyActivityList.do'):
                 self.mine_calls += 1
                 if self.mine_calls >= 2:
@@ -414,21 +371,20 @@ def test_recent_history_cache_survives_list_failure_and_enables_submission(tmp_p
             return super().request(method, url, **kwargs)
     school = CacheSchool()
     school.activities = [activity()]
-    school.server_now = pre_open_text
     waits = []
     def stop(seconds):
         waits.append(seconds)
+        now[0] = OPEN
         if len(waits) == 5:
             raise KeyboardInterrupt
-    assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop) == 130
+    assert execute(school, tmp_path, clock=lambda: now[0], sleep=stop) == 130
     assert school.submitted == ['native']
     assert school.list_calls >= 3
 
 
-def test_captcha_cooldown_uses_school_clock_basis(tmp_path):
+def test_invalid_ocr_retries_on_the_next_scan_without_cooldown(tmp_path):
     school = ActivitySchool()
     school.activities = [activity()]
-    school.server_now = moment('2029-12-31 19:10:00').strftime('%Y-%m-%d %H:%M:%S')
     waits = []
     def stop(seconds):
         waits.append(seconds)
@@ -436,81 +392,5 @@ def test_captcha_cooldown_uses_school_clock_basis(tmp_path):
             raise KeyboardInterrupt
     assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop, recognize=lambda _: '') == 130
     captchas = [url for _, url, _ in school.requests if url.endswith('vcode.do')]
-    assert len(captchas) == 4
-
-
-def test_cooldown_survives_restart_before_clock_calibration(tmp_path):
-    school = ActivitySchool()
-    school.activities = [activity(YYKSSJ='2029-12-31 18:00:00', YYJSSJ='2029-12-31 20:00:00')]
-    school.server_now = moment('2029-12-31 18:50:00').strftime('%Y-%m-%d %H:%M:%S')
-    waits = []
-    def stop(seconds):
-        waits.append(seconds)
-        if len(waits) == 2:
-            raise KeyboardInterrupt
-    assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop, recognize=lambda _: '') == 130
-    assert sum(url.endswith('vcode.do') for _, url, _ in school.requests) == 4
-    school.requests.clear()
-    waits.clear()
-    assert execute(school, tmp_path, clock=lambda: OPEN, sleep=stop, recognize=lambda _: '') == 130
-    assert sum(url.endswith('vcode.do') for _, url, _ in school.requests) == 0
-
-
-def test_cooldown_waits_for_clock_after_restart_then_expires(tmp_path):
-    school = ActivitySchool()
-    school.activities = [activity()]
-    school.server_now = '2029-12-31 19:00:00'
-    now = [OPEN + 600]
-    options = dict(clock=lambda: now[0], sleep=interrupted, recognize=lambda _: '')
-    assert execute(school, tmp_path, **options) == 130
-    deadline = json.loads((tmp_path / 'task.json').read_text())['cooldowns']['native']
-    assert deadline == OPEN + 300
-
-    school.requests.clear()
-    school.server_now = None
-    assert execute(school, tmp_path, **options) == 130
-    assert not any(url.endswith('vcode.do') for _, url, _ in school.requests)
-    saved = json.loads((tmp_path / 'task.json').read_text())
-    assert saved['cooldowns']['native'] == deadline
-    assert saved['selection']['activities'][0]['reason'] == 'cooldown'
-
-    school.server_now = '2029-12-31 19:05:01'
-    now[0] += 301
-    assert execute(school, tmp_path, **options) == 130
-    assert sum(url.endswith('vcode.do') for _, url, _ in school.requests) == 4
-
-
-@pytest.mark.parametrize('slow_path', [False, True])
-def test_missing_clock_keeps_calibration_for_candidate_and_cooldown(tmp_path, slow_path):
-    class MissingClockSchool(ActivitySchool):
-        lists = 0
-        def request(self, method, url, **kwargs):
-            if url.endswith('queryActivityList.do'):
-                self.lists += 1
-                if self.lists > 1:
-                    self.server_now = None
-            return super().request(method, url, **kwargs)
-
-    school = MissingClockSchool()
-    school.activities = [activity(YYJSSJ='2029-12-31 19:05:00')]
-    school.server_now = '2029-12-31 19:00:00'
-    now = [OPEN + 600]
-    def recognize(_):
-        if slow_path:
-            now[0] += 4
-            return '1234'
-        return ''
-    waits = []
-    def stop(seconds):
-        waits.append(seconds)
-        if len(waits) == 2:
-            raise KeyboardInterrupt
-    assert execute(school, tmp_path, clock=lambda: now[0], sleep=stop,
-                   recognize=recognize) == 130
-    if slow_path:
-        assert school.submitted == ['native']
-        assert 'event=reservation_succeeded' in (tmp_path / 'events.log').read_text()
-    else:
-        assert sum(url.endswith('vcode.do') for _, url, _ in school.requests) == 4
-        saved = json.loads((tmp_path / 'task.json').read_text())
-        assert saved['selection']['activities'][0]['reason'] == 'cooldown'
+    assert len(captchas) == 8
+    assert not json.loads((tmp_path / 'task.json').read_text())['cooldowns']

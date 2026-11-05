@@ -7,6 +7,9 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def local_network_only(monkeypatch):
+    # Bypass inherited proxies, including the Windows registry fallback to a local proxy.
+    monkeypatch.setenv('NO_PROXY', '*')
+    monkeypatch.setenv('no_proxy', '*')
     original = socket.socket.connect
     def connect(sock, address):
         if sock.family in (socket.AF_INET, socket.AF_INET6):

@@ -90,15 +90,15 @@ def test_reader_error_keeps_both_owners_alive(
     assert not school.submitted
 
 
-def test_fast_snapshot_age_does_not_expand_with_reader_timeout(opening, tmp_path, monkeypatch):
+def test_snapshot_validity_tracks_the_reader_timeout(opening, tmp_path, monkeypatch):
     _, now, school, wait = opening
     monkeypatch.setattr(FakePoller, 'at_offset', -2.001)
     monkeypatch.setattr(app, 'OPENING_BACKGROUND_TIMEOUT', 20.0)
     assert execute(school, tmp_path, clock=lambda: now[0], sleep=wait,
                    background_poller=True, settings=app.Settings(
                        state_dir=tmp_path, prewarm=False, captcha_prefetch=False)) == 130
-    assert any(r['event'] == 'reader_snapshot_missing' for r in diagnostics_rows(tmp_path))
-    assert all(r.get('rows_age', 0) < .75 for r in diagnostics_rows(tmp_path)
+    assert not any(r['event'] == 'reader_snapshot_missing' for r in diagnostics_rows(tmp_path))
+    assert all(r.get('rows_age', 0) < 20 for r in diagnostics_rows(tmp_path)
                if r['event'] == 'scan_timing' and r.get('rows_source') == 'poller')
 
 
@@ -127,6 +127,14 @@ def test_in_flight_reader_is_not_replaced_until_its_request_finishes(
     monkeypatch.setattr(app, 'new_history_poller', FakeHistoryPoller)
     FakePoller.instances.clear()
     FakePoller.on_timeout = None
+    # Isolate this test from class-level fixtures left by other offline tests.
+    FakePoller.rows_override = None
+    FakePoller.next_rows = []
+    FakePoller.next_error = None
+    FakePoller.at_offset = 0.0
+    FakePoller.error_retry_after = 0.0
+    FakePoller.error_server_directed = False
+    FakePoller.next_wake_once = False
     FakeHistoryPoller.rows = []
     FakeHistoryPoller.error = None
     FakeHistoryPoller.retry_after = 0.0
